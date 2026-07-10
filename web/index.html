@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Model Architecture Viewer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Model Configs Explorer</p>
+          <h1>模型架构、流向与 Shape 可视化</h1>
+          <p class="hero-copy">
+            选择 model_configs 下的模型目录，查看主干结构、跨模态流向、latent 路径和基于配置推导的典型张量 shape。
+          </p>
+        </div>
+        <div class="hero-note">
+          <span>无额外依赖</span>
+          <span>本地 Python 服务</span>
+          <span>支持 LLM / 多模态 / Diffusers</span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="sidebar panel">
+          <section>
+            <div class="section-head">
+              <h2>模型目录</h2>
+              <span id="model-count" class="pill">0</span>
+            </div>
+            <label class="field-label" for="model-search">筛选</label>
+            <input id="model-search" class="search-input" type="search" placeholder="输入模型名或架构名" />
+            <div id="model-list" class="model-list"></div>
+          </section>
+
+          <section class="controls-section">
+            <div class="section-head">
+              <h2>运行参数</h2>
+              <button id="refresh-button" class="ghost-button" type="button">刷新 shape</button>
+            </div>
+            <form id="controls-form" class="controls-form"></form>
+          </section>
+        </aside>
+
+        <section class="main-panel">
+          <div id="status-bar" class="status-bar">正在加载模型目录...</div>
+          <section id="model-summary" class="panel summary-panel"></section>
+          <section id="warnings-panel" class="warnings-panel"></section>
+          <section class="panel graph-panel">
+            <div class="section-head graph-head">
+              <h2>架构图</h2>
+              <span class="graph-tip">点击节点查看细节；修改左侧参数可重算 shape</span>
+            </div>
+            <div id="graph-scroll" class="graph-scroll">
+              <div id="graph-canvas" class="graph-canvas">
+                <svg id="edge-layer" class="edge-layer" aria-hidden="true"></svg>
+                <div id="graph-board" class="graph-board"></div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <aside id="detail-panel" class="detail-panel panel"></aside>
+      </main>
+    </div>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
