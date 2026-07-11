@@ -1005,6 +1005,7 @@ ui.hierarchyToolbar.addEventListener("click", (event) => {
   if (!button || !state.payload || state.payload.model.type !== "llm") {
     return;
   }
+  clearTimeout(state.refreshTimer);
   state.llmHierarchyMode = button.dataset.hierarchyMode;
   syncSelectedNode(state.payload);
   renderHierarchyToolbar();
