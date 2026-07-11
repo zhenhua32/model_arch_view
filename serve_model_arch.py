@@ -221,6 +221,8 @@ def build_node(
     sections: list[dict[str, Any]],
     accent: str,
     micro_flow: list[str] | None = None,
+    parent_id: str | None = None,
+    view_modes: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": node_id,
@@ -236,6 +238,8 @@ def build_node(
         "sections": sections,
         "accent": accent,
         "microFlow": micro_flow or [],
+        "parentId": parent_id,
+        "viewModes": view_modes or ["summary", "expanded"],
     }
 
 
@@ -257,6 +261,15 @@ def derive_vae_scale(vae_config: dict[str, Any]) -> int:
         return 2 ** max(len(block_out_channels) - 1, 0)
 
     return 8
+
+
+def build_edge(source: str, target: str, label: str, view_modes: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "source": source,
+        "target": target,
+        "label": label,
+        "viewModes": view_modes or ["summary", "expanded"],
+    }
 
 
 def max_nested_numeric(mapping: dict[str, Any], key: str) -> int | None:
@@ -334,6 +347,14 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         core_badges.append("MoE")
     if quant:
         core_badges.append(str(quant))
+
+    attention_badges = [f"{num_heads or '?'} heads", f"head {head_dim or '?'}"]
+    if num_kv_heads:
+        attention_badges.append(f"kv {num_kv_heads}")
+
+    ffn_badges = ["MoE" if num_experts else "Dense FFN", f"hidden {ffn_hidden or '?'}"]
+    if num_experts:
+        ffn_badges.append(f"top-{experts_per_tok}")
 
     nodes = [
         build_node(
@@ -424,6 +445,119 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 f"{'MoE 路由 top-' + str(experts_per_tok) if num_experts else 'Dense FFN'}",
                 "Residual + Norm",
             ],
+            view_modes=["summary"],
+        ),
+        build_node(
+            "decoder_attention",
+            "core",
+            1,
+            "Self-Attention",
+            f"每层内的注意力子块，重复 {num_layers or '?'} 次",
+            "展示 Decoder block 内的 QKV 投影、多头注意力和 KV cache 视图。",
+            hidden_shape,
+            hidden_shape,
+            attention_badges,
+            [
+                detail("num_hidden_layers", num_layers),
+                detail("num_attention_heads", num_heads),
+                detail("num_key_value_heads", num_kv_heads),
+                detail("head_dim", head_dim),
+            ],
+            [
+                section(
+                    "子块形状",
+                    [
+                        detail("input hidden", hidden_shape),
+                        detail("qkv view", attention_shape),
+                        detail("kv cache", kv_shape),
+                        detail("output hidden", hidden_shape),
+                    ],
+                ),
+                section(
+                    "推导公式",
+                    [
+                        detail("attention reshape", f"[B, T, H] -> [B, T, n_heads, head_dim] = {attention_shape}"),
+                        detail("kv reshape", f"[B, T, kv_heads, head_dim] = {kv_shape}"),
+                        detail("block repeat", f"attention sub-block appears in each of {num_layers or '?'} layers"),
+                    ],
+                ),
+            ],
+            "core",
+            micro_flow=["QKV projection", "Scaled attention", "Output projection"],
+            parent_id="decoder_stack",
+            view_modes=["expanded"],
+        ),
+        build_node(
+            "decoder_ffn",
+            "core",
+            2,
+            "MoE / FFN",
+            "每层内的前馈子块",
+            "展示每层前馈网络，若模型为 MoE 则突出 routed experts 与 top-k 路由。",
+            hidden_shape,
+            hidden_shape,
+            ffn_badges,
+            [
+                detail("ffn_hidden", ffn_hidden),
+                detail("experts", num_experts or "dense"),
+                detail("top-k experts", experts_per_tok or "-"),
+            ],
+            [
+                section(
+                    "子块形状",
+                    [
+                        detail("input hidden", hidden_shape),
+                        detail("intermediate", shape(batch, seq_len, ffn_hidden or "ffn")),
+                        detail("output hidden", hidden_shape),
+                    ],
+                ),
+                section(
+                    "推导公式",
+                    [
+                        detail("dense ffn", f"[B, T, H] -> [B, T, ffn_hidden] -> [B, T, H] = {hidden_shape}"),
+                        detail(
+                            "moe routing",
+                            f"[B, T, top_k] = {shape(batch, seq_len, experts_per_tok or '-')} across {num_experts} experts" if num_experts else "该模型未启用 routed experts",
+                        ),
+                    ],
+                ),
+            ],
+            "core",
+            micro_flow=["Gate / router" if num_experts else "Up projection", "Experts / FFN", "Down projection"],
+            parent_id="decoder_stack",
+            view_modes=["expanded"],
+        ),
+        build_node(
+            "decoder_residual",
+            "core",
+            3,
+            "Residual + Norm",
+            "每层输出回写到残差流",
+            "表示 attention / FFN 子块之后的残差叠加与归一化。",
+            hidden_shape,
+            hidden_shape,
+            [f"{num_layers or '?'} repeats", "residual stream"],
+            [detail("residual stream", hidden_shape), detail("norm", "RMSNorm / LayerNorm variant")],
+            [
+                section(
+                    "子块形状",
+                    [
+                        detail("residual in", hidden_shape),
+                        detail("residual out", hidden_shape),
+                    ],
+                ),
+                section(
+                    "推导公式",
+                    [
+                        detail("shape preserve", f"[B, T, H] + sub-block output -> [B, T, H] = {hidden_shape}"),
+                        detail("stack handoff", "output becomes next block input or final LM head input"),
+                    ],
+                ),
+            ],
+            "core",
+            micro_flow=["Residual add", "Normalization", "Pass to next layer"],
+            parent_id="decoder_stack",
+            view_modes=["expanded"],
         ),
         build_node(
             "lm_head",
@@ -459,10 +593,14 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     ]
 
     edges = [
-        {"source": "token_input", "target": "token_embedding", "label": "lookup"},
-        {"source": "token_embedding", "target": "decoder_stack", "label": "hidden stream"},
-        {"source": "decoder_stack", "target": "lm_head", "label": "final hidden"},
-        {"source": "lm_head", "target": "logits", "label": "vocab projection"},
+        build_edge("token_input", "token_embedding", "lookup"),
+        build_edge("token_embedding", "decoder_stack", "hidden stream", ["summary"]),
+        build_edge("decoder_stack", "lm_head", "final hidden", ["summary"]),
+        build_edge("token_embedding", "decoder_attention", "block input", ["expanded"]),
+        build_edge("decoder_attention", "decoder_ffn", "attention output", ["expanded"]),
+        build_edge("decoder_ffn", "decoder_residual", "ffn output", ["expanded"]),
+        build_edge("decoder_residual", "lm_head", "stack output", ["expanded"]),
+        build_edge("lm_head", "logits", "vocab projection"),
     ]
 
     sources: list[str] = []
@@ -593,15 +731,6 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     layer_pattern = summarize_layer_pattern(text_config.get("layer_types"))
     if layer_pattern:
         warnings.append(f"文本主干层型摘要: {layer_pattern}。")
-
-    lanes = [
-        ("inputs", "输入"),
-        ("processing", "预处理"),
-        ("encoding", "编码"),
-        ("fusion", "对齐与融合"),
-        ("backbone", "语言主干"),
-        ("output", "输出"),
-    ]
 
     nodes = [
         build_node(

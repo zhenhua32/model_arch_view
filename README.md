@@ -33,6 +33,7 @@ python serve_model_arch.py --port 8123
 - 自动扫描 model_configs 下的一级模型目录
 - 左侧选择模型并调整 batch、token 长度、分辨率、帧数、推理步数等参数
 - 中间查看架构图与数据流向，并在选中节点后高亮其上下游路径
+- 对 LLM 支持 Decoder Stack 的汇总 / 展开层级切换，可在 attention、MoE/FFN、residual 子块之间切换查看
 - 右侧查看节点的关键配置字段、输入 shape、输出 shape、推导公式和上下游跳转
 - 支持导出当前模型视图的 JSON 数据和 SVG 图
 

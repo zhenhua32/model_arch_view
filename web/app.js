@@ -3,6 +3,7 @@ const state = {
   activeModelId: null,
   payload: null,
   selectedNodeId: null,
+  llmHierarchyMode: "summary",
   refreshTimer: null,
 };
 
@@ -12,6 +13,7 @@ const ui = {
   modelList: document.getElementById("model-list"),
   controlsForm: document.getElementById("controls-form"),
   refreshButton: document.getElementById("refresh-button"),
+  hierarchyToolbar: document.getElementById("hierarchy-toolbar"),
   exportJsonButton: document.getElementById("export-json-button"),
   exportSvgButton: document.getElementById("export-svg-button"),
   statusBar: document.getElementById("status-bar"),
@@ -50,6 +52,76 @@ function updateExportButtons() {
   const disabled = !state.payload;
   ui.exportJsonButton.disabled = disabled;
   ui.exportSvgButton.disabled = disabled;
+}
+
+function getHierarchyMode(payload = state.payload) {
+  if (payload?.model?.type !== "llm") {
+    return "all";
+  }
+  return state.llmHierarchyMode;
+}
+
+function isVisibleInHierarchy(item, mode) {
+  if (mode === "all") {
+    return true;
+  }
+  if (!Array.isArray(item?.viewModes) || !item.viewModes.length) {
+    return true;
+  }
+  return item.viewModes.includes(mode);
+}
+
+function getVisibleGraph(payload = state.payload) {
+  const graph = payload?.graph || { nodes: [], edges: [], lanes: [] };
+  const mode = getHierarchyMode(payload);
+  const nodes = (graph.nodes || []).filter((node) => isVisibleInHierarchy(node, mode));
+  const visibleIds = new Set(nodes.map((node) => node.id));
+  const edges = (graph.edges || []).filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target) && isVisibleInHierarchy(edge, mode));
+  return {
+    lanes: graph.lanes || [],
+    nodes,
+    edges,
+  };
+}
+
+function syncSelectedNode(payload = state.payload) {
+  const visibleGraph = getVisibleGraph(payload);
+  const visibleIds = new Set((visibleGraph.nodes || []).map((node) => node.id));
+  if (visibleIds.has(state.selectedNodeId)) {
+    return;
+  }
+
+  const fullNodes = payload?.graph?.nodes || [];
+  const hiddenNode = fullNodes.find((node) => node.id === state.selectedNodeId);
+  if (hiddenNode?.parentId && visibleIds.has(hiddenNode.parentId)) {
+    state.selectedNodeId = hiddenNode.parentId;
+    return;
+  }
+
+  const visibleChild = fullNodes.find((node) => node.parentId === state.selectedNodeId && visibleIds.has(node.id));
+  if (visibleChild) {
+    state.selectedNodeId = visibleChild.id;
+    return;
+  }
+
+  if (visibleIds.has(payload?.selectedNodeId)) {
+    state.selectedNodeId = payload.selectedNodeId;
+    return;
+  }
+
+  state.selectedNodeId = visibleGraph.nodes?.[0]?.id || null;
+}
+
+function renderHierarchyToolbar() {
+  const isLlm = state.payload?.model?.type === "llm";
+  ui.hierarchyToolbar.hidden = !isLlm;
+  if (!isLlm) {
+    return;
+  }
+
+  ui.hierarchyToolbar.querySelectorAll("[data-hierarchy-mode]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.hierarchyMode === state.llmHierarchyMode);
+  });
 }
 
 function buildQueryFromControls() {
@@ -106,7 +178,7 @@ function collectReachable(startId, neighbors) {
 }
 
 function buildGraphRelations(payload) {
-  const graph = payload?.graph || { nodes: [], edges: [], lanes: [] };
+  const graph = getVisibleGraph(payload);
   const index = buildGraphIndex(graph);
   const selectedId = state.selectedNodeId || payload?.selectedNodeId || graph.nodes?.[0]?.id || null;
   const upstream = selectedId ? collectReachable(selectedId, index.incomingNeighbors) : new Set();
@@ -277,7 +349,9 @@ async function loadModelPayload() {
     const payload = await fetchJson(`/api/models/${encodeURIComponent(state.activeModelId)}${suffix}`);
     state.payload = payload;
     state.selectedNodeId = (payload.graph?.nodes || []).some((node) => node.id === previousSelected) ? previousSelected : payload.selectedNodeId;
+    syncSelectedNode(payload);
     updateExportButtons();
+    renderHierarchyToolbar();
     renderModelList();
     renderSummary();
     renderControls();
@@ -303,7 +377,7 @@ function renderSummary() {
     return;
   }
 
-  const graph = payload.graph || { nodes: [], edges: [], lanes: [] };
+  const graph = getVisibleGraph(payload);
   const metrics = payload.model.summary
     .map(
       (item) => `
@@ -336,6 +410,14 @@ function renderSummary() {
   const parameterMarkup = parameterEntries.length
     ? renderChipPairs(parameterEntries.map(([label, value]) => ({ label, value })), "flow-chip param-chip")
     : '<span class="subtle">当前模型没有额外运行参数。</span>';
+  const hierarchyMarkup = payload.model.type === "llm"
+    ? `
+      <div class="detail-section">
+        <h3>LLM 层级视图</h3>
+        <div class="flow-strip">${renderChipPairs([{ label: "当前视图", value: state.llmHierarchyMode === "summary" ? "汇总" : "展开" }])}</div>
+      </div>
+    `
+    : "";
 
   ui.summaryPanel.innerHTML = `
     <div class="summary-top">
@@ -359,6 +441,7 @@ function renderSummary() {
       <h3>当前参数</h3>
       <div class="flow-strip">${parameterMarkup}</div>
     </div>
+    ${hierarchyMarkup}
     <div class="detail-section">
       <h3>来源配置</h3>
       <div class="source-list">${sources || '<span class="subtle">未检测到配置文件。</span>'}</div>
@@ -447,9 +530,10 @@ function renderGraph() {
     return;
   }
 
+  const visibleGraph = getVisibleGraph(payload);
   const relations = buildGraphRelations(payload);
-  const grouped = groupNodesByLane(payload.graph.nodes || [], payload.graph.lanes || []);
-  ui.graphBoard.innerHTML = (payload.graph.lanes || [])
+  const grouped = groupNodesByLane(visibleGraph.nodes || [], visibleGraph.lanes || []);
+  ui.graphBoard.innerHTML = (visibleGraph.lanes || [])
     .map((lane) => {
       const nodes = grouped.get(lane.id) || [];
       const nodeMarkup = nodes
@@ -462,7 +546,7 @@ function renderGraph() {
           const incomingCount = relations.index.incomingNeighbors.get(node.id)?.length || 0;
           const outgoingCount = relations.index.outgoingNeighbors.get(node.id)?.length || 0;
           return `
-            <article class="${classes.join(" ")}" data-node-id="${escapeHtml(node.id)}" data-accent="${escapeHtml(node.accent || "core")}">
+            <article class="${classes.join(" ")}" data-node-id="${escapeHtml(node.id)}" data-accent="${escapeHtml(node.accent || "core")}" ${node.parentId ? `data-parent-id="${escapeHtml(node.parentId)}"` : ""}>
               <div>
                 <h3 class="node-title">${escapeHtml(node.label)}</h3>
                 <div class="node-subtitle">${escapeHtml(node.subtitle || "")}</div>
@@ -499,6 +583,7 @@ function drawEdges() {
     return;
   }
 
+  const visibleGraph = getVisibleGraph(payload);
   const relations = buildGraphRelations(payload);
   const canvasRect = ui.graphCanvas.getBoundingClientRect();
   const nodes = new Map();
@@ -520,7 +605,7 @@ function drawEdges() {
     </defs>
   `;
 
-  (payload.graph.edges || []).forEach((edge) => {
+  (visibleGraph.edges || []).forEach((edge) => {
     const source = nodes.get(edge.source);
     const target = nodes.get(edge.target);
     if (!source || !target) {
@@ -543,7 +628,8 @@ function drawEdges() {
 }
 
 function findSelectedNode() {
-  return (state.payload?.graph?.nodes || []).find((node) => node.id === state.selectedNodeId) || state.payload?.graph?.nodes?.[0] || null;
+  const visibleGraph = getVisibleGraph(state.payload);
+  return (visibleGraph.nodes || []).find((node) => node.id === state.selectedNodeId) || visibleGraph.nodes?.[0] || null;
 }
 
 function renderJumpList(ids, index) {
@@ -708,7 +794,12 @@ function exportCurrentPayload() {
   if (!state.payload) {
     return;
   }
-  downloadBlob(`${sanitizeFileName(state.payload.model.id)}.json`, `${JSON.stringify(state.payload, null, 2)}\n`, "application/json;charset=utf-8");
+  const exported = {
+    ...state.payload,
+    currentHierarchyMode: getHierarchyMode(state.payload),
+    visibleGraph: getVisibleGraph(state.payload),
+  };
+  downloadBlob(`${sanitizeFileName(state.payload.model.id)}.json`, `${JSON.stringify(exported, null, 2)}\n`, "application/json;charset=utf-8");
 }
 
 function exportCurrentSvg() {
@@ -718,6 +809,7 @@ function exportCurrentSvg() {
 
   const payload = state.payload;
   const relations = buildGraphRelations(payload);
+  const visibleGraph = getVisibleGraph(payload);
   const canvasRect = ui.graphCanvas.getBoundingClientRect();
   const width = Math.max(ui.graphBoard.scrollWidth + 24, ui.graphBoard.clientWidth);
   const height = Math.max(ui.graphBoard.scrollHeight + 24, ui.graphBoard.clientHeight);
@@ -726,7 +818,7 @@ function exportCurrentSvg() {
     nodeElements.set(element.dataset.nodeId, element);
   });
 
-  const edgeMarkup = (payload.graph.edges || [])
+  const edgeMarkup = (visibleGraph.edges || [])
     .map((edge) => {
       const source = nodeElements.get(edge.source);
       const target = nodeElements.get(edge.target);
@@ -746,7 +838,7 @@ function exportCurrentSvg() {
     })
     .join("");
 
-  const nodeMarkup = (payload.graph.nodes || [])
+  const nodeMarkup = (visibleGraph.nodes || [])
     .map((node) => {
       const element = nodeElements.get(node.id);
       if (!element) {
@@ -812,6 +904,19 @@ ui.modelList.addEventListener("click", (event) => {
 
 ui.controlsForm.addEventListener("input", scheduleRefresh);
 ui.refreshButton.addEventListener("click", () => loadModelPayload());
+ui.hierarchyToolbar.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-hierarchy-mode]");
+  if (!button || !state.payload || state.payload.model.type !== "llm") {
+    return;
+  }
+  state.llmHierarchyMode = button.dataset.hierarchyMode;
+  syncSelectedNode(state.payload);
+  renderHierarchyToolbar();
+  renderSummary();
+  renderGraph();
+  renderDetails();
+  setStatus(`已切换为 ${state.llmHierarchyMode === "summary" ? "汇总" : "展开"} 层级视图。`);
+});
 ui.exportJsonButton.addEventListener("click", exportCurrentPayload);
 ui.exportSvgButton.addEventListener("click", exportCurrentSvg);
 
@@ -842,6 +947,7 @@ window.addEventListener("resize", () => {
 });
 
 updateExportButtons();
+renderHierarchyToolbar();
 loadModels().catch((error) => {
   console.error(error);
   setStatus(`初始化失败：${error.message}`, true);

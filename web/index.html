@@ -55,6 +55,11 @@
                 <div class="graph-tip">点击节点查看细节；修改左侧参数可重算 shape；当前视图支持路径聚焦与导出。</div>
               </div>
               <div class="graph-actions">
+                <div id="hierarchy-toolbar" class="hierarchy-toolbar" hidden>
+                  <span class="hierarchy-label">LLM 层级</span>
+                  <button class="hierarchy-button is-active" type="button" data-hierarchy-mode="summary">汇总</button>
+                  <button class="hierarchy-button" type="button" data-hierarchy-mode="expanded">展开</button>
+                </div>
                 <button id="export-json-button" class="ghost-button" type="button" disabled>导出 JSON</button>
                 <button id="export-svg-button" class="ghost-button" type="button" disabled>导出 SVG</button>
               </div>

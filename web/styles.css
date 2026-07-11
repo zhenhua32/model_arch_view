@@ -411,6 +411,39 @@ body::before {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+  align-items: center;
+}
+
+.hierarchy-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(31, 26, 20, 0.08);
+}
+
+.hierarchy-label {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.hierarchy-button {
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(13, 106, 100, 0.14);
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.hierarchy-button.is-active {
+  background: rgba(13, 106, 100, 0.12);
+  color: var(--accent);
+  border-color: rgba(13, 106, 100, 0.24);
 }
 
 .graph-tip {
@@ -509,6 +542,11 @@ body::before {
 .graph-node.dimmed {
   opacity: 0.34;
   transform: none;
+}
+
+.graph-node[data-parent-id] {
+  margin-left: 18px;
+  border-style: dashed;
 }
 
 .graph-node::before {
