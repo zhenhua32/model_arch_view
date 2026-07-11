@@ -303,6 +303,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     ffn_hidden = int(first_defined(config.get("intermediate_size"), params_config.get("hidden_dim"), config.get("moe_intermediate_size"), 0) or 0)
     vocab_size = int(first_defined(config.get("vocab_size"), params_config.get("vocab_size"), 0) or 0)
     max_position = int(first_defined(config.get("max_position_embeddings"), params_config.get("max_position_embeddings"), 4096) or 4096)
+    sliding_window = int(first_defined(config.get("sliding_window"), config.get("sliding_window_size"), params_config.get("sliding_window_size"), 0) or 0)
 
     moe_config = params_config.get("moe") if isinstance(params_config.get("moe"), dict) else {}
     num_experts = int(first_defined(config.get("n_routed_experts"), config.get("num_experts"), moe_config.get("num_experts"), 0) or 0)
@@ -702,9 +703,45 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             view_modes=["block"],
         ),
         build_node(
-            "decoder_softmax",
+            "decoder_attn_mask",
             "core",
             6,
+            "Attention Mask",
+            "causal / sliding window mask",
+            "在 softmax 前把非法位置打成极小值；decoder-only 模型默认使用 causal mask，部分模型还会叠加 sliding window mask。",
+            score_shape,
+            score_shape,
+            ["causal", f"window {sliding_window}" if sliding_window else "full causal"],
+            [detail("mask_shape", score_shape), detail("causal_mask", True), detail("sliding_window", sliding_window or "disabled")],
+            [
+                section(
+                    "子块形状",
+                    [
+                        detail("score input", score_shape),
+                        detail("masked score", score_shape),
+                    ],
+                ),
+                section(
+                    "推导公式",
+                    [
+                        detail("causal mask", "对未来位置加上 -inf，使 query 只能看见当前及过去 token"),
+                        detail(
+                            "sliding window mask",
+                            f"每个 query 最多保留最近 {sliding_window} 个历史 token" if sliding_window else "当前配置未启用 sliding window，本层退化为完整下三角 causal mask",
+                        ),
+                        detail("masked score", f"score + mask -> {score_shape}"),
+                    ],
+                ),
+            ],
+            "core",
+            micro_flow=["Apply causal mask", "Apply local window", "Pass to softmax"],
+            parent_id="decoder_stack",
+            view_modes=["block"],
+        ),
+        build_node(
+            "decoder_softmax",
+            "core",
+            7,
             "Softmax",
             "注意力权重归一化",
             "对 QK 分数矩阵按最后一个维度做 softmax，得到注意力权重。",
@@ -736,7 +773,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_node(
             "decoder_weighted_v",
             "core",
-            7,
+            8,
             "Weighted V",
             "注意力加权聚合",
             "用注意力权重对 V 做加权聚合，得到每个 head 的上下文向量。",
@@ -769,7 +806,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_node(
             "decoder_out_proj",
             "core",
-            8,
+            9,
             "Output Projection",
             "concat heads -> hidden",
             "拼接各个注意力 head 的上下文后投影回隐藏维度。",
@@ -801,7 +838,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_node(
             "decoder_ffn",
             "core",
-            9,
+            10,
             "MoE / FFN",
             "每层内的前馈子块",
             "展示每层前馈网络，若模型为 MoE 则突出 routed experts 与 top-k 路由。",
@@ -841,7 +878,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_node(
             "decoder_residual",
             "core",
-            10,
+            11,
             "Residual + Norm",
             "每层输出回写到残差流",
             "表示 attention / FFN 子块之后的残差叠加与归一化。",
@@ -914,8 +951,9 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_edge("decoder_q_proj", "decoder_qk_rope", "Q", ["block"]),
         build_edge("decoder_k_proj", "decoder_qk_rope", "K", ["block"]),
         build_edge("decoder_qk_rope", "decoder_qk_score", "positional QK", ["block"]),
-        build_edge("decoder_qk_score", "decoder_softmax", "scores", ["block"]),
-        build_edge("decoder_softmax", "decoder_weighted_v", "weights", ["block"]),
+        build_edge("decoder_qk_score", "decoder_attn_mask", "raw scores", ["block"]),
+        build_edge("decoder_attn_mask", "decoder_softmax", "masked scores", ["block"]),
+        build_edge("decoder_softmax", "decoder_weighted_v", "normalized weights", ["block"]),
         build_edge("decoder_v_proj", "decoder_weighted_v", "V", ["block"]),
         build_edge("decoder_weighted_v", "decoder_out_proj", "context", ["block"]),
         build_edge("decoder_out_proj", "decoder_ffn", "attention output", ["block"]),
