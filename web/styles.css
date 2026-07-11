@@ -253,6 +253,11 @@ body::before {
   cursor: pointer;
 }
 
+.ghost-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .controls-form {
   display: grid;
   gap: 14px;
@@ -284,6 +289,11 @@ body::before {
 
 .summary-panel {
   padding: 22px;
+}
+
+.summary-top {
+  display: grid;
+  gap: 8px;
 }
 
 .summary-panel h2 {
@@ -328,6 +338,44 @@ body::before {
   margin-top: 16px;
 }
 
+.flow-strip,
+.jump-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.flow-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.76);
+  border: 1px solid rgba(33, 25, 16, 0.08);
+  color: var(--ink);
+  font-size: 0.84rem;
+}
+
+.flow-chip-label {
+  color: var(--muted);
+}
+
+.flow-chip-value {
+  font-family: var(--font-mono);
+}
+
+.path-chip {
+  background: rgba(13, 106, 100, 0.12);
+  border-color: rgba(13, 106, 100, 0.16);
+  color: var(--accent);
+}
+
+.param-chip {
+  background: rgba(204, 125, 33, 0.12);
+  border-color: rgba(204, 125, 33, 0.16);
+}
+
 .source-chip {
   padding: 8px 10px;
   border-radius: 12px;
@@ -353,6 +401,16 @@ body::before {
 
 .graph-panel {
   padding: 18px;
+}
+
+.graph-head {
+  align-items: flex-start;
+}
+
+.graph-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .graph-tip {
@@ -433,6 +491,26 @@ body::before {
   border-color: rgba(13, 106, 100, 0.34);
 }
 
+.graph-node.upstream,
+.graph-node.downstream,
+.graph-node.selected {
+  border-color: rgba(13, 106, 100, 0.3);
+}
+
+.graph-node.upstream {
+  box-shadow: 0 14px 32px rgba(181, 131, 50, 0.14);
+}
+
+.graph-node.downstream,
+.graph-node.selected {
+  box-shadow: 0 14px 32px rgba(13, 106, 100, 0.14);
+}
+
+.graph-node.dimmed {
+  opacity: 0.34;
+  transform: none;
+}
+
 .graph-node::before {
   content: "";
   position: absolute;
@@ -464,6 +542,11 @@ body::before {
 .node-subtitle {
   color: var(--muted);
   font-size: 0.84rem;
+}
+
+.node-io-hint {
+  color: var(--muted);
+  font-size: 0.76rem;
 }
 
 .shape-block {
@@ -531,6 +614,24 @@ body::before {
   word-break: break-word;
 }
 
+.jump-block {
+  margin-top: 14px;
+}
+
+.jump-chip {
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(13, 106, 100, 0.16);
+  background: rgba(13, 106, 100, 0.08);
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.jump-chip:hover {
+  background: rgba(13, 106, 100, 0.12);
+}
+
 .empty-state {
   padding: 18px;
   border-radius: 18px;
@@ -544,16 +645,46 @@ body::before {
   stroke-width: 2.2;
 }
 
+.edge-path.upstream {
+  stroke: rgba(181, 131, 50, 0.82);
+}
+
+.edge-path.downstream {
+  stroke: rgba(13, 106, 100, 0.82);
+}
+
+.edge-path.related {
+  stroke: rgba(90, 118, 143, 0.62);
+}
+
+.edge-path.dimmed {
+  stroke: rgba(76, 93, 108, 0.18);
+}
+
 .edge-label {
   font-family: var(--font-body);
   font-size: 12px;
   fill: var(--muted);
 }
 
+.edge-label.upstream,
+.edge-label.downstream,
+.edge-label.related {
+  fill: var(--ink);
+}
+
+.edge-label.dimmed {
+  opacity: 0.32;
+}
+
 .edge-label-bg {
   fill: rgba(255, 252, 246, 0.92);
   stroke: rgba(33, 25, 16, 0.08);
   stroke-width: 1;
+}
+
+.edge-label-bg.dimmed {
+  opacity: 0.32;
 }
 
 @media (max-width: 1320px) {

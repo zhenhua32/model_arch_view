@@ -361,7 +361,10 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             hidden_shape,
             [f"vocab {vocab_size or '?'}", f"hidden {hidden_size or '?'}"],
             [detail("vocab_size", vocab_size), detail("hidden_size", hidden_size)],
-            [section("输出张量", [detail("embedding", hidden_shape)])],
+            [
+                section("输出张量", [detail("embedding", hidden_shape)]),
+                section("推导公式", [detail("lookup", f"[B, T] -> [B, T, H] = {hidden_shape}")]),
+            ],
             "text",
         ),
         build_node(
@@ -400,6 +403,19 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                         detail("top-k experts", experts_per_tok or "-"),
                     ],
                 ),
+                section(
+                    "推导公式",
+                    [
+                        detail("residual stream", f"[B, T, H] = {hidden_shape}"),
+                        detail("attention view", f"[B, T, n_heads, head_dim] = {attention_shape}"),
+                        detail("kv cache view", f"[B, T, kv_heads, head_dim] = {kv_shape}"),
+                        detail(
+                            "routing / ffn",
+                            f"[B, T, top_k] = {shape(batch, seq_len, experts_per_tok or '-')} over {num_experts} experts" if num_experts else f"[B, T, ffn_hidden] = {shape(batch, seq_len, ffn_hidden or '?')}",
+                        ),
+                        detail("stack repeat", f"{num_layers or '?'} x block with output shape preserved"),
+                    ],
+                ),
             ],
             "core",
             micro_flow=[
@@ -420,7 +436,10 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             logits_shape,
             ["projection", f"vocab {vocab_size or '?'}"],
             [detail("input_hidden", hidden_size), detail("vocab_size", vocab_size)],
-            [section("输出张量", [detail("logits", logits_shape)])],
+            [
+                section("输出张量", [detail("logits", logits_shape)]),
+                section("推导公式", [detail("projection", f"[B, T, H] -> [B, T, vocab] = {logits_shape}")]),
+            ],
             "head",
         ),
         build_node(
@@ -638,7 +657,17 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
             shape(batch, image_patch_count, image_patch_width),
             [f"patches {image_patch_count}", f"merge {merge_size}"],
             [detail("raw_patch_count", image_patch_count), detail("patch_feature_width", image_patch_width), detail("merged_token_count", image_token_count)],
-            [section("预处理参数", [detail("merge_size", merge_size), detail("patch_size", patch_size)])],
+            [
+                section("预处理参数", [detail("merge_size", merge_size), detail("patch_size", patch_size)]),
+                section(
+                    "推导公式",
+                    [
+                        detail("raw patches", f"ceil({image_height}/{patch_size}) * ceil({image_width}/{patch_size}) = {image_patch_count}"),
+                        detail("patch width", f"3 * {patch_size} * {patch_size} = {image_patch_width}"),
+                        detail("merged tokens", f"ceil({image_patch_count} / {max(merge_size, 1) ** 2}) = {image_token_count}"),
+                    ],
+                ),
+            ],
             "vision",
         ),
         build_node(
@@ -666,7 +695,10 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
             shape(batch, image_token_count, projector_hidden),
             [f"to {projector_hidden}", "projector"],
             [detail("projector_out", projector_hidden), detail("vision_tokens", image_token_count)],
-            [section("投影结果", [detail("projected image tokens", shape(batch, image_token_count, projector_hidden))])],
+            [
+                section("投影结果", [detail("projected image tokens", shape(batch, image_token_count, projector_hidden))]),
+                section("推导公式", [detail("projector", f"[B, V, vision_hidden] -> [B, V, language_hidden] = {shape(batch, image_token_count, projector_hidden)}")]),
+            ],
             "fusion",
         ),
         build_node(
@@ -680,7 +712,16 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
             shape(batch, total_tokens, language_hidden),
             [f"total {total_tokens}", "fusion"],
             [detail("text_tokens", seq_len), detail("image_tokens", image_token_count), detail("video_tokens", video_token_count if has_video else 0), detail("total_tokens", total_tokens)],
-            [section("融合后序列", [detail("combined hidden", shape(batch, total_tokens, language_hidden))])],
+            [
+                section("融合后序列", [detail("combined hidden", shape(batch, total_tokens, language_hidden))]),
+                section(
+                    "推导公式",
+                    [
+                        detail("token budget", f"text {seq_len} + image {image_token_count} + video {video_token_count if has_video else 0} = {total_tokens}"),
+                        detail("fusion output", f"[B, total_tokens, H] = {shape(batch, total_tokens, language_hidden)}"),
+                    ],
+                ),
+            ],
             "fusion",
         ),
         build_node(
@@ -755,7 +796,17 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                     shape(batch, video_patch_count, video_patch_width),
                     [f"patches {video_patch_count}", f"tokens {video_token_count}"],
                     [detail("frame_groups", video_frame_groups), detail("raw_patch_count", video_patch_count), detail("merged_token_count", video_token_count)],
-                    [section("时空 patch", [detail("patch width", video_patch_width), detail("temporal_patch", temporal_patch)])],
+                    [
+                        section("时空 patch", [detail("patch width", video_patch_width), detail("temporal_patch", temporal_patch)]),
+                        section(
+                            "推导公式",
+                            [
+                                detail("frame groups", f"ceil({frames}/{temporal_patch}) = {video_frame_groups}"),
+                                detail("raw patches", f"{video_frame_groups} * ceil({image_height}/{patch_size}) * ceil({image_width}/{patch_size}) = {video_patch_count}"),
+                                detail("merged tokens", f"ceil({video_patch_count} / {max(merge_size, 1) ** 2}) = {video_token_count}"),
+                            ],
+                        ),
+                    ],
                     "vision",
                 ),
                 build_node(
@@ -1092,7 +1143,17 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                 shape(batch, latent_channels, latent_height, latent_width),
                 latent_input_badges,
                 [detail("vae_scale", vae_scale), detail("latent_height", latent_height), detail("latent_width", latent_width), detail("latent_channels", latent_channels)],
-                [section("latent 形状", [detail("latent tensor", shape(batch, latent_channels, latent_height, latent_width)), detail("latent tokens", latent_tokens)])],
+                [
+                    section("latent 形状", [detail("latent tensor", shape(batch, latent_channels, latent_height, latent_width)), detail("latent tokens", latent_tokens)]),
+                    section(
+                        "推导公式",
+                        [
+                            detail("latent height", f"ceil({image_height}/{vae_scale}) = {latent_height}"),
+                            detail("latent width", f"ceil({image_width}/{vae_scale}) = {latent_width}"),
+                            detail("latent tokens", f"ceil({latent_height}/{transformer_patch}) * ceil({latent_width}/{transformer_patch}) = {latent_tokens}"),
+                        ],
+                    ),
+                ],
                 "latent",
             ),
             build_node(
@@ -1114,7 +1175,15 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                             detail("latent grid", shape(batch, latent_channels, latent_height, latent_width)),
                             detail("tokenized latent", shape(batch, latent_tokens, transformer_width or "hidden")),
                         ],
-                    )
+                    ),
+                    section(
+                        "推导公式",
+                        [
+                            detail("per step stream", f"[B, latent_tokens, width] = {shape(batch, latent_tokens, transformer_width or 'hidden')}"),
+                            detail("conditioning", f"[B, prompt_tokens, text_hidden] = {shape(batch, prompt_tokens, text_hidden)}"),
+                            detail("scheduler repeat", f"{steps} steps over latent token stream"),
+                        ],
+                    ),
                 ],
                 "core",
                 micro_flow=[
@@ -1134,7 +1203,10 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                 shape(batch, 3, image_height, image_width),
                 [f"scale x{vae_scale}", vae_config.get("_class_name", "vae")],
                 [detail("latent_channels", latent_channels), detail("vae_scale", vae_scale), detail("output_size", shape(batch, 3, image_height, image_width))],
-                [section("解码结果", [detail("image tensor", shape(batch, 3, image_height, image_width))])],
+                [
+                    section("解码结果", [detail("image tensor", shape(batch, 3, image_height, image_width))]),
+                    section("推导公式", [detail("decode", f"[B, C, h, w] -> [B, 3, H, W] = {shape(batch, 3, image_height, image_width)}")]),
+                ],
                 "decode",
             ),
             build_node(

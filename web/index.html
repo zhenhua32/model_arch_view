@@ -50,8 +50,14 @@
           <section id="warnings-panel" class="warnings-panel"></section>
           <section class="panel graph-panel">
             <div class="section-head graph-head">
-              <h2>架构图</h2>
-              <span class="graph-tip">点击节点查看细节；修改左侧参数可重算 shape</span>
+              <div>
+                <h2>架构图</h2>
+                <div class="graph-tip">点击节点查看细节；修改左侧参数可重算 shape；当前视图支持路径聚焦与导出。</div>
+              </div>
+              <div class="graph-actions">
+                <button id="export-json-button" class="ghost-button" type="button" disabled>导出 JSON</button>
+                <button id="export-svg-button" class="ghost-button" type="button" disabled>导出 SVG</button>
+              </div>
             </div>
             <div id="graph-scroll" class="graph-scroll">
               <div id="graph-canvas" class="graph-canvas">
