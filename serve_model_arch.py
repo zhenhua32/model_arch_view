@@ -117,9 +117,33 @@ def count_model_files(model_dir: Path) -> int:
     return sum(1 for path in model_dir.rglob("*") if path.is_file())
 
 
+# Substantive diffusers pipeline component keys (i.e. actual model sub-directories).
+# A bare model_index.json is not sufficient: some LLM checkpoints also ship a
+# model_index.json (e.g. a single "model"/"processor"/"scheduler" map) without any
+# real diffusers component directory, and must be treated as an LLM instead. We
+# require a *substantive* component -- tokenizers/schedulers alone are too generic
+# because many non-diffusers checkpoints carry those keys.
+_DIFFUSERS_COMPONENT_KEYS = {
+    "transformer",
+    "unet",
+    "vae",
+    "text_encoder",
+    "text_encoder_2",
+    "text_encoder_3",
+    "controlnet",
+    "mllm",
+}
+
+
 def classify_model_dir(model_dir: Path) -> str:
-    if (model_dir / "model_index.json").exists():
-        return "diffusers"
+    model_index = model_dir / "model_index.json"
+    if model_index.exists():
+        index_data = read_json_file(model_index) or {}
+        # Only treat it as a diffusers pipeline when it actually declares a
+        # substantive component directory. Otherwise it is most likely an LLM
+        # checkpoint that happens to ship a model_index.json.
+        if any(key in index_data for key in _DIFFUSERS_COMPONENT_KEYS):
+            return "diffusers"
 
     config = primary_config(model_dir)
     params = read_json_file(model_dir / "params.json")
