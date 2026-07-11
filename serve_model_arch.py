@@ -389,6 +389,21 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
 
     previous_repeat_node_id: str | None = None
     for node_id, order, label, subtitle, description, layer_start, layer_end, repeat_count in repeat_specs:
+        if layer_start == 1 and layer_end == num_layers:
+            layer_mask_note = "该模型只有一个 block，mask 规则只应用一次后直接进入输出头。"
+        elif layer_start == 1:
+            layer_mask_note = "首层首次在 embedding 输出上施加 mask 规则，定义后续层共享的可见范围。"
+        elif layer_end == num_layers:
+            layer_mask_note = "末层沿用相同的 mask 规则，最终可见上下文直接送入 LM Head。"
+        else:
+            layer_mask_note = f"中间 {repeat_count} 层重复相同的 mask 规则，不改变可见范围，只重复利用同一注意力约束。"
+
+        mask_window_note = (
+            f"启用 sliding window，每个 query 最多保留最近 {sliding_window} 个历史 token。"
+            if sliding_window
+            else "未启用 sliding window，causal mask 之后保留全部历史 token。"
+        )
+
         repeat_nodes.append(
             build_node(
                 node_id,
@@ -423,6 +438,14 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                             detail("per layer preserve", f"[B, T, H] -> block -> [B, T, H] = {hidden_shape}"),
                             detail("repeat summary", f"该节点代表 {repeat_count} 个 decoder blocks 的重复摘要"),
                             detail("layer span", f"layers {layer_start}..{layer_end}" if layer_start != layer_end else f"layer {layer_start}"),
+                        ],
+                    ),
+                    section(
+                        "Mask 摘要",
+                        [
+                            detail("causal rule", "始终阻止当前 token 看到未来位置。"),
+                            detail("window rule", mask_window_note),
+                            detail("layer role", layer_mask_note),
                         ],
                     ),
                 ],
