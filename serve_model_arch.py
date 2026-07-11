@@ -328,6 +328,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     attention_shape = shape(batch, seq_len, num_heads or "heads", head_dim or "head_dim")
     kv_shape = shape(batch, seq_len, num_kv_heads or "kv_heads", head_dim or "head_dim")
     score_shape = shape(batch, num_heads or "heads", seq_len, seq_len)
+    rope_q_shape = f"Q_rope {attention_shape}; K_rope {kv_shape}"
 
     warnings = [
         "Shape 基于配置文件和当前输入参数推导，不是逐算子运行时真实张量。",
@@ -636,13 +637,46 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             view_modes=["block"],
         ),
         build_node(
-            "decoder_qk_score",
+            "decoder_qk_rope",
             "core",
             4,
+            "RoPE / Positional QK",
+            "对 Q / K 应用位置编码",
+            "在进行打分前，对 Q 和 K 应用旋转位置编码或同类位置编码变换。",
+            f"Q {attention_shape}; K {kv_shape}",
+            rope_q_shape,
+            ["RoPE", f"heads {num_heads or '?'}"],
+            [detail("rope", rope), detail("q shape", attention_shape), detail("k shape", kv_shape)],
+            [
+                section(
+                    "子块形状",
+                    [
+                        detail("q input", attention_shape),
+                        detail("k input", kv_shape),
+                        detail("encoded qk", rope_q_shape),
+                    ],
+                ),
+                section(
+                    "推导公式",
+                    [
+                        detail("rope apply", f"RoPE(Q), RoPE(K) 保持张量阶不变 -> {rope_q_shape}"),
+                        detail("position encoding", "该步骤注入相对或旋转位置关系，再进入 score matrix 计算"),
+                    ],
+                ),
+            ],
+            "core",
+            micro_flow=["Apply RoPE", "Position-aware Q/K"],
+            parent_id="decoder_stack",
+            view_modes=["block"],
+        ),
+        build_node(
+            "decoder_qk_score",
+            "core",
+            5,
             "QK Score",
             "query-key 打分",
             "对每个 query head 计算 QK^T 分数矩阵。",
-            f"Q {attention_shape}; K {kv_shape}",
+            rope_q_shape,
             score_shape,
             [f"{num_heads or '?'} heads", "QK^T"],
             [detail("score_shape", score_shape), detail("seq_len", seq_len), detail("num_attention_heads", num_heads)],
@@ -650,15 +684,14 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 section(
                     "子块形状",
                     [
-                        detail("q input", attention_shape),
-                        detail("k input", kv_shape),
+                        detail("q input", rope_q_shape),
                         detail("score matrix", score_shape),
                     ],
                 ),
                 section(
                     "推导公式",
                     [
-                        detail("score build", f"Q x K^T -> [B, heads, T, T] = {score_shape}"),
+                        detail("score build", f"RoPE(Q) x RoPE(K)^T -> [B, heads, T, T] = {score_shape}"),
                         detail("block repeat", f"score computation appears in each of {num_layers or '?'} layers"),
                     ],
                 ),
@@ -671,7 +704,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_node(
             "decoder_softmax",
             "core",
-            5,
+            6,
             "Softmax",
             "注意力权重归一化",
             "对 QK 分数矩阵按最后一个维度做 softmax，得到注意力权重。",
@@ -703,7 +736,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_node(
             "decoder_weighted_v",
             "core",
-            6,
+            7,
             "Weighted V",
             "注意力加权聚合",
             "用注意力权重对 V 做加权聚合，得到每个 head 的上下文向量。",
@@ -736,7 +769,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_node(
             "decoder_out_proj",
             "core",
-            7,
+            8,
             "Output Projection",
             "concat heads -> hidden",
             "拼接各个注意力 head 的上下文后投影回隐藏维度。",
@@ -768,7 +801,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_node(
             "decoder_ffn",
             "core",
-            8,
+            9,
             "MoE / FFN",
             "每层内的前馈子块",
             "展示每层前馈网络，若模型为 MoE 则突出 routed experts 与 top-k 路由。",
@@ -808,7 +841,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_node(
             "decoder_residual",
             "core",
-            9,
+            10,
             "Residual + Norm",
             "每层输出回写到残差流",
             "表示 attention / FFN 子块之后的残差叠加与归一化。",
@@ -878,8 +911,9 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_edge("token_embedding", "decoder_q_proj", "query branch", ["block"]),
         build_edge("token_embedding", "decoder_k_proj", "key branch", ["block"]),
         build_edge("token_embedding", "decoder_v_proj", "value branch", ["block"]),
-        build_edge("decoder_q_proj", "decoder_qk_score", "Q", ["block"]),
-        build_edge("decoder_k_proj", "decoder_qk_score", "K", ["block"]),
+        build_edge("decoder_q_proj", "decoder_qk_rope", "Q", ["block"]),
+        build_edge("decoder_k_proj", "decoder_qk_rope", "K", ["block"]),
+        build_edge("decoder_qk_rope", "decoder_qk_score", "positional QK", ["block"]),
         build_edge("decoder_qk_score", "decoder_softmax", "scores", ["block"]),
         build_edge("decoder_softmax", "decoder_weighted_v", "weights", ["block"]),
         build_edge("decoder_v_proj", "decoder_weighted_v", "V", ["block"]),

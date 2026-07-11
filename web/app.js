@@ -65,7 +65,7 @@ function getHierarchyModeLabel(mode, payload = state.payload) {
     return "汇总";
   }
   if (mode === "block") {
-    return "单层 Block（Q/K/V/Score/Softmax/Output）";
+    return "单层 Block（Q/K/V/RoPE/Score/Softmax/Output）";
   }
   if (mode === "repeat") {
     const layerCount = extractLlmLayerCount(payload);
