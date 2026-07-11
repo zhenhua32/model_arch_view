@@ -356,6 +356,89 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     if num_experts:
         ffn_badges.append(f"top-{experts_per_tok}")
 
+    repeat_nodes: list[dict[str, Any]] = []
+    repeat_edges: list[dict[str, Any]] = []
+
+    if num_layers <= 1:
+        repeat_specs = [
+            ("decoder_layer_1", 1, "Layer 1", "唯一的一层 decoder block", "该模型只有一个 decoder block，因此重复层摘要退化为单层视图。", 1, 1, 1),
+        ]
+    elif num_layers == 2:
+        repeat_specs = [
+            ("decoder_layer_1", 1, "Layer 1", "首层 decoder block", "表示第一个 decoder block 的摘要。", 1, 1, 1),
+            ("decoder_layer_2", 2, f"Layer {num_layers}", "末层 decoder block", "表示最后一个 decoder block 的摘要。", num_layers, num_layers, 1),
+        ]
+    else:
+        repeat_specs = [
+            ("decoder_layer_1", 1, "Layer 1", "首层 decoder block", "表示第一个 decoder block 的摘要。", 1, 1, 1),
+            (
+                "decoder_layer_mid",
+                2,
+                f"Layers 2..{num_layers - 1}",
+                f"中间 {num_layers - 2} 层的重复摘要",
+                "把中间重复出现的大部分 decoder blocks 折叠为一个摘要节点。",
+                2,
+                num_layers - 1,
+                num_layers - 2,
+            ),
+            ("decoder_layer_last", 3, f"Layer {num_layers}", "末层 decoder block", "表示最后一个 decoder block 的摘要。", num_layers, num_layers, 1),
+        ]
+
+    previous_repeat_node_id: str | None = None
+    for node_id, order, label, subtitle, description, layer_start, layer_end, repeat_count in repeat_specs:
+        repeat_nodes.append(
+            build_node(
+                node_id,
+                "core",
+                order,
+                label,
+                subtitle,
+                description,
+                hidden_shape,
+                hidden_shape,
+                [f"{repeat_count}x block", f"layers {layer_start}..{layer_end}" if layer_start != layer_end else f"layer {layer_start}"],
+                [
+                    detail("layer_start", layer_start),
+                    detail("layer_end", layer_end),
+                    detail("repeat_count", repeat_count),
+                    detail("hidden_size", hidden_size),
+                    detail("num_attention_heads", num_heads),
+                ],
+                [
+                    section(
+                        "块摘要",
+                        [
+                            detail("block input", hidden_shape),
+                            detail("attention sub-block", attention_shape),
+                            detail("ffn / moe sub-block", shape(batch, seq_len, ffn_hidden or "ffn")),
+                            detail("block output", hidden_shape),
+                        ],
+                    ),
+                    section(
+                        "推导公式",
+                        [
+                            detail("per layer preserve", f"[B, T, H] -> block -> [B, T, H] = {hidden_shape}"),
+                            detail("repeat summary", f"该节点代表 {repeat_count} 个 decoder blocks 的重复摘要"),
+                            detail("layer span", f"layers {layer_start}..{layer_end}" if layer_start != layer_end else f"layer {layer_start}"),
+                        ],
+                    ),
+                ],
+                "core",
+                micro_flow=["Attention", "FFN / MoE", "Residual"],
+                parent_id="decoder_stack",
+                view_modes=["repeat"],
+            )
+        )
+
+        if previous_repeat_node_id is None:
+            repeat_edges.append(build_edge("token_embedding", node_id, "layer stream", ["repeat"]))
+        else:
+            repeat_edges.append(build_edge(previous_repeat_node_id, node_id, "next repeated block", ["repeat"]))
+        previous_repeat_node_id = node_id
+
+    if previous_repeat_node_id is not None:
+        repeat_edges.append(build_edge(previous_repeat_node_id, "lm_head", "stack output", ["repeat"]))
+
     nodes = [
         build_node(
             "token_input",
@@ -485,7 +568,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             "core",
             micro_flow=["QKV projection", "Scaled attention", "Output projection"],
             parent_id="decoder_stack",
-            view_modes=["expanded"],
+            view_modes=["block"],
         ),
         build_node(
             "decoder_ffn",
@@ -525,7 +608,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             "core",
             micro_flow=["Gate / router" if num_experts else "Up projection", "Experts / FFN", "Down projection"],
             parent_id="decoder_stack",
-            view_modes=["expanded"],
+            view_modes=["block"],
         ),
         build_node(
             "decoder_residual",
@@ -557,8 +640,9 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             "core",
             micro_flow=["Residual add", "Normalization", "Pass to next layer"],
             parent_id="decoder_stack",
-            view_modes=["expanded"],
+            view_modes=["block"],
         ),
+        *repeat_nodes,
         build_node(
             "lm_head",
             "head",
@@ -596,10 +680,11 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_edge("token_input", "token_embedding", "lookup"),
         build_edge("token_embedding", "decoder_stack", "hidden stream", ["summary"]),
         build_edge("decoder_stack", "lm_head", "final hidden", ["summary"]),
-        build_edge("token_embedding", "decoder_attention", "block input", ["expanded"]),
-        build_edge("decoder_attention", "decoder_ffn", "attention output", ["expanded"]),
-        build_edge("decoder_ffn", "decoder_residual", "ffn output", ["expanded"]),
-        build_edge("decoder_residual", "lm_head", "stack output", ["expanded"]),
+        build_edge("token_embedding", "decoder_attention", "block input", ["block"]),
+        build_edge("decoder_attention", "decoder_ffn", "attention output", ["block"]),
+        build_edge("decoder_ffn", "decoder_residual", "ffn output", ["block"]),
+        build_edge("decoder_residual", "lm_head", "stack output", ["block"]),
+        *repeat_edges,
         build_edge("lm_head", "logits", "vocab projection"),
     ]
 

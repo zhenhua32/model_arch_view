@@ -54,6 +54,26 @@ function updateExportButtons() {
   ui.exportSvgButton.disabled = disabled;
 }
 
+function extractLlmLayerCount(payload = state.payload) {
+  const summaryItem = payload?.model?.summary?.find?.((item) => item.label === "层数");
+  const numeric = Number.parseInt(summaryItem?.value ?? "", 10);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function getHierarchyModeLabel(mode, payload = state.payload) {
+  if (mode === "summary") {
+    return "汇总";
+  }
+  if (mode === "block") {
+    return "单层 Block";
+  }
+  if (mode === "repeat") {
+    const layerCount = extractLlmLayerCount(payload);
+    return layerCount ? `重复 ${layerCount} 层摘要` : "重复 N 层摘要";
+  }
+  return mode;
+}
+
 function getHierarchyMode(payload = state.payload) {
   if (payload?.model?.type !== "llm") {
     return "all";
@@ -96,6 +116,14 @@ function syncSelectedNode(payload = state.payload) {
   if (hiddenNode?.parentId && visibleIds.has(hiddenNode.parentId)) {
     state.selectedNodeId = hiddenNode.parentId;
     return;
+  }
+
+  if (hiddenNode?.parentId) {
+    const siblingNode = fullNodes.find((node) => node.parentId === hiddenNode.parentId && visibleIds.has(node.id));
+    if (siblingNode) {
+      state.selectedNodeId = siblingNode.id;
+      return;
+    }
   }
 
   const visibleChild = fullNodes.find((node) => node.parentId === state.selectedNodeId && visibleIds.has(node.id));
@@ -414,7 +442,7 @@ function renderSummary() {
     ? `
       <div class="detail-section">
         <h3>LLM 层级视图</h3>
-        <div class="flow-strip">${renderChipPairs([{ label: "当前视图", value: state.llmHierarchyMode === "summary" ? "汇总" : "展开" }])}</div>
+        <div class="flow-strip">${renderChipPairs([{ label: "当前视图", value: getHierarchyModeLabel(state.llmHierarchyMode, payload) }])}</div>
       </div>
     `
     : "";
@@ -915,7 +943,7 @@ ui.hierarchyToolbar.addEventListener("click", (event) => {
   renderSummary();
   renderGraph();
   renderDetails();
-  setStatus(`已切换为 ${state.llmHierarchyMode === "summary" ? "汇总" : "展开"} 层级视图。`);
+  setStatus(`已切换为 ${getHierarchyModeLabel(state.llmHierarchyMode)} 层级视图。`);
 });
 ui.exportJsonButton.addEventListener("click", exportCurrentPayload);
 ui.exportSvgButton.addEventListener("click", exportCurrentSvg);
