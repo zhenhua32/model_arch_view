@@ -59,6 +59,24 @@ def clamp_int(value: Any, default: int, minimum: int = 1, maximum: int | None = 
     return parsed
 
 
+def scalar_int(value: Any, default: int = 1) -> int:
+    """Coerce a possibly list/tuple-valued config field to a single int.
+
+    Video diffusion transformers often express patch_size as [t, h, w]; for
+    spatial token accounting we want the spatial (last) dimension. Falls back to
+    ``default`` when the value cannot be parsed.
+    """
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return default
+        value = value[-1]
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def ceil_div(numerator: int, denominator: int) -> int:
     if denominator <= 0:
         return numerator
@@ -290,13 +308,176 @@ def summarize_layer_pattern(layer_types: Any) -> str | None:
     return f"linear={linear_attention}, full={full_attention}"
 
 
+def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Parse the architecture dimensions used for parameter/KV/FLOPs estimation.
+
+    Single source of truth for both ``build_llm_payload`` and the test-suite so the
+    numbers rendered in the UI are exactly what the tests assert on. All aliases
+    (Qwen/DeepSeek/GLM/LongCat/params.json-style) are resolved here.
+    """
+    params_config = params_config or {}
+    moe_config = params_config.get("moe") if isinstance(params_config.get("moe"), dict) else {}
+
+    hidden_size = int(first_defined(config.get("hidden_size"), params_config.get("dim"), 0) or 0)
+    num_layers = int(first_defined(config.get("num_hidden_layers"), config.get("num_layers"), params_config.get("n_layers"), 0) or 0)
+    num_heads = int(first_defined(config.get("num_attention_heads"), params_config.get("n_heads"), 0) or 0)
+    num_kv_heads = int(first_defined(config.get("num_key_value_heads"), params_config.get("n_kv_heads"), num_heads) or num_heads or 0)
+    head_dim = int(first_defined(config.get("head_dim"), params_config.get("head_dim"), hidden_size // num_heads if hidden_size and num_heads else 0) or 0)
+    ffn_hidden = int(first_defined(config.get("intermediate_size"), params_config.get("hidden_dim"), config.get("moe_intermediate_size"), 0) or 0)
+    vocab_size = int(first_defined(config.get("vocab_size"), params_config.get("vocab_size"), 0) or 0)
+
+    num_experts = int(first_defined(config.get("n_routed_experts"), config.get("num_experts"), config.get("num_local_experts"), moe_config.get("num_experts"), 0) or 0)
+    experts_per_tok = int(first_defined(config.get("num_experts_per_tok"), moe_config.get("num_experts_per_tok"), 0) or 0)
+    moe_ffn_hidden = int(first_defined(config.get("moe_intermediate_size"), config.get("expert_ffn_hidden_size"), moe_config.get("moe_intermediate_size"), 0) or 0)
+    n_shared_experts = int(first_defined(config.get("n_shared_experts"), moe_config.get("n_shared_experts"), 0) or 0)
+    first_k_dense = int(first_defined(config.get("first_k_dense_replace"), config.get("n_dense_layers"), 0) or 0)
+    tie_word_embeddings = bool(first_defined(config.get("tie_word_embeddings"), params_config.get("tie_word_embeddings"), False))
+
+    q_lora_rank = int(first_defined(config.get("q_lora_rank"), 0) or 0)
+    kv_lora_rank = int(first_defined(config.get("kv_lora_rank"), config.get("kv_lora_a"), 0) or 0)
+    qk_rope_head_dim = int(first_defined(config.get("qk_rope_head_dim"), 0) or 0)
+    qk_nope_head_dim = int(first_defined(
+        config.get("qk_nope_head_dim"),
+        (head_dim - qk_rope_head_dim) if (head_dim and qk_rope_head_dim) else head_dim,
+        0,
+    ) or 0)
+    qk_head_dim = int(first_defined(
+        config.get("qk_head_dim"),
+        (qk_nope_head_dim + qk_rope_head_dim) if (qk_nope_head_dim and qk_rope_head_dim) else head_dim,
+        0,
+    ) or 0)
+    v_head_dim = int(first_defined(config.get("v_head_dim"), head_dim) or 0)
+
+    return {
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "ffn_hidden": ffn_hidden,
+        "vocab_size": vocab_size,
+        "num_experts": num_experts,
+        "experts_per_tok": experts_per_tok,
+        "moe_ffn_hidden": moe_ffn_hidden,
+        "n_shared_experts": n_shared_experts,
+        "first_k_dense": first_k_dense,
+        "tie_word_embeddings": tie_word_embeddings,
+        "q_lora_rank": q_lora_rank,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "qk_head_dim": qk_head_dim,
+        "v_head_dim": v_head_dim,
+        "is_mla": q_lora_rank > 0,
+    }
+
+
+def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
+    """Estimate parameter count, KV-cache size and per-token FLOPs from parsed dims.
+
+    Returns ``None`` when the config lacks the minimum required fields
+    (``hidden_size`` and ``num_layers``). All returned figures are raw numbers:
+      - total_params / active_params: parameter counts
+      - kv_cache_mb_per_1k: MiB of KV cache per 1K tokens per batch element
+      - gflops_per_token: 2 * active_params / 1e9
+    plus a per-component breakdown for white-box assertions.
+    """
+    hidden_size = dims["hidden_size"]
+    num_layers = dims["num_layers"]
+    if not hidden_size or not num_layers:
+        return None
+
+    num_heads = dims["num_heads"]
+    num_kv_heads = dims["num_kv_heads"]
+    head_dim = dims["head_dim"]
+    ffn_hidden = dims["ffn_hidden"]
+    vocab_size = dims["vocab_size"]
+    num_experts = dims["num_experts"]
+    experts_per_tok = dims["experts_per_tok"]
+    moe_ffn_hidden = dims["moe_ffn_hidden"]
+    n_shared_experts = dims["n_shared_experts"]
+    first_k_dense = dims["first_k_dense"]
+    tie_word_embeddings = dims["tie_word_embeddings"]
+    is_mla = dims["is_mla"]
+    q_lora_rank = dims["q_lora_rank"]
+    kv_lora_rank = dims["kv_lora_rank"]
+    qk_rope_head_dim = dims["qk_rope_head_dim"]
+    qk_nope_head_dim = dims["qk_nope_head_dim"]
+    qk_head_dim = dims["qk_head_dim"]
+    v_head_dim = dims["v_head_dim"]
+
+    # ---- Attention params per layer ----
+    if is_mla:
+        if q_lora_rank:
+            q_params = hidden_size * q_lora_rank + q_lora_rank * num_heads * (qk_head_dim or head_dim)
+        else:
+            q_params = hidden_size * num_heads * (qk_head_dim or head_dim)
+        kv_down = hidden_size * ((kv_lora_rank or head_dim) + qk_rope_head_dim)
+        kv_up = (kv_lora_rank or head_dim) * num_heads * ((qk_nope_head_dim or head_dim) + (v_head_dim or head_dim))
+        o_params = num_heads * (v_head_dim or head_dim) * hidden_size
+        attn_params = q_params + kv_down + kv_up + o_params
+    else:
+        q_dim = (num_heads * head_dim) if (num_heads and head_dim) else hidden_size
+        kv_dim = (num_kv_heads * head_dim) if (num_kv_heads and head_dim) else q_dim
+        attn_params = (
+            hidden_size * q_dim          # q_proj
+            + hidden_size * kv_dim       # k_proj
+            + hidden_size * kv_dim       # v_proj
+            + q_dim * hidden_size        # o_proj
+        )
+
+    # ---- FFN / MoE params ----
+    dense_ffn_dim = ffn_hidden or (hidden_size * 4)
+    dense_ffn_params = 3 * hidden_size * dense_ffn_dim
+    if num_experts:
+        expert_dim = moe_ffn_hidden or dense_ffn_dim
+        expert_params = 3 * hidden_size * expert_dim
+        routed_total = expert_params * num_experts
+        routed_active = expert_params * experts_per_tok if experts_per_tok else expert_params
+        shared_params = expert_params * n_shared_experts  # always active
+        n_dense_layers = min(first_k_dense, num_layers) if first_k_dense else 0
+        n_moe_layers = num_layers - n_dense_layers
+        ffn_total = n_dense_layers * dense_ffn_params + n_moe_layers * (routed_total + shared_params)
+        ffn_active = n_dense_layers * dense_ffn_params + n_moe_layers * (routed_active + shared_params)
+    else:
+        ffn_total = ffn_active = num_layers * dense_ffn_params
+
+    embed_params = hidden_size * (vocab_size or 0)
+    embed_total = embed_params if tie_word_embeddings else embed_params * 2
+    total_params = attn_params * num_layers + ffn_total + embed_total
+    active_params = attn_params * num_layers + ffn_active + embed_params
+
+    # ---- KV cache (per 1K tokens per batch element) ----
+    kv_cache_mb_per_1k: float | None = None
+    if is_mla:
+        kv_elems = num_layers * ((kv_lora_rank or head_dim) + qk_rope_head_dim)
+        kv_bytes = kv_elems * 2  # latent stored in bf16
+        kv_cache_mb_per_1k = kv_bytes * 1024 / (1024 * 1024)
+    elif num_kv_heads and head_dim:
+        kv_bytes = 2 * num_layers * num_kv_heads * head_dim * 2  # K+V, fp16
+        kv_cache_mb_per_1k = kv_bytes * 1024 / (1024 * 1024)
+
+    return {
+        "total_params": total_params,
+        "active_params": active_params,
+        "kv_cache_mb_per_1k": kv_cache_mb_per_1k,
+        "gflops_per_token": 2 * active_params / 1e9,
+        # component breakdown (white-box)
+        "attn_params_per_layer": attn_params,
+        "ffn_total": ffn_total,
+        "ffn_active": ffn_active,
+        "embed_params": embed_params,
+        "embed_total": embed_total,
+    }
+
+
 def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
     config = primary_config(model_dir)
     params_config = read_json_file(model_dir / "params.json")
     architecture = infer_architecture_name(model_dir, "llm")
 
     hidden_size = int(first_defined(config.get("hidden_size"), params_config.get("dim"), 0) or 0)
-    num_layers = int(first_defined(config.get("num_hidden_layers"), params_config.get("n_layers"), 0) or 0)
+    num_layers = int(first_defined(config.get("num_hidden_layers"), config.get("num_layers"), params_config.get("n_layers"), 0) or 0)
     num_heads = int(first_defined(config.get("num_attention_heads"), params_config.get("n_heads"), 0) or 0)
     num_kv_heads = int(first_defined(config.get("num_key_value_heads"), params_config.get("n_kv_heads"), num_heads) or num_heads or 0)
     head_dim = int(first_defined(config.get("head_dim"), params_config.get("head_dim"), hidden_size // num_heads if hidden_size and num_heads else 0) or 0)
@@ -306,12 +487,13 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     sliding_window = int(first_defined(config.get("sliding_window"), config.get("sliding_window_size"), params_config.get("sliding_window_size"), 0) or 0)
 
     moe_config = params_config.get("moe") if isinstance(params_config.get("moe"), dict) else {}
-    num_experts = int(first_defined(config.get("n_routed_experts"), config.get("num_experts"), moe_config.get("num_experts"), 0) or 0)
+    num_experts = int(first_defined(config.get("n_routed_experts"), config.get("num_experts"), config.get("num_local_experts"), moe_config.get("num_experts"), 0) or 0)
     experts_per_tok = int(first_defined(config.get("num_experts_per_tok"), moe_config.get("num_experts_per_tok"), 0) or 0)
     # MoE expert FFN dim (routed & shared experts), shared-expert count, and dense-layer count.
-    moe_ffn_hidden = int(first_defined(config.get("moe_intermediate_size"), moe_config.get("moe_intermediate_size"), 0) or 0)
+    moe_ffn_hidden = int(first_defined(config.get("moe_intermediate_size"), config.get("expert_ffn_hidden_size"), moe_config.get("moe_intermediate_size"), 0) or 0)
     n_shared_experts = int(first_defined(config.get("n_shared_experts"), moe_config.get("n_shared_experts"), 0) or 0)
     first_k_dense = int(first_defined(config.get("first_k_dense_replace"), config.get("n_dense_layers"), 0) or 0)
+    tie_word_embeddings = bool(first_defined(config.get("tie_word_embeddings"), params_config.get("tie_word_embeddings"), False))
     quant = first_defined(
         config.get("quantization_config", {}).get("quant_method") if isinstance(config.get("quantization_config"), dict) else None,
         params_config.get("quantization", {}).get("qformat_weight") if isinstance(params_config.get("quantization"), dict) else None,
@@ -1174,60 +1356,18 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     if num_experts:
         summary.append(detail("MoE", f"{num_experts} experts / top-{experts_per_tok}"))
 
-    # Runtime estimation
-    if hidden_size and num_layers:
-        # ---- Attention params per layer ----
-        if is_mla:
-            # MLA: low-rank Q/KV projections + output proj (DeepSeek/GLM-MoE style).
-            # q_a: H->q_lora ; q_b: q_lora->heads*qk_head
-            if q_lora_rank:
-                q_params = hidden_size * q_lora_rank + q_lora_rank * num_heads * (qk_head_dim or head_dim)
-            else:
-                q_params = hidden_size * num_heads * (qk_head_dim or head_dim)
-            # kv_a: H->(kv_lora + rope) ; kv_b: kv_lora->heads*(qk_nope + v_head)
-            kv_down = hidden_size * ((kv_lora_rank or head_dim) + qk_rope_head_dim)
-            kv_up = (kv_lora_rank or head_dim) * num_heads * ((qk_nope_head_dim or head_dim) + (v_head_dim or head_dim))
-            o_params = num_heads * (v_head_dim or head_dim) * hidden_size
-            attn_params = q_params + kv_down + kv_up + o_params
-        else:
-            attn_params = 2 * hidden_size * hidden_size + 2 * hidden_size * (num_kv_heads * head_dim if num_kv_heads and head_dim else hidden_size)
-
-        # ---- FFN / MoE params ----
-        dense_ffn_dim = ffn_hidden or (hidden_size * 4)
-        dense_ffn_params = 3 * hidden_size * dense_ffn_dim
-        if num_experts:
-            # Routed & shared experts use moe_intermediate_size, NOT the dense intermediate_size.
-            expert_dim = moe_ffn_hidden or dense_ffn_dim
-            expert_params = 3 * hidden_size * expert_dim
-            routed_total = expert_params * num_experts
-            routed_active = expert_params * experts_per_tok if experts_per_tok else expert_params
-            shared_params = expert_params * n_shared_experts  # always active
-            # First `first_k_dense` layers are dense FFN; the rest are MoE.
-            n_dense_layers = min(first_k_dense, num_layers) if first_k_dense else 0
-            n_moe_layers = num_layers - n_dense_layers
-            ffn_total = n_dense_layers * dense_ffn_params + n_moe_layers * (routed_total + shared_params)
-            ffn_active = n_dense_layers * dense_ffn_params + n_moe_layers * (routed_active + shared_params)
-        else:
-            ffn_total = ffn_active = num_layers * dense_ffn_params
-
-        embed_params = hidden_size * (vocab_size or 0)
-        # Total counts embed + lm_head (untied); active compute counts lm_head only (embed is a lookup).
-        total_params = attn_params * num_layers + ffn_total + embed_params * 2
-        active_params = attn_params * num_layers + ffn_active + embed_params
+    # Runtime estimation (shared with the test-suite via estimate_llm_metrics).
+    metrics = estimate_llm_metrics(parse_llm_dims(config, params_config))
+    if metrics is not None:
+        total_params = metrics["total_params"]
+        active_params = metrics["active_params"]
         summary.append(detail("参数量", f"{total_params / 1e9:.2f}B" + (f" (active {active_params / 1e9:.2f}B)" if num_experts else "")))
 
-        if is_mla:
-            # MLA caches only the compressed latent (kv_lora) + decoupled RoPE key, shared across heads.
-            kv_elems = num_layers * ((kv_lora_rank or head_dim) + qk_rope_head_dim)
-            kv_bytes = kv_elems * 2  # latent stored in bf16
-            kv_per_1k = kv_bytes * 1024 / (1024 * 1024)
-            summary.append(detail("KV cache", f"{kv_per_1k:.1f} MB / 1K tokens / batch"))
-        elif num_kv_heads and head_dim:
-            kv_bytes = 2 * num_layers * num_kv_heads * head_dim * 2  # K+V, fp16
-            kv_per_1k = kv_bytes * 1024 / (1024 * 1024)
+        kv_per_1k = metrics["kv_cache_mb_per_1k"]
+        if kv_per_1k is not None:
             summary.append(detail("KV cache", f"{kv_per_1k:.1f} MB / 1K tokens / batch"))
 
-        summary.append(detail("推理 FLOPs", f"{2 * active_params / 1e9:.1f} GFLOPs / token"))
+        summary.append(detail("推理 FLOPs", f"{metrics['gflops_per_token']:.1f} GFLOPs / token"))
 
     controls = [
         {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 16, "step": 1, "help": "并行样本数"},
@@ -1911,7 +2051,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     latent_channels = int(first_defined(vae_config.get("latent_channels"), vae_config.get("z_dim"), transformer_config.get("in_channels"), 4) or 4)
     latent_height = ceil_div(image_height, vae_scale)
     latent_width = ceil_div(image_width, vae_scale)
-    transformer_patch = int(first_defined(transformer_config.get("patch_size"), model_index.get("patch_size"), 1) or 1)
+    transformer_patch = scalar_int(first_defined(transformer_config.get("patch_size"), model_index.get("patch_size"), 1), 1)
     latent_tokens = ceil_div(latent_height, transformer_patch) * ceil_div(latent_width, transformer_patch)
     transformer_width = infer_transformer_width(transformer_config)
     transformer_layers = int(first_defined(transformer_config.get("num_layers"), transformer_config.get("num_double_stream_layers"), 0) or 0)
