@@ -224,6 +224,20 @@ html, body {
 .gpu-card.gpu-mid .gpu-count { color: var(--amber); }
 .gpu-card.gpu-heavy { border-color: rgba(225, 29, 72, 0.3); background: rgba(225, 29, 72, 0.06); }
 .gpu-card.gpu-heavy .gpu-count { color: var(--rose); }
+.gpu-vram { font-size: 0.72rem; color: var(--muted); margin-left: auto; margin-right: 8px; }
+
+/* ---- formula disclosure (参数构成 / 显存成本) ---- */
+.formula-box { margin-top: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--panel-strong); }
+.formula-box > summary { cursor: pointer; padding: 8px 12px; font-size: 0.8rem; font-weight: 600; color: var(--muted); list-style: none; user-select: none; }
+.formula-box > summary::-webkit-details-marker { display: none; }
+.formula-box > summary::before { content: "▸ "; color: var(--accent); }
+.formula-box[open] > summary::before { content: "▾ "; }
+.formula-list { padding: 4px 12px 10px; display: grid; gap: 6px; }
+.formula-row { display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; gap: 8px; align-items: baseline; font-size: 0.76rem; line-height: 1.45; }
+.formula-k { color: var(--accent); font-weight: 600; white-space: nowrap; }
+.formula-eq { color: var(--muted); font-family: var(--font-mono); word-break: break-word; }
+.formula-v { color: var(--ink); font-weight: 600; font-family: var(--font-mono); white-space: nowrap; }
+.formula-note { padding: 0 12px 12px; color: var(--muted); font-size: 0.74rem; line-height: 1.5; font-family: var(--font-mono); }
 
 .tp-head, .tp-row { display: grid; grid-template-columns: 1.3fr 1fr 1fr 0.9fr; align-items: center; gap: 8px; padding: 7px 4px; }
 .tp-head { border-bottom: 1px solid var(--line); color: var(--muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; }

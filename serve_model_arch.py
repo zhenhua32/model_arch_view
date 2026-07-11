@@ -455,6 +455,9 @@ def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
     dense_ffn_dim = ffn_hidden or (hidden_size * 4)
     dense_ffn_params = 3 * hidden_size * dense_ffn_dim
     # Per-component FFN totals (total-parameter convention) for the breakdown chart.
+    expert_params = 0
+    n_dense_layers = 0
+    n_moe_layers = 0
     routed_experts_total = 0
     shared_experts_total = 0
     dense_ffn_total = 0
@@ -506,6 +509,10 @@ def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
         "ffn_active": ffn_active,
         "embed_params": embed_params,
         "embed_total": embed_total,
+        "expert_params": expert_params,
+        "dense_ffn_params": dense_ffn_params,
+        "n_dense_layers": n_dense_layers,
+        "n_moe_layers": n_moe_layers,
         "breakdown": {
             "attention": attn_total,
             "routed_experts": routed_experts_total,
@@ -576,6 +583,7 @@ def estimate_memory_footprint(
         "precision": precision,
         "batch": batch,
         "seq_len": seq_len,
+        "bytes_per_param": PRECISION_BYTES[precision],
         "weights_bytes": weights_bytes,
         "kv_bytes": kv_bytes,
         "activation_bytes": activation_bytes,
@@ -1505,7 +1513,8 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         summary.append(detail("MoE", f"{num_experts} experts / top-{experts_per_tok}"))
 
     # Runtime estimation (shared with the test-suite via estimate_llm_metrics).
-    metrics = estimate_llm_metrics(parse_llm_dims(config, params_config))
+    dims = parse_llm_dims(config, params_config)
+    metrics = estimate_llm_metrics(dims)
     if metrics is not None:
         total_params = metrics["total_params"]
         active_params = metrics["active_params"]
@@ -1553,6 +1562,28 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             "num_layers": metrics["num_layers"],
             "is_moe": bool(num_experts),
             "breakdown": metrics["breakdown"],
+            "formula_terms": {
+                "hidden_size": dims["hidden_size"],
+                "num_layers": dims["num_layers"],
+                "num_heads": dims["num_heads"],
+                "num_kv_heads": dims["num_kv_heads"],
+                "head_dim": dims["head_dim"],
+                "ffn_hidden": dims["ffn_hidden"],
+                "vocab_size": dims["vocab_size"],
+                "num_experts": dims["num_experts"],
+                "experts_per_tok": dims["experts_per_tok"],
+                "moe_ffn_hidden": dims["moe_ffn_hidden"],
+                "n_shared_experts": dims["n_shared_experts"],
+                "first_k_dense": dims["first_k_dense"],
+                "tie_word_embeddings": dims["tie_word_embeddings"],
+                "is_mla": dims["is_mla"],
+                "attn_per_layer": metrics["attn_params_per_layer"],
+                "expert_per": metrics["expert_params"],
+                "dense_ffn_per": metrics["dense_ffn_params"],
+                "n_dense_layers": metrics["n_dense_layers"],
+                "n_moe_layers": metrics["n_moe_layers"],
+                "embed_params": metrics["embed_params"],
+            },
             "memory": estimate_memory_footprint(metrics, precision, batch, seq_len),
             "throughput": estimate_throughput(metrics, precision, seq_len),
             "gpu_reference": GPU_REFERENCE,

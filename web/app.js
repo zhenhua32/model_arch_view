@@ -490,6 +490,14 @@ function formatTps(v) {
   return v >= 1 ? v.toFixed(0) : v.toFixed(1);
 }
 
+function formatCount(v) {
+  return Number(v || 0).toLocaleString("en-US");
+}
+
+function formulaRow(k, expr, val) {
+  return `<div class="formula-row"><span class="formula-k">${escapeHtml(k)}</span><span class="formula-eq">${escapeHtml(expr)}</span><span class="formula-v">${escapeHtml(val)}</span></div>`;
+}
+
 function renderStackedBar(items, total) {
   if (!total) return "";
   const segments = items
@@ -528,12 +536,37 @@ function renderBreakdownSection(metrics) {
          <span class="active-val">${formatB(metrics.active_params)} · ${(metrics.active_params / total * 100).toFixed(1)}%</span>
        </div>`
     : "";
+
+  const ft = metrics.formula_terms || {};
+  const attnNote = ft.is_mla
+    ? `注意力(层) = hidden×q_lora + q_lora×heads×qk_head_dim + hidden×(kv_lora+qk_rope) + kv_lora×heads×(qk_nope+v_head) + heads×v_head×hidden`
+    : `注意力(层) = hidden×q_dim + hidden×kv_dim×2 + q_dim×hidden，其中 q_dim=heads×head_dim，kv_dim=kv_heads×head_dim`;
+  const rows = [formulaRow("注意力", `${formatCount(ft.attn_per_layer)} × ${ft.num_layers} 层`, formatB(bd.attention))];
+  if (metrics.is_moe) {
+    rows.push(formulaRow("路由专家", `${ft.n_moe_layers} 层 × ${ft.num_experts} 专家 × ${formatCount(ft.expert_per)}`, formatB(bd.routed_experts)));
+    if (bd.shared_experts > 0) {
+      rows.push(formulaRow("共享专家", `${ft.n_moe_layers} 层 × ${ft.n_shared_experts} 共享 × ${formatCount(ft.expert_per)}`, formatB(bd.shared_experts)));
+    }
+  }
+  if (bd.dense_ffn > 0) {
+    rows.push(formulaRow("稠密 FFN", `${ft.n_dense_layers} 层 × ${formatCount(ft.dense_ffn_per)}`, formatB(bd.dense_ffn)));
+  }
+  rows.push(formulaRow("嵌入/输出头", `hidden×vocab${ft.tie_word_embeddings ? " ×1 (权重共享)" : " ×2"} = ${formatCount(ft.embed_params)}${ft.tie_word_embeddings ? "" : " ×2"}`, formatB(bd.embedding)));
+  rows.push(formulaRow("总计", `注意力 + 路由 + 共享 + 稠密 + 嵌入`, formatB(total)));
+  const formula = `
+    <details class="formula-box">
+      <summary>计算公式</summary>
+      <div class="formula-note">${escapeHtml(attnNote)}</div>
+      <div class="formula-list">${rows.join("")}</div>
+    </details>`;
+
   return `
     <div class="detail-section">
       <h3>参数构成 <span class="subtle">共 ${formatB(total)}</span></h3>
       ${bar}
       <div class="legend">${legend}</div>
       ${activeBar}
+      ${formula}
     </div>`;
 }
 
@@ -556,9 +589,26 @@ function renderMemorySection(metrics) {
   const gpus = (mem.gpu_fit || [])
     .map((g) => {
       const cls = g.count <= 1 ? "gpu-ok" : g.count <= 4 ? "gpu-mid" : "gpu-heavy";
-      return `<div class="gpu-card ${cls}"><span class="gpu-name">${escapeHtml(g.name)}</span><span class="gpu-count">×${g.count}</span></div>`;
+      return `<div class="gpu-card ${cls}"><span class="gpu-name">${escapeHtml(g.name)}</span><span class="gpu-vram">${g.mem_gb} GB</span><span class="gpu-count">×${g.count}</span></div>`;
     })
     .join("");
+  const ft = metrics.formula_terms || {};
+  const bpp = mem.bytes_per_param;
+  const memRows = [
+    formulaRow("权重", `总参数 × ${bpp}B/参数 = ${formatB(metrics.total_params)} × ${bpp}`, formatGB(mem.weights_bytes)),
+    formulaRow("KV cache", `每token ${formatCount(mem.kv_bytes_per_token)}B × seq ${mem.seq_len} × batch ${mem.batch}`, formatGB(mem.kv_bytes)),
+    formulaRow("激活", `batch×seq×hidden×layers×2×2B = ${mem.batch}×${mem.seq_len}×${ft.hidden_size}×${ft.num_layers}×2×2`, formatGB(mem.activation_bytes)),
+    formulaRow("总需求", `权重 + KV + 激活`, `${mem.total_gb.toFixed(1)} GB`),
+  ];
+  const gpuNote = mem.gpu_fit && mem.gpu_fit.length
+    ? `GPU 卡数 = ⌈总需求 / (显存 × 0.9)⌉（仅约 90% 显存可用于模型）`
+    : "";
+  const formula = `
+    <details class="formula-box">
+      <summary>计算公式</summary>
+      <div class="formula-list">${memRows.join("")}</div>
+      <div class="formula-note">${escapeHtml(gpuNote)}</div>
+    </details>`;
   return `
     <div class="detail-section">
       <h3>显存 &amp; 成本 <span class="est-badge">粗估 · ${escapeHtml(mem.precision)}</span></h3>
@@ -566,6 +616,7 @@ function renderMemorySection(metrics) {
       ${bar}
       <div class="legend">${legend}</div>
       <div class="gpu-grid">${gpus}</div>
+      ${formula}
     </div>`;
 }
 
