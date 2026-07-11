@@ -391,6 +391,9 @@ async function loadModelPayload() {
     console.error(error);
     state.payload = null;
     updateExportButtons();
+    renderHierarchyToolbar();
+    renderWarnings();
+    ui.controlsForm.innerHTML = '<div class="empty-state">无法加载运行参数。</div>';
     setStatus(`加载失败：${error.message}`, true);
     ui.summaryPanel.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
     ui.graphBoard.innerHTML = "";
@@ -483,12 +486,31 @@ function renderControls() {
     return;
   }
 
-  if (!(payload.controls || []).length) {
+  const controls = payload.controls || [];
+  if (!controls.length) {
     ui.controlsForm.innerHTML = '<div class="empty-state">当前模型无需额外运行参数。</div>';
     return;
   }
 
-  ui.controlsForm.innerHTML = payload.controls
+  const existingInputs = Array.from(ui.controlsForm.querySelectorAll("input[name]"));
+  const existingNames = existingInputs.map((el) => el.name);
+  const newNames = controls.map((c) => c.name);
+  const sameStructure = existingNames.length === newNames.length && existingNames.every((name, i) => name === newNames[i]);
+
+  if (sameStructure) {
+    controls.forEach((control) => {
+      const input = ui.controlsForm.querySelector(`input[name="${control.name}"]`);
+      if (!input) {
+        return;
+      }
+      input.min = control.min ?? "";
+      input.max = control.max ?? "";
+      input.step = control.step ?? 1;
+    });
+    return;
+  }
+
+  ui.controlsForm.innerHTML = controls
     .map(
       (control) => `
         <label class="control-group">
@@ -497,7 +519,7 @@ function renderControls() {
             class="control-input"
             name="${escapeHtml(control.name)}"
             type="${escapeHtml(control.type || "number")}" 
-            value="${escapeHtml(control.value)}"
+            value="${escapeHtml(control.value ?? "")}"
             min="${escapeHtml(control.min ?? "")}" 
             max="${escapeHtml(control.max ?? "")}" 
             step="${escapeHtml(control.step ?? 1)}"

@@ -1111,7 +1111,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
         )
         or language_hidden
     )
-    projector_hidden = int(first_defined(projector_config.get("n_embed"), language_hidden, vision_config.get("out_hidden_size"), language_hidden) or language_hidden)
+    projector_hidden = int(first_defined(projector_config.get("n_embed"), vision_config.get("out_hidden_size"), language_hidden) or language_hidden)
     vision_depth = int(
         first_defined(
             vision_config.get("depth"),
@@ -1146,6 +1146,15 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     layer_pattern = summarize_layer_pattern(text_config.get("layer_types"))
     if layer_pattern:
         warnings.append(f"文本主干层型摘要: {layer_pattern}。")
+
+    lanes = [
+        ("inputs", "输入"),
+        ("processing", "处理"),
+        ("encoding", "编码"),
+        ("fusion", "融合"),
+        ("backbone", "主干"),
+        ("output", "输出"),
+    ]
 
     nodes = [
         build_node(
@@ -1914,6 +1923,11 @@ class ModelArchRequestHandler(SimpleHTTPRequestHandler):
                     payload = build_model_payload(segments[2], parse_qs(parsed.query))
                 except FileNotFoundError:
                     self.respond_json({"error": "Model not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
+                    self.respond_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
                 self.respond_json(payload)
                 return
