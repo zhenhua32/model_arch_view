@@ -496,6 +496,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 section("推导公式", [detail("lookup", f"[B, T] -> [B, T, H] = {hidden_shape}")]),
             ],
             "text",
+            view_modes=["summary", "expanded", "repeat"],
         ),
         build_node(
             "decoder_stack",
@@ -978,6 +979,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 section("推导公式", [detail("projection", f"[B, T, H] -> [B, T, vocab] = {logits_shape}")]),
             ],
             "head",
+            view_modes=["summary", "expanded", "repeat"],
         ),
         build_node(
             "logits",
@@ -1931,6 +1933,9 @@ class ModelArchRequestHandler(SimpleHTTPRequestHandler):
                     return
                 self.respond_json(payload)
                 return
+
+            self.respond_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+            return
 
         if parsed.path == "/":
             self.path = "/index.html"

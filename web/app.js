@@ -5,6 +5,7 @@ const state = {
   selectedNodeId: null,
   llmHierarchyMode: "summary",
   refreshTimer: null,
+  fetchController: null,
 };
 
 const ui = {
@@ -39,8 +40,8 @@ function setStatus(text, isError = false) {
   ui.statusBar.style.color = isError ? "#9b4d34" : "";
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, { cache: "no-store" });
+async function fetchJson(url, signal) {
+  const response = await fetch(url, { cache: "no-store", signal });
   if (!response.ok) {
     const text = await response.text();
     throw new Error(text || `Request failed with ${response.status}`);
@@ -368,13 +369,18 @@ async function loadModelPayload() {
     return;
   }
 
+  if (state.fetchController) {
+    state.fetchController.abort();
+  }
+  state.fetchController = new AbortController();
+
   const query = buildQueryFromControls();
   const suffix = query ? `?${query}` : "";
   setStatus(`正在分析 ${state.activeModelId} ...`);
 
   try {
     const previousSelected = state.selectedNodeId;
-    const payload = await fetchJson(`/api/models/${encodeURIComponent(state.activeModelId)}${suffix}`);
+    const payload = await fetchJson(`/api/models/${encodeURIComponent(state.activeModelId)}${suffix}`, state.fetchController.signal);
     state.payload = payload;
     state.selectedNodeId = (payload.graph?.nodes || []).some((node) => node.id === previousSelected) ? previousSelected : payload.selectedNodeId;
     syncSelectedNode(payload);
@@ -388,6 +394,9 @@ async function loadModelPayload() {
     renderDetails();
     setStatus(`已加载 ${payload.model.name}，当前展示 ${payload.model.type} 图结构。`);
   } catch (error) {
+    if (error.name === "AbortError") {
+      return;
+    }
     console.error(error);
     state.payload = null;
     updateExportButtons();
@@ -640,6 +649,27 @@ function renderGraph() {
     })
     .join("");
 
+  requestAnimationFrame(drawEdges);
+}
+
+function updateNodeSelection() {
+  const payload = state.payload;
+  if (!payload) {
+    return;
+  }
+
+  const relations = buildGraphRelations(payload);
+  ui.graphBoard.querySelectorAll(".graph-node").forEach((element) => {
+    const nodeId = element.dataset.nodeId;
+    element.classList.remove("selected", "upstream", "downstream", "dimmed", "active");
+    const relationClass = relations.nodeClass(nodeId);
+    if (relationClass) {
+      element.classList.add(relationClass);
+    }
+    if (nodeId === state.selectedNodeId) {
+      element.classList.add("active");
+    }
+  });
   requestAnimationFrame(drawEdges);
 }
 
@@ -992,7 +1022,7 @@ ui.graphBoard.addEventListener("click", (event) => {
     return;
   }
   state.selectedNodeId = nodeElement.dataset.nodeId;
-  renderGraph();
+  updateNodeSelection();
   renderDetails();
 });
 
@@ -1002,14 +1032,19 @@ ui.detailPanel.addEventListener("click", (event) => {
     return;
   }
   state.selectedNodeId = jumpButton.dataset.jumpNode;
-  renderGraph();
+  updateNodeSelection();
   renderDetails();
 });
 
+let resizeTimer = null;
 window.addEventListener("resize", () => {
-  if (state.payload) {
-    requestAnimationFrame(drawEdges);
+  if (!state.payload) {
+    return;
   }
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    requestAnimationFrame(drawEdges);
+  }, 150);
 });
 
 updateExportButtons();
