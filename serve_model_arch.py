@@ -321,6 +321,15 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         params_config.get("rope_theta"),
     )
 
+    # MLA detection
+    q_lora_rank = int(first_defined(config.get("q_lora_rank"), 0) or 0)
+    kv_lora_rank = int(first_defined(config.get("kv_lora_rank"), config.get("kv_lora_a"), 0) or 0)
+    qk_rope_head_dim = int(first_defined(config.get("qk_rope_head_dim"), 0) or 0)
+    qk_nope_head_dim = head_dim - qk_rope_head_dim if head_dim and qk_rope_head_dim else head_dim or 0
+    v_head_dim = int(first_defined(config.get("v_head_dim"), head_dim) or 0)
+    o_lora_rank = int(first_defined(config.get("o_lora_rank"), 0) or 0)
+    is_mla = q_lora_rank > 0
+
     batch = clamp_int(query.get("batch", [1])[0], 1)
     seq_len = clamp_int(query.get("seq_len", [min(max_position, 2048)])[0], min(max_position, 2048), maximum=max_position)
 
@@ -1020,6 +1029,118 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         build_edge("lm_head", "logits", "vocab projection"),
     ]
 
+    if is_mla:
+        # Switch standard block nodes/edges to block_gqa so they're hidden in block mode
+        for node in nodes:
+            if node.get("viewModes") == ["block"]:
+                node["viewModes"] = ["block_gqa"]
+        edges = [e if "block" not in e.get("viewModes", []) else {**e, "viewModes": ["block_gqa"]} for e in edges]
+
+        kv_compress_dim = kv_lora_rank or head_dim or 0
+        mla_q_shape = shape(batch, seq_len, num_heads or "heads", head_dim or "head_dim")
+        mla_kv_latent = shape(batch, seq_len, kv_compress_dim)
+        mla_v_shape = shape(batch, seq_len, num_heads or "heads", v_head_dim or "head_dim")
+
+        mla_block_nodes = [
+            build_node(
+                "mla_q_proj", "core", 1, "Q Low-rank Projection",
+                f"hidden → {q_lora_rank} → heads",
+                "Q 通过低秩投影压缩再展开，减少参数量。",
+                hidden_shape, mla_q_shape,
+                [f"q_lora {q_lora_rank}", f"{num_heads or '?'} heads"],
+                [detail("q_lora_rank", q_lora_rank), detail("head_dim", head_dim)],
+                [section("MLA Q", [detail("down", f"{hidden_size} → {q_lora_rank}"), detail("up", f"{q_lora_rank} → {num_heads}×{head_dim}")])],
+                "core", parent_id="decoder_stack", view_modes=["block"],
+            ),
+            build_node(
+                "mla_kv_compress", "core", 2, "KV Compression",
+                f"hidden → {kv_compress_dim} (latent)",
+                "KV 压缩为低秩 latent，cache 只存压缩表示。",
+                hidden_shape, mla_kv_latent,
+                [f"kv_lora {kv_compress_dim}", "cached latent"],
+                [detail("kv_compress_dim", kv_compress_dim), detail("num_kv_heads", num_kv_heads)],
+                [section("MLA KV", [detail("compress", f"{hidden_size} → {kv_compress_dim}"), detail("cache_saving", f"vs GQA: {num_kv_heads}×{head_dim} → {kv_compress_dim}")])],
+                "scheduler", parent_id="decoder_stack", view_modes=["block"],
+            ),
+            build_node(
+                "mla_kv_decompress", "core", 3, "KV Decompression",
+                f"latent → K_nope + K_rope + V",
+                "从压缩 latent 还原 K（nope + rope）和 V。",
+                mla_kv_latent, f"K/V {mla_q_shape}",
+                [f"nope {qk_nope_head_dim}", f"rope {qk_rope_head_dim}"],
+                [detail("qk_nope_head_dim", qk_nope_head_dim), detail("qk_rope_head_dim", qk_rope_head_dim), detail("v_head_dim", v_head_dim)],
+                [section("解压", [detail("K_nope", qk_nope_head_dim), detail("K_rope", qk_rope_head_dim), detail("V", v_head_dim)])],
+                "scheduler", parent_id="decoder_stack", view_modes=["block"],
+            ),
+            build_node(
+                "mla_qk_rope", "core", 4, "RoPE Decoupling",
+                "Q/K split: nope + rope",
+                "RoPE 仅施加在 rope 维度，nope 维度保持不变。",
+                f"{mla_q_shape} + K", mla_q_shape,
+                ["RoPE", f"rope_dim {qk_rope_head_dim}"],
+                [detail("qk_rope_head_dim", qk_rope_head_dim)],
+                [section("解耦 RoPE", [detail("nope_part", f"{qk_nope_head_dim} dims, no RoPE"), detail("rope_part", f"{qk_rope_head_dim} dims, RoPE")])],
+                "core", parent_id="decoder_stack", view_modes=["block"],
+            ),
+            build_node(
+                "mla_score", "core", 5, "Attention Score",
+                "[Q_nope||Q_rope] × [K_nope||K_rope]",
+                "拼接 nope 和 rope 维度后计算注意力分数。",
+                mla_q_shape, shape(batch, num_heads or "heads", seq_len, seq_len),
+                ["score", f"dim {head_dim}"],
+                [detail("Q_dim", head_dim), detail("K_dim", head_dim)],
+                [section("Score", [detail("QK", f"[B, heads, T, {head_dim}] × [B, kv, T, {head_dim}]ᵀ")])],
+                "core", parent_id="decoder_stack", view_modes=["block"],
+            ),
+            build_node(
+                "mla_softmax", "core", 6, "Causal + Softmax",
+                "mask → normalize",
+                "施加 causal mask 后 softmax 归一化。",
+                shape(batch, num_heads or "heads", seq_len, seq_len), shape(batch, num_heads or "heads", seq_len, seq_len),
+                ["causal", "softmax"],
+                [],
+                [section("Mask + Softmax", [detail("window", sliding_window or "full")])],
+                "core", parent_id="decoder_stack", view_modes=["block"],
+            ),
+            build_node(
+                "mla_weighted_v", "core", 7, "Weighted V",
+                "scores × V → context",
+                "用 softmax 权重对 V 加权求和。",
+                f"score × {mla_v_shape}", mla_v_shape,
+                ["attn output", f"v_dim {v_head_dim}"],
+                [detail("v_head_dim", v_head_dim)],
+                [section("Attention Output", [detail("context", mla_v_shape)])],
+                "core", parent_id="decoder_stack", view_modes=["block"],
+            ),
+            build_node(
+                "mla_out_proj", "core", 8, "Output Low-rank",
+                f"context → {o_lora_rank or 'hidden'} → hidden",
+                "通过低秩投影输出到隐藏维度。",
+                mla_v_shape, hidden_shape,
+                [f"o_lora {o_lora_rank}" if o_lora_rank else "direct"],
+                [detail("o_lora_rank", o_lora_rank)],
+                [section("Output", [detail("down", f"→ {o_lora_rank}" if o_lora_rank else "direct"), detail("up", f"→ {hidden_size}")])],
+                "core", parent_id="decoder_stack", view_modes=["block"],
+            ),
+        ]
+
+        mla_block_edges = [
+            build_edge("token_embedding", "mla_q_proj", "Q input", ["block"]),
+            build_edge("token_embedding", "mla_kv_compress", "KV input", ["block"]),
+            build_edge("mla_q_proj", "mla_qk_rope", "Q", ["block"]),
+            build_edge("mla_kv_compress", "mla_kv_decompress", "decompress", ["block"]),
+            build_edge("mla_kv_decompress", "mla_qk_rope", "K", ["block"]),
+            build_edge("mla_kv_decompress", "mla_weighted_v", "V", ["block"]),
+            build_edge("mla_qk_rope", "mla_score", "QK", ["block"]),
+            build_edge("mla_score", "mla_softmax", "raw scores", ["block"]),
+            build_edge("mla_softmax", "mla_weighted_v", "weights", ["block"]),
+            build_edge("mla_weighted_v", "mla_out_proj", "context", ["block"]),
+            build_edge("mla_out_proj", "decoder_ffn", "attn output", ["block"]),
+        ]
+
+        nodes.extend(mla_block_nodes)
+        edges.extend(mla_block_edges)
+
     sources: list[str] = []
     append_source_file(model_dir, sources, "config.json")
     append_source_file(model_dir, sources, "configuration.json")
@@ -1034,8 +1155,33 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         detail("上下文长度", max_position),
         detail("量化", quant),
     ]
+    if is_mla:
+        summary.append(detail("注意力", f"MLA (q_lora={q_lora_rank}, kv_lora={kv_lora_rank or head_dim}, rope_dim={qk_rope_head_dim})"))
     if num_experts:
         summary.append(detail("MoE", f"{num_experts} experts / top-{experts_per_tok}"))
+
+    # Runtime estimation
+    if hidden_size and num_layers:
+        attn_params = 2 * hidden_size * hidden_size + 2 * hidden_size * (num_kv_heads * head_dim if num_kv_heads and head_dim else hidden_size)
+        ffn_dim = ffn_hidden or (hidden_size * 4)
+        ffn_params = 3 * hidden_size * ffn_dim
+        if num_experts:
+            ffn_params_total = ffn_params * num_experts
+            ffn_params_active = ffn_params * experts_per_tok if experts_per_tok else ffn_params
+        else:
+            ffn_params_total = ffn_params
+            ffn_params_active = ffn_params
+        embed_params = hidden_size * (vocab_size or 0)
+        total_params = (attn_params + ffn_params_total) * num_layers + embed_params
+        active_params = (attn_params + ffn_params_active) * num_layers + embed_params
+        summary.append(detail("参数量", f"{total_params / 1e9:.2f}B" + (f" (active {active_params / 1e9:.2f}B)" if num_experts else "")))
+
+        if num_kv_heads and head_dim:
+            kv_bytes = 2 * num_layers * num_kv_heads * head_dim * 2  # K+V, fp16
+            kv_per_1k = kv_bytes * 1024 / (1024 * 1024)
+            summary.append(detail("KV cache", f"{kv_per_1k:.1f} MB / 1K tokens / batch"))
+
+        summary.append(detail("推理 FLOPs", f"{2 * active_params / 1e9:.1f} GFLOPs / token"))
 
     controls = [
         {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 16, "step": 1, "help": "并行样本数"},
@@ -2040,14 +2186,9 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                     [section("迭代", [detail("input", latent_shape), detail("output", latent_shape)])],
                     "core", parent_id="transformer", view_modes=["repeat"],
                 ))
-                repeat_edges.append(build_edge(step_1_id if i == 1 else f"denoise_step_{i-1}", nid, "next step", ["repeat"]))
             repeat_edges = [build_edge(latents_input_node, step_1_id, "initial latent", ["repeat"])]
-            for i in range(1, steps + 1):
-                nid = f"denoise_step_{i}"
-                if i == 1:
-                    repeat_edges.append(build_edge(latents_input_node, nid, "initial latent", ["repeat"]))
-                else:
-                    repeat_edges.append(build_edge(f"denoise_step_{i-1}", nid, "next step", ["repeat"]))
+            for i in range(2, steps + 1):
+                repeat_edges.append(build_edge(f"denoise_step_{i-1}", f"denoise_step_{i}", "next step", ["repeat"]))
             repeat_edges.append(build_edge(f"denoise_step_{steps}", "vae_decode", "denoised latent", ["repeat"]))
         else:
             repeat_nodes = [

@@ -40,6 +40,7 @@
       <main class="main-canvas-area">
         <header class="canvas-header">
           <div id="status-bar" class="status-bar">正在加载模型目录...</div>
+          <input id="node-search" class="node-search-input" type="search" placeholder="搜索节点..." />
           <div class="graph-actions floating-toolbar">
             <div id="hierarchy-toolbar" class="hierarchy-toolbar" hidden>
               <span class="hierarchy-label">层级视图</span>
@@ -57,6 +58,13 @@
             <svg id="edge-layer" class="edge-layer" aria-hidden="true"></svg>
             <div id="graph-board" class="graph-board"></div>
           </div>
+        </div>
+
+        <div id="zoom-controls" class="zoom-controls">
+          <button id="zoom-out" class="zoom-btn" type="button" title="缩小" aria-label="缩小">−</button>
+          <span id="zoom-level" class="zoom-level">100%</span>
+          <button id="zoom-in" class="zoom-btn" type="button" title="放大" aria-label="放大">+</button>
+          <button id="zoom-reset" class="zoom-btn" type="button" title="重置" aria-label="重置缩放">⟲</button>
         </div>
       </main>
 

@@ -6,6 +6,10 @@ const state = {
   llmHierarchyMode: "summary",
   refreshTimer: null,
   fetchController: null,
+  zoom: { scale: 1, x: 0, y: 0 },
+  pan: { dragging: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0 },
+  collapsedParents: new Set(),
+  collapsedLanes: new Set(),
 };
 
 const ui = {
@@ -20,10 +24,16 @@ const ui = {
   statusBar: document.getElementById("status-bar"),
   summaryPanel: document.getElementById("model-summary"),
   warningsPanel: document.getElementById("warnings-panel"),
+  graphScroll: document.getElementById("graph-scroll"),
   graphCanvas: document.getElementById("graph-canvas"),
   graphBoard: document.getElementById("graph-board"),
   edgeLayer: document.getElementById("edge-layer"),
   detailPanel: document.getElementById("detail-panel"),
+  zoomIn: document.getElementById("zoom-in"),
+  zoomOut: document.getElementById("zoom-out"),
+  zoomReset: document.getElementById("zoom-reset"),
+  zoomLevel: document.getElementById("zoom-level"),
+  nodeSearch: document.getElementById("node-search"),
 };
 
 function escapeHtml(value) {
@@ -107,7 +117,11 @@ function isVisibleInHierarchy(item, mode) {
 function getVisibleGraph(payload = state.payload) {
   const graph = payload?.graph || { nodes: [], edges: [], lanes: [] };
   const mode = getHierarchyMode(payload);
-  const nodes = (graph.nodes || []).filter((node) => isVisibleInHierarchy(node, mode));
+  let nodes = (graph.nodes || []).filter((node) => isVisibleInHierarchy(node, mode));
+  nodes = nodes.filter((node) => {
+    if (!node.parentId) return true;
+    return !state.collapsedParents.has(node.parentId);
+  });
   const visibleIds = new Set(nodes.map((node) => node.id));
   const edges = (graph.edges || []).filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target) && isVisibleInHierarchy(edge, mode));
   return {
@@ -663,8 +677,8 @@ function renderGraph() {
         .join("");
 
       return `
-        <section class="lane">
-          <div class="lane-title">${escapeHtml(lane.label)}</div>
+        <section class="lane${state.collapsedLanes.has(lane.id) ? " collapsed" : ""}" data-lane-id="${escapeHtml(lane.id)}">
+          <div class="lane-title" data-toggle-lane="${escapeHtml(lane.id)}">${escapeHtml(lane.label)} <span class="lane-toggle">${state.collapsedLanes.has(lane.id) ? "▸" : "▾"}</span></div>
           <div class="lane-body">${nodeMarkup || '<div class="empty-state">无节点</div>'}</div>
         </section>
       `;
@@ -672,6 +686,54 @@ function renderGraph() {
     .join("");
 
   requestAnimationFrame(drawEdges);
+}
+
+function applyZoom() {
+  const { scale, x, y } = state.zoom;
+  ui.graphCanvas.style.transform = `scale(${scale}) translate(${x}px, ${y}px)`;
+  ui.zoomLevel.textContent = `${Math.round(scale * 100)}%`;
+  requestAnimationFrame(drawEdges);
+}
+
+function resetZoom() {
+  state.zoom = { scale: 1, x: 0, y: 0 };
+  applyZoom();
+}
+
+function zoomBy(delta, centerX, centerY) {
+  const oldScale = state.zoom.scale;
+  const newScale = Math.max(0.3, Math.min(3, oldScale * delta));
+  if (newScale === oldScale) {
+    return;
+  }
+  if (centerX !== undefined && centerY !== undefined) {
+    const scrollRect = ui.graphScroll.getBoundingClientRect();
+    const mx = centerX - scrollRect.left + ui.graphScroll.scrollLeft;
+    const my = centerY - scrollRect.top + ui.graphScroll.scrollTop;
+    state.zoom.x = mx - (mx - state.zoom.x) * (newScale / oldScale) - mx;
+    state.zoom.y = my - (my - state.zoom.y) * (newScale / oldScale) - my;
+  }
+  state.zoom.scale = newScale;
+  applyZoom();
+}
+
+function getNodeOffset(element, container) {
+  let left = 0;
+  let top = 0;
+  let el = element;
+  while (el && el !== container) {
+    left += el.offsetLeft;
+    top += el.offsetTop;
+    el = el.offsetParent;
+  }
+  return {
+    left,
+    top,
+    width: element.offsetWidth,
+    height: element.offsetHeight,
+    right: left + element.offsetWidth,
+    bottom: top + element.offsetHeight,
+  };
 }
 
 function updateNodeSelection() {
@@ -703,7 +765,7 @@ function drawEdges() {
 
   const visibleGraph = getVisibleGraph(payload);
   const relations = buildGraphRelations(payload);
-  const canvasRect = ui.graphCanvas.getBoundingClientRect();
+  const canvasRect = { left: 0, top: 0 };
   const nodes = new Map();
   ui.graphBoard.querySelectorAll(".graph-node").forEach((element) => {
     nodes.set(element.dataset.nodeId, element);
@@ -718,7 +780,7 @@ function drawEdges() {
   let markup = `
     <defs>
       <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto-start-reverse">
-        <path d="M0,0 L12,6 L0,12 z" fill="rgba(76, 93, 108, 0.56)"></path>
+        <path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"></path>
       </marker>
     </defs>
   `;
@@ -730,7 +792,7 @@ function drawEdges() {
       return;
     }
 
-    const geometry = buildEdgeGeometry(source.getBoundingClientRect(), target.getBoundingClientRect(), canvasRect);
+    const geometry = buildEdgeGeometry(getNodeOffset(source, ui.graphCanvas), getNodeOffset(target, ui.graphCanvas), canvasRect);
     const labelText = escapeHtml(edge.label || "");
     const labelWidth = Math.max(56, labelText.length * 7.4);
     const relationClass = relations.edgeClass(edge);
@@ -884,28 +946,28 @@ function truncateText(value, maxLength = 46) {
 
 function accentColor(accent) {
   if (accent === "vision") {
-    return "#cc7d21";
+    return "#d97706";
   }
   if (accent === "scheduler" || accent === "latent") {
-    return "#5180a4";
+    return "#0ea5e9";
   }
   if (accent === "output" || accent === "head" || accent === "decode") {
-    return "#b65c45";
+    return "#e11d48";
   }
-  return "#0d6a64";
+  return "#4f46e5";
 }
 
 function relationColor(kind) {
   if (kind === "upstream") {
-    return "#b58332";
+    return "#d97706";
   }
   if (kind === "downstream") {
-    return "#0d6a64";
+    return "#4f46e5";
   }
   if (kind === "related") {
-    return "#5a768f";
+    return "#94a3b8";
   }
-  return "rgba(76, 93, 108, 0.24)";
+  return "#cbd5e1";
 }
 
 function exportCurrentPayload() {
@@ -928,7 +990,7 @@ function exportCurrentSvg() {
   const payload = state.payload;
   const relations = buildGraphRelations(payload);
   const visibleGraph = getVisibleGraph(payload);
-  const canvasRect = ui.graphCanvas.getBoundingClientRect();
+  const canvasRect = { left: 0, top: 0 };
   const width = Math.max(ui.graphBoard.scrollWidth + 24, ui.graphBoard.clientWidth);
   const height = Math.max(ui.graphBoard.scrollHeight + 24, ui.graphBoard.clientHeight);
   const nodeElements = new Map();
@@ -944,14 +1006,14 @@ function exportCurrentSvg() {
         return "";
       }
 
-      const geometry = buildEdgeGeometry(source.getBoundingClientRect(), target.getBoundingClientRect(), canvasRect);
+      const geometry = buildEdgeGeometry(getNodeOffset(source, ui.graphCanvas), getNodeOffset(target, ui.graphCanvas), canvasRect);
       const label = truncateText(edge.label || "", 24);
       const labelWidth = Math.max(56, label.length * 7.2);
       const color = relationColor(relations.edgeClass(edge));
       return `
         <path d="${geometry.path}" fill="none" stroke="${color}" stroke-width="2.4" marker-end="url(#arrow)" />
-        <rect x="${geometry.labelX - labelWidth / 2}" y="${geometry.labelY - 12}" width="${labelWidth}" height="24" rx="10" ry="10" fill="rgba(255,252,246,0.94)" stroke="rgba(33,25,16,0.08)" />
-        <text x="${geometry.labelX}" y="${geometry.labelY + 4}" fill="#655d51" font-family="Aptos, Microsoft YaHei UI, sans-serif" font-size="12" text-anchor="middle">${escapeHtml(label)}</text>
+        <rect x="${geometry.labelX - labelWidth / 2}" y="${geometry.labelY - 12}" width="${labelWidth}" height="24" rx="10" ry="10" fill="rgba(255,255,255,0.92)" stroke="rgba(15,23,42,0.08)" />
+        <text x="${geometry.labelX}" y="${geometry.labelY + 4}" fill="#64748b" font-family="Aptos, Microsoft YaHei UI, sans-serif" font-size="12" text-anchor="middle">${escapeHtml(label)}</text>
       `;
     })
     .join("");
@@ -963,28 +1025,28 @@ function exportCurrentSvg() {
         return "";
       }
 
-      const rect = element.getBoundingClientRect();
-      const x = rect.left - canvasRect.left;
-      const y = rect.top - canvasRect.top;
+      const rect = getNodeOffset(element, ui.graphCanvas);
+      const x = rect.left;
+      const y = rect.top;
       const widthPx = rect.width;
       const heightPx = rect.height;
       const accent = accentColor(node.accent || "core");
       const relation = relations.nodeClass(node.id);
       const opacity = relation === "dimmed" ? 0.34 : 1;
-      const stroke = node.id === relations.selectedId ? "#0d6a64" : "rgba(31,26,20,0.08)";
+      const stroke = node.id === relations.selectedId ? "#4f46e5" : "rgba(15,23,42,0.08)";
       const title = truncateText(node.label, 26);
       const subtitle = truncateText(node.subtitle || "", 38);
       const input = truncateText(`IN ${node.inputShape || "-"}`, 38);
       const output = truncateText(`OUT ${node.outputShape || "-"}`, 38);
       return `
         <g opacity="${opacity}">
-          <rect x="${x}" y="${y}" width="${widthPx}" height="${heightPx}" rx="22" ry="22" fill="rgba(255,248,235,0.98)" stroke="${stroke}" />
+          <rect x="${x}" y="${y}" width="${widthPx}" height="${heightPx}" rx="12" ry="12" fill="rgba(255,255,255,0.98)" stroke="${stroke}" />
           <rect x="${x}" y="${y}" width="6" height="${heightPx}" rx="6" ry="6" fill="${accent}" />
-          <text x="${x + 18}" y="${y + 28}" fill="#1d1f1c" font-family="Bahnschrift, Aptos Display, Microsoft YaHei UI, sans-serif" font-size="16">${escapeHtml(title)}</text>
-          <text x="${x + 18}" y="${y + 48}" fill="#655d51" font-family="Aptos, Microsoft YaHei UI, sans-serif" font-size="12">${escapeHtml(subtitle)}</text>
-          <rect x="${x + 16}" y="${y + heightPx - 54}" width="${Math.max(120, widthPx - 32)}" height="38" rx="12" ry="12" fill="rgba(246,242,232,0.9)" stroke="rgba(33,25,16,0.08)" />
-          <text x="${x + 28}" y="${y + heightPx - 31}" fill="#655d51" font-family="Cascadia Code, Consolas, monospace" font-size="11">${escapeHtml(input)}</text>
-          <text x="${x + 28}" y="${y + heightPx - 17}" fill="#655d51" font-family="Cascadia Code, Consolas, monospace" font-size="11">${escapeHtml(output)}</text>
+          <text x="${x + 18}" y="${y + 28}" fill="#0f172a" font-family="Bahnschrift, Aptos Display, Microsoft YaHei UI, sans-serif" font-size="16">${escapeHtml(title)}</text>
+          <text x="${x + 18}" y="${y + 48}" fill="#64748b" font-family="Aptos, Microsoft YaHei UI, sans-serif" font-size="12">${escapeHtml(subtitle)}</text>
+          <rect x="${x + 16}" y="${y + heightPx - 54}" width="${Math.max(120, widthPx - 32)}" height="38" rx="8" ry="8" fill="rgba(241,245,249,0.9)" stroke="rgba(226,232,240,0.6)" />
+          <text x="${x + 28}" y="${y + heightPx - 31}" fill="#64748b" font-family="Cascadia Code, Consolas, monospace" font-size="11">${escapeHtml(input)}</text>
+          <text x="${x + 28}" y="${y + heightPx - 17}" fill="#64748b" font-family="Cascadia Code, Consolas, monospace" font-size="11">${escapeHtml(output)}</text>
         </g>
       `;
     })
@@ -994,11 +1056,11 @@ function exportCurrentSvg() {
 <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#f7f0de" />
-      <stop offset="100%" stop-color="#e9dfc7" />
+      <stop offset="0%" stop-color="#f8fafc" />
+      <stop offset="100%" stop-color="#f1f5f9" />
     </linearGradient>
     <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto-start-reverse">
-      <path d="M0,0 L12,6 L0,12 z" fill="rgba(76,93,108,0.56)" />
+      <path d="M0,0 L12,6 L0,12 z" fill="#94a3b8" />
     </marker>
   </defs>
   <rect width="100%" height="100%" fill="url(#bg)" />
@@ -1040,6 +1102,18 @@ ui.exportJsonButton.addEventListener("click", exportCurrentPayload);
 ui.exportSvgButton.addEventListener("click", exportCurrentSvg);
 
 ui.graphBoard.addEventListener("click", (event) => {
+  const laneToggle = event.target.closest("[data-toggle-lane]");
+  if (laneToggle) {
+    const laneId = laneToggle.dataset.toggleLane;
+    if (state.collapsedLanes.has(laneId)) {
+      state.collapsedLanes.delete(laneId);
+    } else {
+      state.collapsedLanes.add(laneId);
+    }
+    renderGraph();
+    return;
+  }
+
   const nodeElement = event.target.closest("[data-node-id]");
   if (!nodeElement) {
     return;
@@ -1057,6 +1131,10 @@ ui.detailPanel.addEventListener("click", (event) => {
   state.selectedNodeId = jumpButton.dataset.jumpNode;
   updateNodeSelection();
   renderDetails();
+  const targetElement = ui.graphBoard.querySelector(`[data-node-id="${state.selectedNodeId}"]`);
+  if (targetElement) {
+    targetElement.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+  }
 });
 
 let resizeTimer = null;
@@ -1069,6 +1147,79 @@ window.addEventListener("resize", () => {
     requestAnimationFrame(drawEdges);
   }, 150);
 });
+
+// --- Node Search ---
+
+let nodeSearchTimer = null;
+ui.nodeSearch.addEventListener("input", () => {
+  clearTimeout(nodeSearchTimer);
+  nodeSearchTimer = setTimeout(applyNodeSearch, 120);
+});
+
+function applyNodeSearch() {
+  const keyword = ui.nodeSearch.value.trim().toLowerCase();
+  ui.graphBoard.querySelectorAll(".graph-node").forEach((element) => {
+    element.classList.remove("matched", "search-dimmed");
+    if (!keyword) {
+      return;
+    }
+    const nodeId = element.dataset.nodeId || "";
+    const title = element.querySelector(".node-title")?.textContent?.toLowerCase() || "";
+    const subtitle = element.querySelector(".node-subtitle")?.textContent?.toLowerCase() || "";
+    const matched = title.includes(keyword) || subtitle.includes(keyword) || nodeId.toLowerCase().includes(keyword);
+    if (matched) {
+      element.classList.add("matched");
+    } else {
+      element.classList.add("search-dimmed");
+    }
+  });
+}
+
+// --- Zoom & Pan ---
+
+ui.graphScroll.addEventListener("wheel", (event) => {
+  if (event.ctrlKey || event.metaKey) {
+    event.preventDefault();
+    zoomBy(event.deltaY < 0 ? 1.1 : 0.9, event.clientX, event.clientY);
+  }
+}, { passive: false });
+
+ui.graphScroll.addEventListener("mousedown", (event) => {
+  if (event.button !== 0) {
+    return;
+  }
+  const isNode = event.target.closest("[data-node-id]");
+  if (isNode) {
+    return;
+  }
+  state.pan.dragging = true;
+  state.pan.startX = event.clientX;
+  state.pan.startY = event.clientY;
+  state.pan.scrollLeft = ui.graphScroll.scrollLeft;
+  state.pan.scrollTop = ui.graphScroll.scrollTop;
+  ui.graphScroll.classList.add("is-panning");
+});
+
+window.addEventListener("mousemove", (event) => {
+  if (!state.pan.dragging) {
+    return;
+  }
+  const dx = event.clientX - state.pan.startX;
+  const dy = event.clientY - state.pan.startY;
+  ui.graphScroll.scrollLeft = state.pan.scrollLeft - dx;
+  ui.graphScroll.scrollTop = state.pan.scrollTop - dy;
+});
+
+window.addEventListener("mouseup", () => {
+  if (state.pan.dragging) {
+    state.pan.dragging = false;
+    ui.graphScroll.classList.remove("is-panning");
+  }
+});
+
+ui.zoomIn.addEventListener("click", () => zoomBy(1.2));
+ui.zoomOut.addEventListener("click", () => zoomBy(0.83));
+ui.zoomReset.addEventListener("click", resetZoom);
 
 updateExportButtons();
 renderHierarchyToolbar();
