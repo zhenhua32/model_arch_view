@@ -30,10 +30,15 @@
           </div>
           <form id="controls-form" class="controls-form"></form>
         </section>
+
+        <div class="sidebar-messages">
+          <section id="warnings-panel" class="warnings-panel"></section>
+          <section id="model-summary" class="summary-panel"></section>
+        </div>
       </aside>
 
       <main class="main-canvas-area">
-        <div class="canvas-overlay canvas-top-bar">
+        <header class="canvas-header">
           <div id="status-bar" class="status-bar">正在加载模型目录...</div>
           <div class="graph-actions floating-toolbar">
             <div id="hierarchy-toolbar" class="hierarchy-toolbar" hidden>
@@ -45,15 +50,7 @@
             <button id="export-json-button" class="ghost-button action-btn" type="button" disabled>JSON</button>
             <button id="export-svg-button" class="ghost-button action-btn" type="button" disabled>SVG</button>
           </div>
-        </div>
-
-        <div class="canvas-overlay canvas-warnings">
-          <section id="warnings-panel" class="warnings-panel"></section>
-        </div>
-        
-        <div class="canvas-overlay canvas-summary">
-          <section id="model-summary" class="summary-panel"></section>
-        </div>
+        </header>
 
         <div id="graph-scroll" class="graph-scroll">
           <div id="graph-canvas" class="graph-canvas">
