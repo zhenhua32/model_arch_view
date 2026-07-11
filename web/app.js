@@ -13,6 +13,7 @@ const state = {
   pan: { dragging: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0 },
   collapsedParents: new Set(),
   collapsedLanes: new Set(),
+  centerView: "graph",
 };
 
 const ui = {
@@ -41,6 +42,11 @@ const ui = {
   zoomReset: document.getElementById("zoom-reset"),
   zoomLevel: document.getElementById("zoom-level"),
   nodeSearch: document.getElementById("node-search"),
+  viewTabs: document.querySelector(".view-tabs"),
+  graphView: document.getElementById("graph-view"),
+  detailsView: document.getElementById("details-view"),
+  compareView: document.getElementById("compare-view"),
+  viewStage: document.getElementById("view-stage"),
 };
 
 function escapeHtml(value) {
@@ -1350,6 +1356,32 @@ function exportCurrentSvg() {
 
   downloadBlob(`${sanitizeFileName(payload.model.id)}.svg`, svg, "image/svg+xml;charset=utf-8");
 }
+
+function setCenterView(view) {
+  state.centerView = view;
+  ui.viewTabs.querySelectorAll(".view-tab").forEach((tab) => {
+    const active = tab.dataset.view === view;
+    tab.classList.toggle("is-active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  const graphOnly = view === "graph";
+  ui.graphView.hidden = !graphOnly;
+  ui.detailsView.hidden = view !== "details";
+  ui.compareView.hidden = view !== "compare";
+  ui.nodeSearch.hidden = !graphOnly;
+  if (graphOnly) {
+    renderHierarchyToolbar();
+    if (state.payload) renderGraph();
+  } else {
+    ui.hierarchyToolbar.hidden = true;
+  }
+}
+
+ui.viewTabs.addEventListener("click", (event) => {
+  const tab = event.target.closest(".view-tab");
+  if (!tab) return;
+  setCenterView(tab.dataset.view);
+});
 
 ui.modelSearch.addEventListener("input", renderModelList);
 

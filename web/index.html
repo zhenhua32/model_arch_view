@@ -33,15 +33,6 @@
 
         <div class="sidebar-messages">
           <section id="warnings-panel" class="warnings-panel"></section>
-          <section id="model-summary" class="summary-panel"></section>
-          <section id="compare-section" class="compare-section" hidden>
-            <div class="section-head">
-              <h2>A/B 对比</h2>
-              <button id="compare-clear" class="ghost-button" type="button" hidden>清除</button>
-            </div>
-            <select id="compare-select" class="control-input"></select>
-            <div id="compare-body" class="compare-body"></div>
-          </section>
         </div>
       </aside>
 
@@ -61,18 +52,42 @@
           </div>
         </header>
 
-        <div id="graph-scroll" class="graph-scroll">
-          <div id="graph-canvas" class="graph-canvas">
-            <svg id="edge-layer" class="edge-layer" aria-hidden="true"></svg>
-            <div id="graph-board" class="graph-board"></div>
-          </div>
+        <div class="view-tabs" role="tablist" aria-label="中心视图">
+          <button class="view-tab is-active" type="button" data-view="graph" role="tab" aria-selected="true">架构图</button>
+          <button class="view-tab" type="button" data-view="details" role="tab" aria-selected="false">模型详情</button>
+          <button class="view-tab" type="button" data-view="compare" role="tab" aria-selected="false">A/B 对比</button>
         </div>
 
-        <div id="zoom-controls" class="zoom-controls">
-          <button id="zoom-out" class="zoom-btn" type="button" title="缩小" aria-label="缩小">−</button>
-          <span id="zoom-level" class="zoom-level">100%</span>
-          <button id="zoom-in" class="zoom-btn" type="button" title="放大" aria-label="放大">+</button>
-          <button id="zoom-reset" class="zoom-btn" type="button" title="重置" aria-label="重置缩放">⟲</button>
+        <div id="view-stage" class="view-stage">
+          <div id="graph-view" class="view-pane">
+            <div id="graph-scroll" class="graph-scroll">
+              <div id="graph-canvas" class="graph-canvas">
+                <svg id="edge-layer" class="edge-layer" aria-hidden="true"></svg>
+                <div id="graph-board" class="graph-board"></div>
+              </div>
+            </div>
+            <div id="zoom-controls" class="zoom-controls">
+              <button id="zoom-out" class="zoom-btn" type="button" title="缩小" aria-label="缩小">−</button>
+              <span id="zoom-level" class="zoom-level">100%</span>
+              <button id="zoom-in" class="zoom-btn" type="button" title="放大" aria-label="放大">+</button>
+              <button id="zoom-reset" class="zoom-btn" type="button" title="重置" aria-label="重置缩放">⟲</button>
+            </div>
+          </div>
+
+          <div id="details-view" class="view-pane" hidden>
+            <section id="model-summary" class="summary-panel center-summary"></section>
+          </div>
+
+          <div id="compare-view" class="view-pane" hidden>
+            <section id="compare-section" class="compare-section center-compare">
+              <div class="section-head">
+                <h2>A/B 对比</h2>
+                <button id="compare-clear" class="ghost-button" type="button" hidden>清除</button>
+              </div>
+              <select id="compare-select" class="control-input"></select>
+              <div id="compare-body" class="compare-body"></div>
+            </section>
+          </div>
         </div>
       </main>
 
