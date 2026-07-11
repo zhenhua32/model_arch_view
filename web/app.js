@@ -652,8 +652,8 @@ function renderThroughputSection(metrics) {
       const r = rows.find((x) => x.name === g.name) || {};
       return `<div class="tp-sub">
           <span class="tp-sub-name">${escapeHtml(g.name)}</span>
-          <span class="tp-sub-formula">算力上限 = (${g.bf16_tflops} × 10¹² × ${mfu}) / (2 × ${formatCount(act)}) ≈ ${formatTps(compute)} tok/s</span>
-          <span class="tp-sub-formula">带宽上限 = (${g.bw_gbs} × 10⁹) / (${formatCount(act)} × ${bpp}) ≈ ${formatTps(bandwidth)} tok/s</span>
+          <span class="tp-sub-formula">算力上限 = (${g.bf16_tflops} × 10¹² × MFU ${mfu}) / (2 × 激活 ${formatCount(act)}) ≈ ${formatTps(compute)} tok/s</span>
+          <span class="tp-sub-formula">带宽上限 = (${g.bw_gbs} × 10⁹) / (激活 ${formatCount(act)} × ${bpp}B/参数) ≈ ${formatTps(bandwidth)} tok/s</span>
           <span class="tp-sub-bound">→ decode = ${formatTps(r.decode_tps)} tok/s（${escapeHtml(r.bound)}瓶颈）</span>
         </div>`;
     })
@@ -672,7 +672,7 @@ function renderThroughputSection(metrics) {
         ${formulaRow("decode 吞吐", "min(算力上限, 带宽上限)", "")}
         ${formulaRow("首 token 延迟", `(2 × active × ${seq}) / peak × 1000 ms`, "")}
       </div>
-      <div class="formula-note">decode 每 token 约 2·active 次 FLOP（一次前/后向近似 2×），每 token 需把全部权重从显存读一遍，故通常带宽受限、MFU 取 ${mfu}；prefill（首 token）为算力受限，与 seq 长度成正比。</div>
+      <div class="formula-note">各符号：<b>激活</b> = 激活参数（本模型 ${formatB(act)}，MoE 仅取 top-k 路由专家 + 共享专家 + 稠密层，并非全部参数量）；<b>MFU ${mfu}</b> = 模型算力利用率（实际可达峰值算力的比例，推理场景通常约 40%）；<b>2×</b> = 每个参数单次前向约需 2 次浮点运算；<b>B/参数</b> = 权重精度对应的每参数字节（${escapeHtml(tt.precision || "bf16")}=${bpp}）。prefill（首 token）为算力受限，与 seq 长度成正比。</div>
       <div class="tp-sub-grid">${gpuRows}</div>
     </details>`;
 
