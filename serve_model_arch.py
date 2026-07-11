@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -453,6 +454,10 @@ def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
     # ---- FFN / MoE params ----
     dense_ffn_dim = ffn_hidden or (hidden_size * 4)
     dense_ffn_params = 3 * hidden_size * dense_ffn_dim
+    # Per-component FFN totals (total-parameter convention) for the breakdown chart.
+    routed_experts_total = 0
+    shared_experts_total = 0
+    dense_ffn_total = 0
     if num_experts:
         expert_dim = moe_ffn_hidden or dense_ffn_dim
         expert_params = 3 * hidden_size * expert_dim
@@ -461,38 +466,157 @@ def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
         shared_params = expert_params * n_shared_experts  # always active
         n_dense_layers = min(first_k_dense, num_layers) if first_k_dense else 0
         n_moe_layers = num_layers - n_dense_layers
-        ffn_total = n_dense_layers * dense_ffn_params + n_moe_layers * (routed_total + shared_params)
+        routed_experts_total = n_moe_layers * routed_total
+        shared_experts_total = n_moe_layers * shared_params
+        dense_ffn_total = n_dense_layers * dense_ffn_params
+        ffn_total = dense_ffn_total + routed_experts_total + shared_experts_total
         ffn_active = n_dense_layers * dense_ffn_params + n_moe_layers * (routed_active + shared_params)
     else:
         ffn_total = ffn_active = num_layers * dense_ffn_params
+        dense_ffn_total = ffn_total
 
     embed_params = hidden_size * (vocab_size or 0)
     embed_total = embed_params if tie_word_embeddings else embed_params * 2
-    total_params = attn_params * num_layers + ffn_total + embed_total
-    active_params = attn_params * num_layers + ffn_active + embed_params
+    attn_total = attn_params * num_layers
+    total_params = attn_total + ffn_total + embed_total
+    active_params = attn_total + ffn_active + embed_params
 
     # ---- KV cache (per 1K tokens per batch element) ----
     kv_cache_mb_per_1k: float | None = None
+    kv_bytes_per_token = 0  # raw per-token KV bytes (bf16), reused by memory estimator
     if is_mla:
         kv_elems = num_layers * ((kv_lora_rank or head_dim) + qk_rope_head_dim)
-        kv_bytes = kv_elems * 2  # latent stored in bf16
-        kv_cache_mb_per_1k = kv_bytes * 1024 / (1024 * 1024)
+        kv_bytes_per_token = kv_elems * 2  # latent stored in bf16
+        kv_cache_mb_per_1k = kv_bytes_per_token * 1024 / (1024 * 1024)
     elif num_kv_heads and head_dim:
-        kv_bytes = 2 * num_layers * num_kv_heads * head_dim * 2  # K+V, fp16
-        kv_cache_mb_per_1k = kv_bytes * 1024 / (1024 * 1024)
+        kv_bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * 2  # K+V, fp16
+        kv_cache_mb_per_1k = kv_bytes_per_token * 1024 / (1024 * 1024)
 
     return {
         "total_params": total_params,
         "active_params": active_params,
         "kv_cache_mb_per_1k": kv_cache_mb_per_1k,
+        "kv_bytes_per_token": kv_bytes_per_token,
         "gflops_per_token": 2 * active_params / 1e9,
-        # component breakdown (white-box)
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        # component breakdown (white-box + chart). sum(breakdown) == total_params.
         "attn_params_per_layer": attn_params,
         "ffn_total": ffn_total,
         "ffn_active": ffn_active,
         "embed_params": embed_params,
         "embed_total": embed_total,
+        "breakdown": {
+            "attention": attn_total,
+            "routed_experts": routed_experts_total,
+            "shared_experts": shared_experts_total,
+            "dense_ffn": dense_ffn_total,
+            "embedding": embed_total,
+        },
     }
+
+
+# ---- Deployment estimation reference tables --------------------------------
+# Approximate spec sheet values; centralised so they are easy to tweak.
+# bf16_tflops = dense bf16 tensor-core peak; bw_gbs = HBM bandwidth (GB/s).
+GPU_REFERENCE = [
+    {"name": "RTX 4090", "mem_gb": 24, "bf16_tflops": 165, "bw_gbs": 1008},
+    {"name": "A100 80G", "mem_gb": 80, "bf16_tflops": 312, "bw_gbs": 2039},
+    {"name": "H100 80G", "mem_gb": 80, "bf16_tflops": 990, "bw_gbs": 3350},
+    {"name": "H200 141G", "mem_gb": 141, "bf16_tflops": 990, "bw_gbs": 4800},
+]
+
+# Bytes per stored parameter for each weight precision.
+PRECISION_BYTES = {"bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.0, "int4": 0.5}
+
+# Fraction of usable VRAM (framework/fragmentation overhead) and model FLOPs
+# utilisation used for the theoretical throughput ceiling.
+_VRAM_USABLE = 0.90
+_MFU = 0.40
+# Coarse per-token activation footprint factor (very approximate).
+_ACT_FACTOR = 2
+
+
+def estimate_memory_footprint(
+    metrics: dict[str, Any],
+    precision: str = "bf16",
+    batch: int = 1,
+    seq_len: int = 2048,
+) -> dict[str, Any]:
+    """Estimate inference VRAM footprint and how many of each GPU are needed.
+
+    All figures are theoretical approximations:
+      - weights  = total_params * bytes/param(precision)
+      - kv_cache = kv_bytes_per_token * seq_len * batch (KV kept in bf16)
+      - activation ~= batch * seq_len * hidden_size * num_layers * factor * 2B (bf16)
+    """
+    precision = precision if precision in PRECISION_BYTES else "bf16"
+    batch = max(int(batch or 1), 1)
+    seq_len = max(int(seq_len or 1), 1)
+
+    total_params = metrics.get("total_params", 0) or 0
+    kv_bytes_per_token = metrics.get("kv_bytes_per_token", 0) or 0
+    hidden_size = metrics.get("hidden_size", 0) or 0
+    num_layers = metrics.get("num_layers", 0) or 0
+
+    weights_bytes = total_params * PRECISION_BYTES[precision]
+    kv_bytes = kv_bytes_per_token * seq_len * batch
+    activation_bytes = batch * seq_len * hidden_size * num_layers * _ACT_FACTOR * 2
+    total_bytes = weights_bytes + kv_bytes + activation_bytes
+
+    gib = 1024 ** 3
+    total_gb = total_bytes / gib
+    gpu_fit = []
+    for gpu in GPU_REFERENCE:
+        usable = gpu["mem_gb"] * _VRAM_USABLE
+        count = math.ceil(total_gb / usable) if usable > 0 else 0
+        gpu_fit.append({"name": gpu["name"], "mem_gb": gpu["mem_gb"], "count": count})
+
+    return {
+        "precision": precision,
+        "batch": batch,
+        "seq_len": seq_len,
+        "weights_bytes": weights_bytes,
+        "kv_bytes": kv_bytes,
+        "activation_bytes": activation_bytes,
+        "total_bytes": total_bytes,
+        "total_gb": total_gb,
+        "gpu_fit": gpu_fit,
+    }
+
+
+def estimate_throughput(metrics: dict[str, Any], precision: str = "bf16", seq_len: int = 2048) -> list[dict[str, Any]]:
+    """Estimate per-GPU decode throughput (tok/s) and prefill first-token latency.
+
+    Decode is the smaller of the compute ceiling and the memory-bandwidth ceiling
+    (decode is usually bandwidth bound). Prefill (TTFT) is compute bound.
+    All values are theoretical upper-bound approximations.
+    """
+    precision = precision if precision in PRECISION_BYTES else "bf16"
+    seq_len = max(int(seq_len or 1), 1)
+    active_params = metrics.get("active_params", 0) or 0
+    if active_params <= 0:
+        return []
+
+    bytes_per_param = PRECISION_BYTES[precision]
+    rows = []
+    for gpu in GPU_REFERENCE:
+        peak_flops = gpu["bf16_tflops"] * 1e12 * _MFU
+        bw = gpu["bw_gbs"] * 1e9
+        compute_tps = peak_flops / (2 * active_params)
+        bandwidth_tps = bw / (active_params * bytes_per_param)
+        if bandwidth_tps <= compute_tps:
+            decode_tps, bound = bandwidth_tps, "带宽"
+        else:
+            decode_tps, bound = compute_tps, "算力"
+        ttft_ms = (2 * active_params * seq_len) / peak_flops * 1000
+        rows.append({
+            "name": gpu["name"],
+            "decode_tps": decode_tps,
+            "ttft_ms": ttft_ms,
+            "bound": bound,
+        })
+    return rows
 
 
 def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -1393,25 +1517,48 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
 
         summary.append(detail("推理 FLOPs", f"{metrics['gflops_per_token']:.1f} GFLOPs / token"))
 
+    precision = str(query.get("precision", ["bf16"])[0] or "bf16")
+    if precision not in PRECISION_BYTES:
+        precision = "bf16"
+
     controls = [
         {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 16, "step": 1, "help": "并行样本数"},
         {"name": "seq_len", "label": "Token 长度", "type": "number", "value": seq_len, "min": 1, "max": max_position, "step": 1, "help": "输入 token 数"},
+        {"name": "precision", "label": "权重精度", "type": "select", "value": precision, "options": list(PRECISION_BYTES.keys()), "help": "用于显存/成本与吞吐估算"},
     ]
 
     headline = f"Decoder-only 语言模型，隐藏维度 {hidden_size or '?'}，共 {num_layers or '?'} 层。"
-    return base_model_payload(
+    payload = base_model_payload(
         model_id,
         "llm",
         architecture,
         headline,
         summary,
         controls,
-        {"batch": batch, "seq_len": seq_len},
+        {"batch": batch, "seq_len": seq_len, "precision": precision},
         build_graph(lanes, nodes, edges),
         warnings,
         sources,
         "decoder_stack",
     )
+
+    if metrics is not None:
+        payload["metrics"] = {
+            "total_params": metrics["total_params"],
+            "active_params": metrics["active_params"],
+            "gflops_per_token": metrics["gflops_per_token"],
+            "kv_bytes_per_token": metrics["kv_bytes_per_token"],
+            "kv_cache_mb_per_1k": metrics["kv_cache_mb_per_1k"],
+            "hidden_size": metrics["hidden_size"],
+            "num_layers": metrics["num_layers"],
+            "is_moe": bool(num_experts),
+            "breakdown": metrics["breakdown"],
+            "memory": estimate_memory_footprint(metrics, precision, batch, seq_len),
+            "throughput": estimate_throughput(metrics, precision, seq_len),
+            "gpu_reference": GPU_REFERENCE,
+        }
+
+    return payload
 
 
 def infer_default_image_size(config: dict[str, Any], vision_config: dict[str, Any], image_processor: dict[str, Any]) -> tuple[int, int]:

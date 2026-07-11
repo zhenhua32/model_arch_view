@@ -2,6 +2,9 @@ const state = {
   models: [],
   activeModelId: null,
   payload: null,
+  compareModelId: null,
+  comparePayload: null,
+  compareController: null,
   selectedNodeId: null,
   llmHierarchyMode: "summary",
   refreshTimer: null,
@@ -23,6 +26,10 @@ const ui = {
   exportSvgButton: document.getElementById("export-svg-button"),
   statusBar: document.getElementById("status-bar"),
   summaryPanel: document.getElementById("model-summary"),
+  compareSection: document.getElementById("compare-section"),
+  compareSelect: document.getElementById("compare-select"),
+  compareBody: document.getElementById("compare-body"),
+  compareClear: document.getElementById("compare-clear"),
   warningsPanel: document.getElementById("warnings-panel"),
   graphScroll: document.getElementById("graph-scroll"),
   graphCanvas: document.getElementById("graph-canvas"),
@@ -428,6 +435,8 @@ async function loadModelPayload() {
     renderWarnings();
     renderGraph();
     renderDetails();
+    renderCompareSelect();
+    loadComparePayload();
     setStatus(`已加载 ${payload.model.name}，当前展示 ${payload.model.type} 图结构。`);
   } catch (error) {
     if (error.name === "AbortError") {
@@ -444,6 +453,264 @@ async function loadModelPayload() {
     ui.graphBoard.innerHTML = "";
     ui.edgeLayer.innerHTML = "";
     ui.detailPanel.innerHTML = '<div class="empty-state">无法读取模型详情。</div>';
+  }
+}
+
+const BREAKDOWN_META = [
+  { key: "attention", label: "注意力", color: "#378ADD" },
+  { key: "routed_experts", label: "路由专家", color: "#1D9E75" },
+  { key: "shared_experts", label: "共享专家", color: "#EF9F27" },
+  { key: "dense_ffn", label: "稠密 FFN", color: "#7F77DD" },
+  { key: "embedding", label: "嵌入 / 输出头", color: "#888780" },
+];
+
+const MEM_META = [
+  { key: "weights_bytes", label: "权重", color: "#378ADD" },
+  { key: "kv_bytes", label: "KV cache", color: "#1D9E75" },
+  { key: "activation_bytes", label: "激活(粗估)", color: "#EF9F27" },
+];
+
+function formatB(v) {
+  return `${(v / 1e9).toFixed(2)}B`;
+}
+
+function formatGB(bytes) {
+  const gb = bytes / 1024 ** 3;
+  if (gb >= 1) return `${gb.toFixed(1)} GB`;
+  return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
+}
+
+function formatTps(v) {
+  return v >= 1 ? v.toFixed(0) : v.toFixed(1);
+}
+
+function renderStackedBar(items, total) {
+  if (!total) return "";
+  const segments = items
+    .filter((it) => it.value > 0)
+    .map(
+      (it) =>
+        `<span class="stack-seg" style="width:${(it.value / total * 100).toFixed(2)}%;background:${it.color}" title="${escapeHtml(it.label)} ${(it.value / total * 100).toFixed(1)}%"></span>`
+    )
+    .join("");
+  return `<div class="stack-bar">${segments}</div>`;
+}
+
+function renderBreakdownSection(metrics) {
+  const bd = metrics.breakdown || {};
+  const total = metrics.total_params || 0;
+  if (!total) return "";
+  const items = BREAKDOWN_META.map((m) => ({ ...m, value: bd[m.key] || 0 }));
+  const bar = renderStackedBar(items, total);
+  const legend = items
+    .filter((it) => it.value > 0)
+    .sort((a, b) => b.value - a.value)
+    .map(
+      (it) => `
+        <div class="legend-row">
+          <span class="legend-dot" style="background:${it.color}"></span>
+          <span class="legend-name">${escapeHtml(it.label)}</span>
+          <span class="legend-val">${formatB(it.value)}</span>
+          <span class="legend-pct">${(it.value / total * 100).toFixed(1)}%</span>
+        </div>`
+    )
+    .join("");
+  const activeBar = metrics.is_moe
+    ? `<div class="active-row">
+         <span class="active-label">激活参数</span>
+         <div class="stack-bar thin"><span class="stack-seg" style="width:${(metrics.active_params / total * 100).toFixed(2)}%;background:#1D9E75"></span></div>
+         <span class="active-val">${formatB(metrics.active_params)} · ${(metrics.active_params / total * 100).toFixed(1)}%</span>
+       </div>`
+    : "";
+  return `
+    <div class="detail-section">
+      <h3>参数构成 <span class="subtle">共 ${formatB(total)}</span></h3>
+      ${bar}
+      <div class="legend">${legend}</div>
+      ${activeBar}
+    </div>`;
+}
+
+function renderMemorySection(metrics) {
+  const mem = metrics.memory;
+  if (!mem) return "";
+  const items = MEM_META.map((m) => ({ ...m, value: mem[m.key] || 0 }));
+  const bar = renderStackedBar(items, mem.total_bytes);
+  const legend = items
+    .filter((it) => it.value > 0)
+    .map(
+      (it) => `
+        <div class="legend-row">
+          <span class="legend-dot" style="background:${it.color}"></span>
+          <span class="legend-name">${escapeHtml(it.label)}</span>
+          <span class="legend-val">${formatGB(it.value)}</span>
+        </div>`
+    )
+    .join("");
+  const gpus = (mem.gpu_fit || [])
+    .map((g) => {
+      const cls = g.count <= 1 ? "gpu-ok" : g.count <= 4 ? "gpu-mid" : "gpu-heavy";
+      return `<div class="gpu-card ${cls}"><span class="gpu-name">${escapeHtml(g.name)}</span><span class="gpu-count">×${g.count}</span></div>`;
+    })
+    .join("");
+  return `
+    <div class="detail-section">
+      <h3>显存 &amp; 成本 <span class="est-badge">粗估 · ${escapeHtml(mem.precision)}</span></h3>
+      <div class="mem-total">总需求 ≈ ${mem.total_gb.toFixed(1)} GB <span class="subtle">(batch ${mem.batch} · seq ${mem.seq_len})</span></div>
+      ${bar}
+      <div class="legend">${legend}</div>
+      <div class="gpu-grid">${gpus}</div>
+    </div>`;
+}
+
+function renderThroughputSection(metrics) {
+  const rows = metrics.throughput || [];
+  if (!rows.length) return "";
+  const body = rows
+    .map(
+      (r) => `
+        <div class="tp-row">
+          <span class="tp-name">${escapeHtml(r.name)}</span>
+          <span class="tp-tps">${formatTps(r.decode_tps)} tok/s</span>
+          <span class="tp-ttft">${r.ttft_ms.toFixed(0)} ms</span>
+          <span class="tp-bound">${escapeHtml(r.bound)}</span>
+        </div>`
+    )
+    .join("");
+  return `
+    <div class="detail-section">
+      <h3>吞吐 / 延迟 <span class="est-badge">理论上限</span></h3>
+      <div class="tp-head">
+        <span class="tp-name">GPU</span><span class="tp-tps">decode</span><span class="tp-ttft">首 token</span><span class="tp-bound">瓶颈</span>
+      </div>
+      ${body}
+    </div>`;
+}
+
+function renderAnalysisSections(payload) {
+  const metrics = payload.metrics;
+  if (!metrics) return "";
+  return renderBreakdownSection(metrics) + renderMemorySection(metrics) + renderThroughputSection(metrics);
+}
+
+// ---- A/B comparison ----
+
+function metricsHaveData(payload) {
+  return Boolean(payload && payload.metrics && payload.metrics.total_params);
+}
+
+function pickThroughput(metrics, gpuName) {
+  const rows = metrics.throughput || [];
+  const hit = rows.find((r) => r.name === gpuName) || rows[rows.length - 1];
+  return hit || null;
+}
+
+const COMPARE_ROWS = [
+  { label: "总参数量", get: (m) => m.total_params, fmt: formatB, lowerBetter: true },
+  { label: "激活参数", get: (m) => m.active_params, fmt: formatB, lowerBetter: true },
+  { label: "每 token FLOPs", get: (m) => m.gflops_per_token * 1e9, fmt: (v) => `${(v / 1e9).toFixed(2)} G`, lowerBetter: true },
+  { label: "KV / 1k tok", get: (m) => m.kv_cache_mb_per_1k, fmt: (v) => `${v.toFixed(1)} MB`, lowerBetter: true },
+  { label: "显存需求", get: (m) => (m.memory ? m.memory.total_gb : 0), fmt: (v) => `${v.toFixed(1)} GB`, lowerBetter: true },
+  {
+    label: "H100 decode",
+    get: (m) => { const t = pickThroughput(m, "H100 80G"); return t ? t.decode_tps : 0; },
+    fmt: (v) => `${formatTps(v)} tok/s`,
+    lowerBetter: false,
+  },
+];
+
+function renderDeltaBadge(base, other, lowerBetter) {
+  if (!base || !other) return `<span class="cmp-delta same">—</span>`;
+  const ratio = (other - base) / base;
+  if (Math.abs(ratio) < 0.005) return `<span class="cmp-delta same">≈</span>`;
+  const up = other > base;
+  const good = lowerBetter ? !up : up;
+  const arrow = up ? "▲" : "▼";
+  const pct = `${up ? "+" : ""}${(ratio * 100).toFixed(0)}%`;
+  return `<span class="cmp-delta ${good ? "good" : "bad"}">${arrow} ${pct}</span>`;
+}
+
+function renderCompareTable() {
+  const base = state.payload;
+  const other = state.comparePayload;
+  if (!metricsHaveData(base) || !metricsHaveData(other)) {
+    ui.compareBody.innerHTML = "";
+    return;
+  }
+  const ma = base.metrics;
+  const mb = other.metrics;
+  const rows = COMPARE_ROWS.map((row) => {
+    const va = row.get(ma) || 0;
+    const vb = row.get(mb) || 0;
+    return `
+      <div class="cmp-row">
+        <span class="cmp-metric">${escapeHtml(row.label)}</span>
+        <span class="cmp-a">${row.fmt(va)}</span>
+        <span class="cmp-b">${row.fmt(vb)} ${renderDeltaBadge(va, vb, row.lowerBetter)}</span>
+      </div>`;
+  }).join("");
+  ui.compareBody.innerHTML = `
+    <div class="cmp-table">
+      <div class="cmp-head">
+        <span class="cmp-metric">指标</span>
+        <span class="cmp-a" title="${escapeHtml(base.model.name)}">A · ${escapeHtml(truncateText(base.model.name, 14))}</span>
+        <span class="cmp-b" title="${escapeHtml(other.model.name)}">B · ${escapeHtml(truncateText(other.model.name, 14))}</span>
+      </div>
+      ${rows}
+      <p class="cmp-note">B 列箭头相对 A 变化，绿色=更优（资源更省或吞吐更高）。</p>
+    </div>`;
+}
+
+function renderCompareSelect() {
+  if (!ui.compareSelect) return;
+  const showable = metricsHaveData(state.payload);
+  ui.compareSection.hidden = !showable;
+  if (!showable) {
+    state.compareModelId = null;
+    state.comparePayload = null;
+    return;
+  }
+  const candidates = state.models.filter(
+    (m) => m.type === "llm" && m.id !== state.activeModelId
+  );
+  if (state.compareModelId && !candidates.some((m) => m.id === state.compareModelId)) {
+    state.compareModelId = null;
+    state.comparePayload = null;
+  }
+  const options = [`<option value="">（选择对比模型…）</option>`].concat(
+    candidates.map(
+      (m) =>
+        `<option value="${escapeHtml(m.id)}"${m.id === state.compareModelId ? " selected" : ""}>${escapeHtml(m.name)}</option>`
+    )
+  );
+  ui.compareSelect.innerHTML = options.join("");
+  ui.compareClear.hidden = !state.compareModelId;
+}
+
+async function loadComparePayload() {
+  if (!state.compareModelId) {
+    state.comparePayload = null;
+    renderCompareTable();
+    return;
+  }
+  if (state.compareController) {
+    state.compareController.abort();
+  }
+  state.compareController = new AbortController();
+  const query = buildQueryFromControls();
+  const suffix = query ? `?${query}` : "";
+  try {
+    const payload = await fetchJson(
+      `/api/models/${encodeURIComponent(state.compareModelId)}${suffix}`,
+      state.compareController.signal
+    );
+    state.comparePayload = payload;
+    renderCompareTable();
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    console.error(error);
+    state.comparePayload = null;
+    ui.compareBody.innerHTML = `<div class="empty-state">对比模型加载失败：${escapeHtml(error.message)}</div>`;
   }
 }
 
@@ -505,6 +772,7 @@ function renderSummary() {
       <p class="headline">${escapeHtml(payload.model.headline)}</p>
     </div>
     <div class="summary-grid">${metrics}</div>
+    ${renderAnalysisSections(payload)}
     <div class="detail-section">
       <h3>图谱摘要</h3>
       <div class="flow-strip">${graphStats}</div>
@@ -537,30 +805,38 @@ function renderControls() {
     return;
   }
 
-  const existingInputs = Array.from(ui.controlsForm.querySelectorAll("input[name]"));
-  const existingNames = existingInputs.map((el) => el.name);
+  const existingFields = Array.from(ui.controlsForm.querySelectorAll("[name]"));
+  const existingNames = existingFields.map((el) => el.name);
   const newNames = controls.map((c) => c.name);
   const sameStructure = existingNames.length === newNames.length && existingNames.every((name, i) => name === newNames[i]);
 
   if (sameStructure) {
     controls.forEach((control) => {
       const input = ui.controlsForm.querySelector(`input[name="${control.name}"]`);
-      if (!input) {
-        return;
+      if (input) {
+        input.min = control.min ?? "";
+        input.max = control.max ?? "";
+        input.step = control.step ?? 1;
       }
-      input.min = control.min ?? "";
-      input.max = control.max ?? "";
-      input.step = control.step ?? 1;
+      const select = ui.controlsForm.querySelector(`select[name="${control.name}"]`);
+      if (select && control.value != null) {
+        select.value = String(control.value);
+      }
     });
     return;
   }
 
   ui.controlsForm.innerHTML = controls
-    .map(
-      (control) => `
-        <label class="control-group">
-          <span>${escapeHtml(control.label)}</span>
-          <input
+    .map((control) => {
+      const field =
+        control.type === "select"
+          ? `<select class="control-input" name="${escapeHtml(control.name)}">${(control.options || [])
+              .map(
+                (opt) =>
+                  `<option value="${escapeHtml(opt)}"${String(opt) === String(control.value) ? " selected" : ""}>${escapeHtml(opt)}</option>`
+              )
+              .join("")}</select>`
+          : `<input
             class="control-input"
             name="${escapeHtml(control.name)}"
             type="${escapeHtml(control.type || "number")}" 
@@ -568,11 +844,15 @@ function renderControls() {
             min="${escapeHtml(control.min ?? "")}" 
             max="${escapeHtml(control.max ?? "")}" 
             step="${escapeHtml(control.step ?? 1)}"
-          />
+          />`;
+      return `
+        <label class="control-group">
+          <span>${escapeHtml(control.label)}</span>
+          ${field}
           <span class="control-meta">${escapeHtml(control.help || "")}</span>
         </label>
-      `
-    )
+      `;
+    })
     .join("");
 }
 
@@ -1083,7 +1363,21 @@ ui.modelList.addEventListener("click", (event) => {
 });
 
 ui.controlsForm.addEventListener("input", scheduleRefresh);
+ui.controlsForm.addEventListener("change", scheduleRefresh);
 ui.refreshButton.addEventListener("click", () => loadModelPayload());
+
+ui.compareSelect.addEventListener("change", () => {
+  state.compareModelId = ui.compareSelect.value || null;
+  ui.compareClear.hidden = !state.compareModelId;
+  loadComparePayload();
+});
+ui.compareClear.addEventListener("click", () => {
+  state.compareModelId = null;
+  state.comparePayload = null;
+  ui.compareClear.hidden = true;
+  if (ui.compareSelect) ui.compareSelect.value = "";
+  renderCompareTable();
+});
 ui.hierarchyToolbar.addEventListener("click", (event) => {
   const button = event.target.closest("[data-hierarchy-mode]");
   if (!button || !state.payload || !HIERARCHY_TYPES.has(state.payload.model.type)) {
