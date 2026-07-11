@@ -8,74 +8,62 @@
   </head>
   <body>
     <div class="page-shell">
-      <header class="hero">
-        <div>
-          <p class="eyebrow">Model Configs Explorer</p>
-          <h1>模型架构、流向与 Shape 可视化</h1>
-          <p class="hero-copy">
-            选择 model_configs 下的模型目录，查看主干结构、跨模态流向、latent 路径和基于配置推导的典型张量 shape。
-          </p>
-        </div>
-        <div class="hero-note">
-          <span>无额外依赖</span>
-          <span>本地 Python 服务</span>
-          <span>支持 LLM / 多模态 / Diffusers</span>
-        </div>
-      </header>
+      <aside class="sidebar">
+        <header class="app-header">
+          <h1>Model Arch Viewer</h1>
+          <p class="app-desc">模型架构、流向与 Shape 可视化</p>
+        </header>
 
-      <main class="workspace">
-        <aside class="sidebar panel">
-          <section>
-            <div class="section-head">
-              <h2>模型目录</h2>
-              <span id="model-count" class="pill">0</span>
-            </div>
-            <label class="field-label" for="model-search">筛选</label>
-            <input id="model-search" class="search-input" type="search" placeholder="输入模型名或架构名" />
-            <div id="model-list" class="model-list"></div>
-          </section>
-
-          <section class="controls-section">
-            <div class="section-head">
-              <h2>运行参数</h2>
-              <button id="refresh-button" class="ghost-button" type="button">刷新 shape</button>
-            </div>
-            <form id="controls-form" class="controls-form"></form>
-          </section>
-        </aside>
-
-        <section class="main-panel">
-          <div id="status-bar" class="status-bar">正在加载模型目录...</div>
-          <section id="model-summary" class="panel summary-panel"></section>
-          <section id="warnings-panel" class="warnings-panel"></section>
-          <section class="panel graph-panel">
-            <div class="section-head graph-head">
-              <div>
-                <h2>架构图</h2>
-                <div class="graph-tip">点击节点查看细节；修改左侧参数可重算 shape；当前视图支持路径聚焦与导出。</div>
-              </div>
-              <div class="graph-actions">
-                <div id="hierarchy-toolbar" class="hierarchy-toolbar" hidden>
-                  <span class="hierarchy-label">LLM 层级</span>
-                  <button class="hierarchy-button is-active" type="button" data-hierarchy-mode="summary">汇总</button>
-                  <button class="hierarchy-button" type="button" data-hierarchy-mode="block">Q/K/V/Causal</button>
-                  <button class="hierarchy-button" type="button" data-hierarchy-mode="repeat">重复 N 层</button>
-                </div>
-                <button id="export-json-button" class="ghost-button" type="button" disabled>导出 JSON</button>
-                <button id="export-svg-button" class="ghost-button" type="button" disabled>导出 SVG</button>
-              </div>
-            </div>
-            <div id="graph-scroll" class="graph-scroll">
-              <div id="graph-canvas" class="graph-canvas">
-                <svg id="edge-layer" class="edge-layer" aria-hidden="true"></svg>
-                <div id="graph-board" class="graph-board"></div>
-              </div>
-            </div>
-          </section>
+        <section class="model-section">
+          <div class="section-head">
+            <h2>模型目录</h2>
+            <span id="model-count" class="pill">0</span>
+          </div>
+          <input id="model-search" class="search-input" type="search" placeholder="输入模型名或架构名" />
+          <div id="model-list" class="model-list"></div>
         </section>
 
-        <aside id="detail-panel" class="detail-panel panel"></aside>
+        <section class="controls-section">
+          <div class="section-head">
+            <h2>运行参数</h2>
+            <button id="refresh-button" class="ghost-button" type="button">刷新</button>
+          </div>
+          <form id="controls-form" class="controls-form"></form>
+        </section>
+      </aside>
+
+      <main class="main-canvas-area">
+        <div class="canvas-overlay canvas-top-bar">
+          <div id="status-bar" class="status-bar">正在加载模型目录...</div>
+          <div class="graph-actions floating-toolbar">
+            <div id="hierarchy-toolbar" class="hierarchy-toolbar" hidden>
+              <span class="hierarchy-label">LLM 层级</span>
+              <button class="hierarchy-button is-active" type="button" data-hierarchy-mode="summary">汇总</button>
+              <button class="hierarchy-button" type="button" data-hierarchy-mode="block">Q/K/V/Causal</button>
+              <button class="hierarchy-button" type="button" data-hierarchy-mode="repeat">重复 N 层</button>
+            </div>
+            <button id="export-json-button" class="ghost-button action-btn" type="button" disabled>JSON</button>
+            <button id="export-svg-button" class="ghost-button action-btn" type="button" disabled>SVG</button>
+          </div>
+        </div>
+
+        <div class="canvas-overlay canvas-warnings">
+          <section id="warnings-panel" class="warnings-panel"></section>
+        </div>
+        
+        <div class="canvas-overlay canvas-summary">
+          <section id="model-summary" class="summary-panel"></section>
+        </div>
+
+        <div id="graph-scroll" class="graph-scroll">
+          <div id="graph-canvas" class="graph-canvas">
+            <svg id="edge-layer" class="edge-layer" aria-hidden="true"></svg>
+            <div id="graph-board" class="graph-board"></div>
+          </div>
+        </div>
       </main>
+
+      <aside id="detail-panel" class="detail-panel"></aside>
     </div>
 
     <script src="/app.js" defer></script>
