@@ -308,6 +308,10 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     moe_config = params_config.get("moe") if isinstance(params_config.get("moe"), dict) else {}
     num_experts = int(first_defined(config.get("n_routed_experts"), config.get("num_experts"), moe_config.get("num_experts"), 0) or 0)
     experts_per_tok = int(first_defined(config.get("num_experts_per_tok"), moe_config.get("num_experts_per_tok"), 0) or 0)
+    # MoE expert FFN dim (routed & shared experts), shared-expert count, and dense-layer count.
+    moe_ffn_hidden = int(first_defined(config.get("moe_intermediate_size"), moe_config.get("moe_intermediate_size"), 0) or 0)
+    n_shared_experts = int(first_defined(config.get("n_shared_experts"), moe_config.get("n_shared_experts"), 0) or 0)
+    first_k_dense = int(first_defined(config.get("first_k_dense_replace"), config.get("n_dense_layers"), 0) or 0)
     quant = first_defined(
         config.get("quantization_config", {}).get("quant_method") if isinstance(config.get("quantization_config"), dict) else None,
         params_config.get("quantization", {}).get("qformat_weight") if isinstance(params_config.get("quantization"), dict) else None,
@@ -325,7 +329,17 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     q_lora_rank = int(first_defined(config.get("q_lora_rank"), 0) or 0)
     kv_lora_rank = int(first_defined(config.get("kv_lora_rank"), config.get("kv_lora_a"), 0) or 0)
     qk_rope_head_dim = int(first_defined(config.get("qk_rope_head_dim"), 0) or 0)
-    qk_nope_head_dim = head_dim - qk_rope_head_dim if head_dim and qk_rope_head_dim else head_dim or 0
+    # Prefer explicit config value; only fall back to derivation when absent.
+    qk_nope_head_dim = int(first_defined(
+        config.get("qk_nope_head_dim"),
+        (head_dim - qk_rope_head_dim) if (head_dim and qk_rope_head_dim) else head_dim,
+        0,
+    ) or 0)
+    qk_head_dim = int(first_defined(
+        config.get("qk_head_dim"),
+        (qk_nope_head_dim + qk_rope_head_dim) if (qk_nope_head_dim and qk_rope_head_dim) else head_dim,
+        0,
+    ) or 0)
     v_head_dim = int(first_defined(config.get("v_head_dim"), head_dim) or 0)
     o_lora_rank = int(first_defined(config.get("o_lora_rank"), 0) or 0)
     is_mla = q_lora_rank > 0
@@ -1162,21 +1176,53 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
 
     # Runtime estimation
     if hidden_size and num_layers:
-        attn_params = 2 * hidden_size * hidden_size + 2 * hidden_size * (num_kv_heads * head_dim if num_kv_heads and head_dim else hidden_size)
-        ffn_dim = ffn_hidden or (hidden_size * 4)
-        ffn_params = 3 * hidden_size * ffn_dim
-        if num_experts:
-            ffn_params_total = ffn_params * num_experts
-            ffn_params_active = ffn_params * experts_per_tok if experts_per_tok else ffn_params
+        # ---- Attention params per layer ----
+        if is_mla:
+            # MLA: low-rank Q/KV projections + output proj (DeepSeek/GLM-MoE style).
+            # q_a: H->q_lora ; q_b: q_lora->heads*qk_head
+            if q_lora_rank:
+                q_params = hidden_size * q_lora_rank + q_lora_rank * num_heads * (qk_head_dim or head_dim)
+            else:
+                q_params = hidden_size * num_heads * (qk_head_dim or head_dim)
+            # kv_a: H->(kv_lora + rope) ; kv_b: kv_lora->heads*(qk_nope + v_head)
+            kv_down = hidden_size * ((kv_lora_rank or head_dim) + qk_rope_head_dim)
+            kv_up = (kv_lora_rank or head_dim) * num_heads * ((qk_nope_head_dim or head_dim) + (v_head_dim or head_dim))
+            o_params = num_heads * (v_head_dim or head_dim) * hidden_size
+            attn_params = q_params + kv_down + kv_up + o_params
         else:
-            ffn_params_total = ffn_params
-            ffn_params_active = ffn_params
+            attn_params = 2 * hidden_size * hidden_size + 2 * hidden_size * (num_kv_heads * head_dim if num_kv_heads and head_dim else hidden_size)
+
+        # ---- FFN / MoE params ----
+        dense_ffn_dim = ffn_hidden or (hidden_size * 4)
+        dense_ffn_params = 3 * hidden_size * dense_ffn_dim
+        if num_experts:
+            # Routed & shared experts use moe_intermediate_size, NOT the dense intermediate_size.
+            expert_dim = moe_ffn_hidden or dense_ffn_dim
+            expert_params = 3 * hidden_size * expert_dim
+            routed_total = expert_params * num_experts
+            routed_active = expert_params * experts_per_tok if experts_per_tok else expert_params
+            shared_params = expert_params * n_shared_experts  # always active
+            # First `first_k_dense` layers are dense FFN; the rest are MoE.
+            n_dense_layers = min(first_k_dense, num_layers) if first_k_dense else 0
+            n_moe_layers = num_layers - n_dense_layers
+            ffn_total = n_dense_layers * dense_ffn_params + n_moe_layers * (routed_total + shared_params)
+            ffn_active = n_dense_layers * dense_ffn_params + n_moe_layers * (routed_active + shared_params)
+        else:
+            ffn_total = ffn_active = num_layers * dense_ffn_params
+
         embed_params = hidden_size * (vocab_size or 0)
-        total_params = (attn_params + ffn_params_total) * num_layers + embed_params
-        active_params = (attn_params + ffn_params_active) * num_layers + embed_params
+        # Total counts embed + lm_head (untied); active compute counts lm_head only (embed is a lookup).
+        total_params = attn_params * num_layers + ffn_total + embed_params * 2
+        active_params = attn_params * num_layers + ffn_active + embed_params
         summary.append(detail("参数量", f"{total_params / 1e9:.2f}B" + (f" (active {active_params / 1e9:.2f}B)" if num_experts else "")))
 
-        if num_kv_heads and head_dim:
+        if is_mla:
+            # MLA caches only the compressed latent (kv_lora) + decoupled RoPE key, shared across heads.
+            kv_elems = num_layers * ((kv_lora_rank or head_dim) + qk_rope_head_dim)
+            kv_bytes = kv_elems * 2  # latent stored in bf16
+            kv_per_1k = kv_bytes * 1024 / (1024 * 1024)
+            summary.append(detail("KV cache", f"{kv_per_1k:.1f} MB / 1K tokens / batch"))
+        elif num_kv_heads and head_dim:
             kv_bytes = 2 * num_layers * num_kv_heads * head_dim * 2  # K+V, fp16
             kv_per_1k = kv_bytes * 1024 / (1024 * 1024)
             summary.append(detail("KV cache", f"{kv_per_1k:.1f} MB / 1K tokens / batch"))
