@@ -164,9 +164,13 @@ html, body {
 .summary-panel h2 { margin: 0; font-family: var(--font-head); font-size: 1rem; font-weight: 600; }
 .headline { margin: 6px 0 0; color: var(--muted); line-height: 1.5; font-size: 0.8rem; }
 .summary-grid { margin-top: 12px; gap: 8px; }
-.metric-card { flex: 1; min-width: 80px; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--panel); border: 1px solid var(--line); }
-.metric-label { color: var(--muted); font-size: 0.7rem; }
-.metric-value { margin-top: 4px; font-family: var(--font-mono); font-size: 0.9rem; font-weight: 600; }
+
+/* ---- spec table (model details, replaces cramped metric cards) ---- */
+.spec-table { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0 20px; margin-top: 16px; }
+.spec-row { display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 14px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.spec-row:last-child { border-bottom: none; }
+.spec-label { color: var(--muted); font-size: 0.78rem; white-space: nowrap; }
+.spec-value { color: var(--ink); font-family: var(--font-mono); font-size: 0.85rem; font-weight: 500; overflow-wrap: anywhere; word-break: break-word; }
 .source-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .source-chip { padding: 4px 8px; border-radius: 4px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); font-family: var(--font-mono); font-size: 0.7rem; }
 .flow-strip, .jump-list { display: flex; flex-wrap: wrap; gap: 6px; }

@@ -821,14 +821,14 @@ function renderSummary() {
   }
 
   const graph = getVisibleGraph(payload);
+  // Clean spec-table layout: two-col rows (label | value).
   const metrics = payload.model.summary
     .map(
       (item) => `
-        <div class="metric-card">
-          <div class="metric-label">${escapeHtml(item.label)}</div>
-          <div class="metric-value">${escapeHtml(item.value)}</div>
-        </div>
-      `
+        <div class="spec-row">
+          <span class="spec-label">${escapeHtml(item.label)}</span>
+          <span class="spec-value">${escapeHtml(item.value)}</span>
+        </div>`
     )
     .join("");
   const sources = (payload.model.sources || [])
@@ -871,7 +871,7 @@ function renderSummary() {
       <h2>${escapeHtml(payload.model.name)}</h2>
       <p class="headline">${escapeHtml(payload.model.headline)}</p>
     </div>
-    <div class="summary-grid">${metrics}</div>
+    <div class="spec-table">${metrics}</div>
     ${renderAnalysisSections(payload)}
     <div class="detail-section">
       <h3>图谱摘要</h3>
