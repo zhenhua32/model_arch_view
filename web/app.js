@@ -55,28 +55,40 @@ function updateExportButtons() {
   ui.exportSvgButton.disabled = disabled;
 }
 
-function extractLlmLayerCount(payload = state.payload) {
-  const summaryItem = payload?.model?.summary?.find?.((item) => item.label === "层数");
+function extractRepeatCount(payload = state.payload) {
+  const modelType = payload?.model?.type;
+  const label = modelType === "diffusers" ? "推理步数" : modelType === "multimodal" ? "主干层数" : "层数";
+  const summaryItem = payload?.model?.summary?.find?.((item) => item.label === label);
   const numeric = Number.parseInt(summaryItem?.value ?? "", 10);
   return Number.isFinite(numeric) ? numeric : null;
 }
 
 function getHierarchyModeLabel(mode, payload = state.payload) {
+  const modelType = payload?.model?.type;
   if (mode === "summary") {
     return "汇总";
   }
   if (mode === "block") {
+    if (modelType === "diffusers") {
+      return "Transformer 内部（Patchify/Attn/Cross-Attn/FFN/AdaLN）";
+    }
+    if (modelType === "multimodal") {
+      return "编码器内部（Vision Attn/Cross-Modal/FFN）";
+    }
     return "单层 Block（Q/K/V/RoPE/Score/Causal/Window/Softmax/Output）";
   }
   if (mode === "repeat") {
-    const layerCount = extractLlmLayerCount(payload);
-    return layerCount ? `重复 ${layerCount} 层摘要` : "重复 N 层摘要";
+    const count = extractRepeatCount(payload);
+    const unit = modelType === "diffusers" ? "步" : "层";
+    return count ? `重复 ${count} ${unit}摘要` : `重复 N ${unit}摘要`;
   }
   return mode;
 }
 
+const HIERARCHY_TYPES = new Set(["llm", "diffusers", "multimodal"]);
+
 function getHierarchyMode(payload = state.payload) {
-  if (payload?.model?.type !== "llm") {
+  if (!HIERARCHY_TYPES.has(payload?.model?.type)) {
     return "all";
   }
   return state.llmHierarchyMode;
@@ -142,14 +154,24 @@ function syncSelectedNode(payload = state.payload) {
 }
 
 function renderHierarchyToolbar() {
-  const isLlm = state.payload?.model?.type === "llm";
-  ui.hierarchyToolbar.hidden = !isLlm;
-  if (!isLlm) {
+  const modelType = state.payload?.model?.type;
+  const hasHierarchy = HIERARCHY_TYPES.has(modelType);
+  ui.hierarchyToolbar.hidden = !hasHierarchy;
+  if (!hasHierarchy) {
     return;
   }
 
+  const blockLabel = modelType === "diffusers" ? "Transformer 内部" : modelType === "multimodal" ? "编码器内部" : "Q/K/V/Causal";
+  const repeatLabel = modelType === "diffusers" ? "重复 N 步" : "重复 N 层";
+
   ui.hierarchyToolbar.querySelectorAll("[data-hierarchy-mode]").forEach((button) => {
     button.classList.toggle("is-active", button.dataset.hierarchyMode === state.llmHierarchyMode);
+    if (button.dataset.hierarchyMode === "block") {
+      button.textContent = blockLabel;
+    }
+    if (button.dataset.hierarchyMode === "repeat") {
+      button.textContent = repeatLabel;
+    }
   });
 }
 
@@ -1002,7 +1024,7 @@ ui.controlsForm.addEventListener("input", scheduleRefresh);
 ui.refreshButton.addEventListener("click", () => loadModelPayload());
 ui.hierarchyToolbar.addEventListener("click", (event) => {
   const button = event.target.closest("[data-hierarchy-mode]");
-  if (!button || !state.payload || state.payload.model.type !== "llm") {
+  if (!button || !state.payload || !HIERARCHY_TYPES.has(state.payload.model.type)) {
     return;
   }
   clearTimeout(state.refreshTimer);

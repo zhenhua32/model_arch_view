@@ -1278,6 +1278,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                 ),
             ],
             "fusion",
+            view_modes=["summary", "expanded", "repeat"],
         ),
         build_node(
             "language_backbone",
@@ -1320,6 +1321,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
             [detail("vocab_size", vocab_size), detail("output", shape(batch, total_tokens, vocab_size or "vocab"))],
             [section("输出", [detail("logits", shape(batch, total_tokens, vocab_size or "vocab"))])],
             "head",
+            view_modes=["summary", "expanded", "repeat"],
         ),
     ]
 
@@ -1412,16 +1414,166 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
         )
     )
 
+    lang_hidden_shape = shape(batch, total_tokens, language_hidden)
+    vision_hidden_shape = shape(batch, image_token_count, vision_hidden)
+
+    mm_block_nodes = [
+        build_node(
+            "vision_patch_embed", "encoding", 2,
+            "Vision Patch Embedding",
+            "patch → token",
+            "将视觉 patch 编码为 token 序列。",
+            shape(batch, image_patch_count, image_patch_width),
+            vision_hidden_shape,
+            [f"patch {patch_size}", f"tokens {image_token_count}"],
+            [detail("patch_width", image_patch_width), detail("vision_hidden", vision_hidden)],
+            [section("嵌入", [detail("output", vision_hidden_shape)])],
+            "vision", parent_id="image_encoder", view_modes=["block"],
+        ),
+        build_node(
+            "vision_self_attn", "encoding", 3,
+            "Vision Self-Attention",
+            f"{vision_depth or '?'} 层视觉注意力",
+            "视觉编码器内部的自注意力层。",
+            vision_hidden_shape, vision_hidden_shape,
+            [f"depth {vision_depth or '?'}", "self-attn"],
+            [detail("input", vision_hidden_shape), detail("output", vision_hidden_shape)],
+            [section("注意力", [detail("Q/K/V", vision_hidden_shape)])],
+            "vision", parent_id="image_encoder", view_modes=["block"],
+        ),
+        build_node(
+            "vision_ffn", "encoding", 4,
+            "Vision FFN",
+            "视觉前馈网络",
+            "视觉编码器内部的 FFN 层。",
+            vision_hidden_shape, vision_hidden_shape,
+            ["FFN"],
+            [detail("input", vision_hidden_shape), detail("output", vision_hidden_shape)],
+            [section("FFN", [detail("hidden", vision_hidden)])],
+            "vision", parent_id="image_encoder", view_modes=["block"],
+        ),
+        build_node(
+            "lang_self_attn", "backbone", 1,
+            "Language Self-Attention",
+            f"{num_heads or '?'} heads",
+            "语言主干对统一序列做自注意力。",
+            lang_hidden_shape, lang_hidden_shape,
+            [f"heads {num_heads or '?'}", f"dim {head_dim or '?'}"],
+            [detail("Q/K/V", lang_hidden_shape)],
+            [section("自注意力", [detail("input", lang_hidden_shape), detail("output", lang_hidden_shape)])],
+            "core", parent_id="language_backbone", view_modes=["block"],
+        ),
+        build_node(
+            "lang_cross_attn", "backbone", 2,
+            "Cross-Modal Attention",
+            "text attends to vision",
+            "语言 token 对视觉 token 做交叉注意力。",
+            f"{lang_hidden_shape} + {vision_hidden_shape}", lang_hidden_shape,
+            ["cross-attn", "vision→lang"],
+            [detail("Q", lang_hidden_shape), detail("K/V", vision_hidden_shape)],
+            [section("交叉注意力", [detail("vision_tokens", image_token_count), detail("output", lang_hidden_shape)])],
+            "core", parent_id="language_backbone", view_modes=["block"],
+        ),
+        build_node(
+            "lang_ffn", "backbone", 3,
+            "Language FFN",
+            "MLP / SwiGLU",
+            "语言主干的前馈网络。",
+            lang_hidden_shape, lang_hidden_shape,
+            ["FFN", f"hidden {language_hidden}"],
+            [detail("input", lang_hidden_shape), detail("output", lang_hidden_shape)],
+            [section("FFN", [detail("hidden", language_hidden)])],
+            "core", parent_id="language_backbone", view_modes=["block"],
+        ),
+    ]
+
+    mm_repeat_nodes = []
+    mm_repeat_edges = []
+    if num_layers and num_layers > 0:
+        layer_1_id = "lang_layer_1"
+        layer_mid_id = "lang_layer_mid"
+        layer_last_id = "lang_layer_last"
+
+        if num_layers <= 2:
+            for i in range(1, num_layers + 1):
+                nid = f"lang_layer_{i}"
+                mm_repeat_nodes.append(build_node(
+                    nid, "backbone", 10 + i,
+                    f"Layer {i}", f"第 {i} 层",
+                    f"第 {i} 层语言主干，执行注意力与 FFN。",
+                    lang_hidden_shape, lang_hidden_shape,
+                    [f"layer {i}/{num_layers}"],
+                    [detail("layer", i), detail("total_layers", num_layers)],
+                    [section("层", [detail("input", lang_hidden_shape), detail("output", lang_hidden_shape)])],
+                    "core", parent_id="language_backbone", view_modes=["repeat"],
+                ))
+            mm_repeat_edges = [build_edge("fusion_context", layer_1_id, "conditioned seq", ["repeat"])]
+            for i in range(2, num_layers + 1):
+                mm_repeat_edges.append(build_edge(f"lang_layer_{i-1}", f"lang_layer_{i}", "next layer", ["repeat"]))
+            mm_repeat_edges.append(build_edge(f"lang_layer_{num_layers}", "lm_head", "hidden stream", ["repeat"]))
+        else:
+            mm_repeat_nodes = [
+                build_node(
+                    layer_1_id, "backbone", 11,
+                    "Layer 1", "首层",
+                    "第一层语言主干。",
+                    lang_hidden_shape, lang_hidden_shape,
+                    [f"layer 1/{num_layers}"],
+                    [detail("layer", 1), detail("total_layers", num_layers)],
+                    [section("层", [detail("input", lang_hidden_shape), detail("output", lang_hidden_shape)])],
+                    "core", parent_id="language_backbone", view_modes=["repeat"],
+                ),
+                build_node(
+                    layer_mid_id, "backbone", 12,
+                    f"Layers 2..{num_layers - 1}", "中间层",
+                    f"中间 {num_layers - 2} 层语言主干。",
+                    lang_hidden_shape, lang_hidden_shape,
+                    [f"layers 2..{num_layers - 1}"],
+                    [detail("layer_range", f"2..{num_layers - 1}"), detail("total_layers", num_layers)],
+                    [section("层", [detail("input", lang_hidden_shape), detail("output", lang_hidden_shape)])],
+                    "core", parent_id="language_backbone", view_modes=["repeat"],
+                ),
+                build_node(
+                    layer_last_id, "backbone", 13,
+                    f"Layer {num_layers}", "末层",
+                    f"第 {num_layers} 层语言主干。",
+                    lang_hidden_shape, lang_hidden_shape,
+                    [f"layer {num_layers}/{num_layers}"],
+                    [detail("layer", num_layers), detail("total_layers", num_layers)],
+                    [section("层", [detail("input", lang_hidden_shape), detail("output", lang_hidden_shape)])],
+                    "core", parent_id="language_backbone", view_modes=["repeat"],
+                ),
+            ]
+            mm_repeat_edges = [
+                build_edge("fusion_context", layer_1_id, "conditioned seq", ["repeat"]),
+                build_edge(layer_1_id, layer_mid_id, "next layer", ["repeat"]),
+                build_edge(layer_mid_id, layer_last_id, "next layer", ["repeat"]),
+                build_edge(layer_last_id, "lm_head", "hidden stream", ["repeat"]),
+            ]
+
+    nodes.extend(mm_block_nodes)
+    nodes.extend(mm_repeat_nodes)
+
     edges = [
         {"source": "text_input", "target": "text_embedding", "label": "token ids"},
-        {"source": "text_embedding", "target": "fusion_context", "label": "text hidden"},
-        {"source": "image_input", "target": "image_processor", "label": "image tensor"},
-        {"source": "image_processor", "target": "image_encoder", "label": "patches"},
-        {"source": "image_encoder", "target": "image_projector", "label": "vision hidden"},
-        {"source": "image_projector", "target": "fusion_context", "label": "image tokens"},
-        {"source": "fusion_context", "target": "language_backbone", "label": "conditioned sequence"},
-        {"source": "language_backbone", "target": "lm_head", "label": "hidden stream"},
+        {"source": "text_embedding", "target": "fusion_context", "label": "text hidden", "viewModes": ["summary", "expanded"]},
+        {"source": "image_input", "target": "image_processor", "label": "image tensor", "viewModes": ["summary", "expanded"]},
+        {"source": "image_processor", "target": "image_encoder", "label": "patches", "viewModes": ["summary", "expanded"]},
+        {"source": "image_encoder", "target": "image_projector", "label": "vision hidden", "viewModes": ["summary", "expanded"]},
+        {"source": "image_projector", "target": "fusion_context", "label": "image tokens", "viewModes": ["summary", "expanded"]},
+        {"source": "fusion_context", "target": "language_backbone", "label": "conditioned sequence", "viewModes": ["summary", "expanded"]},
+        {"source": "language_backbone", "target": "lm_head", "label": "hidden stream", "viewModes": ["summary", "expanded"]},
         {"source": "lm_head", "target": "logits", "label": "vocab projection"},
+        build_edge("image_encoder", "vision_patch_embed", "patches", ["block"]),
+        build_edge("vision_patch_embed", "vision_self_attn", "vision tokens", ["block"]),
+        build_edge("vision_self_attn", "vision_ffn", "attn out", ["block"]),
+        build_edge("vision_ffn", "image_projector", "vision hidden", ["block"]),
+        build_edge("fusion_context", "lang_self_attn", "unified seq", ["block"]),
+        build_edge("lang_self_attn", "lang_cross_attn", "self out", ["block"]),
+        build_edge("image_projector", "lang_cross_attn", "vision K/V", ["block"]),
+        build_edge("lang_cross_attn", "lang_ffn", "cross out", ["block"]),
+        build_edge("lang_ffn", "lm_head", "hidden out", ["block"]),
+        *mm_repeat_edges,
     ]
 
     if has_video:
@@ -1710,6 +1862,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                     ),
                 ],
                 "latent",
+                view_modes=["summary", "expanded", "repeat"],
             ),
             build_node(
                 "transformer",
@@ -1763,6 +1916,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                     section("推导公式", [detail("decode", f"[B, C, h, w] -> [B, 3, H, W] = {shape(batch, 3, image_height, image_width)}")]),
                 ],
                 "decode",
+                view_modes=["summary", "expanded", "repeat"],
             ),
             build_node(
                 "image_output",
@@ -1781,13 +1935,183 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         ]
     )
 
+    transformer_width_val = transformer_width or "hidden"
+    latent_shape = shape(batch, latent_channels, latent_height, latent_width)
+    token_shape = shape(batch, latent_tokens, transformer_width_val)
+    text_cond_shape = shape(batch, prompt_tokens, text_hidden)
+
+    block_nodes = [
+        build_node(
+            "transformer_patchify", "denoise", 1,
+            "Latent Patchify",
+            "latent → patch tokens",
+            "将 latent 空间切分为 patch token 序列。",
+            latent_shape, token_shape,
+            [f"patch {transformer_patch}", f"tokens {latent_tokens}"],
+            [detail("latent_shape", latent_shape), detail("token_shape", token_shape)],
+            [section("推导公式", [detail("patchify", f"[B, C, h, w] -> [B, tokens, width] = {token_shape}")])],
+            "core", parent_id="transformer", view_modes=["block"],
+        ),
+        build_node(
+            "transformer_timestep", "denoise", 2,
+            "Timestep Embedding",
+            "t → conditioning",
+            "将时间步编码为调制向量。",
+            shape(steps), shape(batch, transformer_width_val),
+            [f"steps {steps}", "sinusoidal"],
+            [detail("inference_steps", steps)],
+            [section("输出", [detail("timestep emb", shape(batch, transformer_width_val))])],
+            "scheduler", parent_id="transformer", view_modes=["block"],
+        ),
+        build_node(
+            "transformer_self_attn", "denoise", 3,
+            "Self-Attention",
+            "latent token 间注意力",
+            "对 latent patch token 执行自注意力。",
+            token_shape, token_shape,
+            [f"heads {transformer_heads or '?'}", f"dim {transformer_head_dim or '?'}"],
+            [detail("qkv", token_shape), detail("heads", transformer_heads)],
+            [section("注意力", [detail("Q/K/V", token_shape), detail("output", token_shape)])],
+            "core", parent_id="transformer", view_modes=["block"],
+        ),
+        build_node(
+            "transformer_cross_attn", "denoise", 4,
+            "Cross-Attention",
+            "latent attends to text",
+            "latent token 对文本条件做交叉注意力。",
+            f"{token_shape} + {text_cond_shape}", token_shape,
+            ["cross-attn", f"text {prompt_tokens}"],
+            [detail("Q", token_shape), detail("K/V", text_cond_shape)],
+            [section("交叉注意力", [detail("text condition", text_cond_shape), detail("output", token_shape)])],
+            "core", parent_id="transformer", view_modes=["block"],
+        ),
+        build_node(
+            "transformer_ffn", "denoise", 5,
+            "Feed-Forward",
+            "MLP / SwiGLU",
+            "对每个 token 做前馈网络变换。",
+            token_shape, token_shape,
+            ["FFN", f"width {transformer_width_val}"],
+            [detail("input", token_shape), detail("output", token_shape)],
+            [section("FFN", [detail("hidden", transformer_width_val)])],
+            "core", parent_id="transformer", view_modes=["block"],
+        ),
+        build_node(
+            "transformer_adaln", "denoise", 6,
+            "AdaLN 调制",
+            "timestep → scale/shift",
+            "用时间步嵌入调制各子层的归一化参数。",
+            shape(batch, transformer_width_val), shape(batch, transformer_width_val),
+            ["modulation", "AdaLN"],
+            [detail("timestep_emb", shape(batch, transformer_width_val))],
+            [section("调制", [detail("scale_shift", "timestep emb → per-block scale/shift")])],
+            "scheduler", parent_id="transformer", view_modes=["block"],
+        ),
+        build_node(
+            "transformer_unpatchify", "denoise", 7,
+            "Unpatchify",
+            "patch tokens → latent",
+            "将 patch token 序列还原为 latent 空间。",
+            token_shape, latent_shape,
+            [f"tokens {latent_tokens}", f"patch {transformer_patch}"],
+            [detail("token_shape", token_shape), detail("latent_shape", latent_shape)],
+            [section("推导公式", [detail("unpatchify", f"[B, tokens, width] -> [B, C, h, w] = {latent_shape}")])],
+            "core", parent_id="transformer", view_modes=["block"],
+        ),
+    ]
+
+    repeat_nodes = []
+    repeat_edges = []
+    if steps > 0:
+        step_1_id = "denoise_step_1"
+        step_mid_id = "denoise_step_mid"
+        step_last_id = "denoise_step_last"
+
+        if steps <= 2:
+            for i in range(1, steps + 1):
+                nid = f"denoise_step_{i}"
+                repeat_nodes.append(build_node(
+                    nid, "denoise", 10 + i,
+                    f"Step {i}", f"去噪步 {i}",
+                    f"第 {i} 步去噪迭代，transformer 对 latent 做一次更新。",
+                    latent_shape, latent_shape,
+                    [f"step {i}/{steps}"],
+                    [detail("step", i), detail("total_steps", steps)],
+                    [section("迭代", [detail("input", latent_shape), detail("output", latent_shape)])],
+                    "core", parent_id="transformer", view_modes=["repeat"],
+                ))
+                repeat_edges.append(build_edge(step_1_id if i == 1 else f"denoise_step_{i-1}", nid, "next step", ["repeat"]))
+            repeat_edges = [build_edge(latents_input_node, step_1_id, "initial latent", ["repeat"])]
+            for i in range(1, steps + 1):
+                nid = f"denoise_step_{i}"
+                if i == 1:
+                    repeat_edges.append(build_edge(latents_input_node, nid, "initial latent", ["repeat"]))
+                else:
+                    repeat_edges.append(build_edge(f"denoise_step_{i-1}", nid, "next step", ["repeat"]))
+            repeat_edges.append(build_edge(f"denoise_step_{steps}", "vae_decode", "denoised latent", ["repeat"]))
+        else:
+            repeat_nodes = [
+                build_node(
+                    step_1_id, "denoise", 11,
+                    "Step 1", "首步去噪",
+                    "第一步去噪迭代，从初始噪声或编码 latent 开始。",
+                    latent_shape, latent_shape,
+                    [f"step 1/{steps}"],
+                    [detail("step", 1), detail("total_steps", steps)],
+                    [section("迭代", [detail("input", latent_shape), detail("output", latent_shape)])],
+                    "core", parent_id="transformer", view_modes=["repeat"],
+                ),
+                build_node(
+                    step_mid_id, "denoise", 12,
+                    f"Steps 2..{steps - 1}", "中间步去噪",
+                    f"中间 {steps - 2} 步去噪迭代。",
+                    latent_shape, latent_shape,
+                    [f"steps 2..{steps - 1}"],
+                    [detail("step_range", f"2..{steps - 1}"), detail("total_steps", steps)],
+                    [section("迭代", [detail("input", latent_shape), detail("output", latent_shape)])],
+                    "core", parent_id="transformer", view_modes=["repeat"],
+                ),
+                build_node(
+                    step_last_id, "denoise", 13,
+                    f"Step {steps}", "末步去噪",
+                    f"第 {steps} 步去噪迭代，输出最终去噪 latent。",
+                    latent_shape, latent_shape,
+                    [f"step {steps}/{steps}"],
+                    [detail("step", steps), detail("total_steps", steps)],
+                    [section("迭代", [detail("input", latent_shape), detail("output", latent_shape)])],
+                    "core", parent_id="transformer", view_modes=["repeat"],
+                ),
+            ]
+            repeat_edges = [
+                build_edge(latents_input_node, step_1_id, "initial latent", ["repeat"]),
+                build_edge(step_1_id, step_mid_id, "next step", ["repeat"]),
+                build_edge(step_mid_id, step_last_id, "next step", ["repeat"]),
+                build_edge(step_last_id, "vae_decode", "denoised latent", ["repeat"]),
+            ]
+
+    nodes.extend(block_nodes)
+    nodes.extend(repeat_nodes)
+
     edges = [
         {"source": "prompt_input", "target": "text_condition", "label": "prompt"},
-        {"source": "text_condition", "target": "transformer", "label": "text hidden"},
-        {"source": "scheduler", "target": "transformer", "label": "timesteps"},
-        {"source": latents_input_node, "target": "transformer", "label": "latent tokens"},
-        {"source": "transformer", "target": "vae_decode", "label": "denoised latent"},
+        {"source": "text_condition", "target": "transformer", "label": "text hidden", "viewModes": ["summary", "expanded"]},
+        {"source": "scheduler", "target": "transformer", "label": "timesteps", "viewModes": ["summary", "expanded"]},
+        {"source": latents_input_node, "target": "transformer", "label": "latent tokens", "viewModes": ["summary", "expanded"]},
+        {"source": "transformer", "target": "vae_decode", "label": "denoised latent", "viewModes": ["summary", "expanded"]},
         {"source": "vae_decode", "target": "image_output", "label": "pixels"},
+        build_edge(latents_input_node, "transformer_patchify", "latent input", ["block"]),
+        build_edge("scheduler", "transformer_timestep", "t → emb", ["block"]),
+        build_edge("text_condition", "transformer_cross_attn", "text K/V", ["block"]),
+        build_edge("transformer_patchify", "transformer_self_attn", "patch tokens", ["block"]),
+        build_edge("transformer_timestep", "transformer_adaln", "timestep emb", ["block"]),
+        build_edge("transformer_adaln", "transformer_self_attn", "modulate", ["block"]),
+        build_edge("transformer_adaln", "transformer_cross_attn", "modulate", ["block"]),
+        build_edge("transformer_adaln", "transformer_ffn", "modulate", ["block"]),
+        build_edge("transformer_self_attn", "transformer_cross_attn", "self out", ["block"]),
+        build_edge("transformer_cross_attn", "transformer_ffn", "cross out", ["block"]),
+        build_edge("transformer_ffn", "transformer_unpatchify", "ffn out", ["block"]),
+        build_edge("transformer_unpatchify", "vae_decode", "latent out", ["block"]),
+        *repeat_edges,
     ]
 
     if has_conditioning_image:
@@ -1815,6 +2139,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         detail("类型", "Diffusers"),
         detail("Transformer 宽度", transformer_width),
         detail("去噪层数", transformer_layers),
+        detail("推理步数", steps),
         detail("latent channels", latent_channels),
         detail("latent tokens", latent_tokens),
         detail("scheduler", scheduler_config.get("_class_name", "-")),
