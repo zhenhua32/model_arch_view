@@ -535,21 +535,37 @@ function groupNodesByLane(nodes, lanes) {
 }
 
 function buildEdgeGeometry(sourceRect, targetRect, canvasRect) {
-  const startX = sourceRect.right - canvasRect.left;
-  const startY = sourceRect.top - canvasRect.top + sourceRect.height / 2;
-  const endX = targetRect.left - canvasRect.left;
-  const endY = targetRect.top - canvasRect.top + targetRect.height / 2;
-  const curve = Math.max(42, Math.abs(endX - startX) * 0.38);
-  const path = `M ${startX} ${startY} C ${startX + curve} ${startY}, ${endX - curve} ${endY}, ${endX} ${endY}`;
-  return {
-    startX,
-    startY,
-    endX,
-    endY,
-    path,
-    labelX: (startX + endX) / 2,
-    labelY: (startY + endY) / 2 - 8,
-  };
+  const sourceCx = sourceRect.left - canvasRect.left + sourceRect.width / 2;
+  const sourceCy = sourceRect.top - canvasRect.top + sourceRect.height / 2;
+  const targetCx = targetRect.left - canvasRect.left + targetRect.width / 2;
+  const targetCy = targetRect.top - canvasRect.top + targetRect.height / 2;
+  const dx = targetCx - sourceCx;
+  const dy = targetCy - sourceCy;
+  const horizontal = Math.abs(dx) > Math.abs(dy);
+
+  if (horizontal) {
+    const goingRight = dx > 0;
+    const startX = goingRight ? sourceRect.right - canvasRect.left : sourceRect.left - canvasRect.left;
+    const endX = goingRight ? targetRect.left - canvasRect.left : targetRect.right - canvasRect.left;
+    const startY = sourceCy;
+    const endY = targetCy;
+    const curve = Math.max(42, Math.abs(endX - startX) * 0.38);
+    const cp1x = startX + (goingRight ? curve : -curve);
+    const cp2x = endX + (goingRight ? -curve : curve);
+    const path = `M ${startX} ${startY} C ${cp1x} ${startY}, ${cp2x} ${endY}, ${endX} ${endY}`;
+    return { startX, startY, endX, endY, path, labelX: (startX + endX) / 2, labelY: (startY + endY) / 2 - 8 };
+  }
+
+  const goingDown = dy > 0;
+  const startX = sourceCx;
+  const startY = goingDown ? sourceRect.bottom - canvasRect.top : sourceRect.top - canvasRect.top;
+  const endX = targetCx;
+  const endY = goingDown ? targetRect.top - canvasRect.top : targetRect.bottom - canvasRect.top;
+  const curve = Math.max(42, Math.abs(endY - startY) * 0.38);
+  const cp1y = startY + (goingDown ? curve : -curve);
+  const cp2y = endY + (goingDown ? -curve : curve);
+  const path = `M ${startX} ${startY} C ${startX} ${cp1y}, ${endX} ${cp2y}, ${endX} ${endY}`;
+  return { startX, startY, endX, endY, path, labelX: (startX + endX) / 2, labelY: (startY + endY) / 2 - 8 };
 }
 
 function renderGraph() {
@@ -596,7 +612,7 @@ function renderGraph() {
       return `
         <section class="lane">
           <div class="lane-title">${escapeHtml(lane.label)}</div>
-          ${nodeMarkup || '<div class="empty-state">无节点</div>'}
+          <div class="lane-body">${nodeMarkup || '<div class="empty-state">无节点</div>'}</div>
         </section>
       `;
     })
