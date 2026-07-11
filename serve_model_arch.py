@@ -1587,6 +1587,14 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             "memory": estimate_memory_footprint(metrics, precision, batch, seq_len),
             "throughput": estimate_throughput(metrics, precision, seq_len),
             "gpu_reference": GPU_REFERENCE,
+            "throughput_terms": {
+                "active_params": active_params,
+                "bytes_per_param": PRECISION_BYTES[precision],
+                "precision": precision,
+                "seq_len": seq_len,
+                "mfu": _MFU,
+                "two": 2,
+            },
         }
 
     return payload

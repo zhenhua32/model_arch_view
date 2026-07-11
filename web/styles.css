@@ -247,6 +247,12 @@ html, body {
 .tp-tps, .tp-ttft { font-family: var(--font-mono); color: var(--ink); font-size: 0.75rem; }
 .tp-bound { font-size: 0.72rem; color: var(--muted); text-align: right; }
 
+.tp-sub-grid { margin-top: 10px; display: grid; gap: 8px; }
+.tp-sub { padding: 8px 10px; background: var(--panel-strong); border: 1px solid var(--line); border-radius: var(--radius-sm); display: grid; gap: 2px; }
+.tp-sub-name { color: var(--ink); font-weight: 600; font-size: 0.78rem; margin-bottom: 2px; }
+.tp-sub-formula { color: var(--muted); font-family: var(--font-mono); font-size: 0.72rem; line-height: 1.5; word-break: break-word; }
+.tp-sub-bound { color: var(--accent); font-family: var(--font-mono); font-size: 0.72rem; margin-top: 2px; }
+
 /* ---- A/B comparison ---- */
 .compare-section { padding: 16px; background: var(--panel-strong); border-radius: var(--radius-md); border: 1px solid var(--line); }
 .compare-section .section-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }

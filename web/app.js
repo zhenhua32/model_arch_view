@@ -623,6 +623,13 @@ function renderMemorySection(metrics) {
 function renderThroughputSection(metrics) {
   const rows = metrics.throughput || [];
   if (!rows.length) return "";
+  const tt = metrics.throughput_terms || {};
+  const act = tt.active_params || metrics.active_params || 0;
+  const bpp = tt.bytes_per_param || (metrics.memory ? metrics.memory.bytes_per_param : 2);
+  const seq = tt.seq_len || 2048;
+  const mfu = tt.mfu != null ? tt.mfu : 0.40;
+  const gpus = metrics.gpu_reference || [];
+
   const body = rows
     .map(
       (r) => `
@@ -634,6 +641,41 @@ function renderThroughputSection(metrics) {
         </div>`
     )
     .join("");
+
+  // Concrete per-GPU ceiling substitution (compute vs bandwidth).
+  const gpuRows = gpus
+    .map((g) => {
+      const peak = g.bf16_tflops * 1e12 * mfu;
+      const bw = g.bw_gbs * 1e9;
+      const compute = peak / (2 * act);
+      const bandwidth = bw / (act * bpp);
+      const r = rows.find((x) => x.name === g.name) || {};
+      return `<div class="tp-sub">
+          <span class="tp-sub-name">${escapeHtml(g.name)}</span>
+          <span class="tp-sub-formula">算力上限 = (${g.bf16_tflops} × 10¹² × ${mfu}) / (2 × ${formatCount(act)}) ≈ ${formatTps(compute)} tok/s</span>
+          <span class="tp-sub-formula">带宽上限 = (${g.bw_gbs} × 10⁹) / (${formatCount(act)} × ${bpp}) ≈ ${formatTps(bandwidth)} tok/s</span>
+          <span class="tp-sub-bound">→ decode = ${formatTps(r.decode_tps)} tok/s（${escapeHtml(r.bound)}瓶颈）</span>
+        </div>`;
+    })
+    .join("");
+
+  const formula = `
+    <details class="formula-box">
+      <summary>计算公式</summary>
+      <div class="formula-list">
+        ${formulaRow("激活参数", "active", formatCount(act))}
+        ${formulaRow("每参数字节", `b（${escapeHtml(tt.precision || "bf16")}）`, String(bpp))}
+        ${formulaRow("有效算力", "peak = bf16_TFLOPS × 10¹² × MFU", mfu)}
+        ${formulaRow("显存带宽", "bw = bw_GB/s × 10⁹", "")}
+        ${formulaRow("算力上限", "peak / (2 × active)", "")}
+        ${formulaRow("带宽上限", "bw / (active × b)", "")}
+        ${formulaRow("decode 吞吐", "min(算力上限, 带宽上限)", "")}
+        ${formulaRow("首 token 延迟", `(2 × active × ${seq}) / peak × 1000 ms`, "")}
+      </div>
+      <div class="formula-note">decode 每 token 约 2·active 次 FLOP（一次前/后向近似 2×），每 token 需把全部权重从显存读一遍，故通常带宽受限、MFU 取 ${mfu}；prefill（首 token）为算力受限，与 seq 长度成正比。</div>
+      <div class="tp-sub-grid">${gpuRows}</div>
+    </details>`;
+
   return `
     <div class="detail-section">
       <h3>吞吐 / 延迟 <span class="est-badge">理论上限</span></h3>
@@ -641,6 +683,7 @@ function renderThroughputSection(metrics) {
         <span class="tp-name">GPU</span><span class="tp-tps">decode</span><span class="tp-ttft">首 token</span><span class="tp-bound">瓶颈</span>
       </div>
       ${body}
+      ${formula}
     </div>`;
 }
 
