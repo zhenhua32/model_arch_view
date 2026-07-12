@@ -44,7 +44,7 @@ python serve_model_arch.py --port 8123
 不同类型模型的 shape 推导方式如下：
 
 - LLM：根据 hidden_size、num_hidden_layers、attention heads、MoE 配置推导 token 流形状
-- 多模态：根据 patch_size、merge_size、vision_config、processor_config 推导图像或视频 token 数
+- 多模态：优先使用显式 soft-token 预算，否则根据 patch_size、merge_size、vision_config、processor_config 推导所选图像、视频或音频分支；ASR、SAM 视频分割和 delay-pattern TTS 使用专用计算图
 - Diffusers：根据 VAE 下采样倍率、transformer patch_size、scheduler 步数推导 latent token 流
 
 ## 估算口径
@@ -52,6 +52,8 @@ python serve_model_arch.py --port 8123
 - LLM 参数量区分 gated / 非 gated FFN、稠密层、路由专家、共享专家和可选 MTP 辅助层。
 - Decode FLOPs 包含线性层以及当前上下文长度对应的 QK / AV 注意力计算。
 - KV cache 和 decode 带宽会按 full / sliding attention 层分别应用上下文窗口。
+- DeepSeek V4 按共享 K=V、q/grouped-o 低秩和 CSA/HCA 压缩率计算；CSA/DSA 同时计入低维 indexer 扫描与 top-k 主注意力，openPangu DSA 缓存按完整序列计算。
+- 原生混合精度模型会分别计算 FP4 路由专家与 FP8 主干的激活权重读取；显存优先采用 safetensors index 的实际 checkpoint 字节数。
 - 显存中的激活项按可复用的单层 inference workspace 粗估，不按层数重复累计。
 - GPU 卡数仍只是容量下界；真实部署还受并行切分、通信和框架常驻显存影响。
 - Diffusers 视频模型的 token 数包含 VAE 时间压缩与 3D transformer patch。
@@ -59,7 +61,7 @@ python serve_model_arch.py --port 8123
 ## 已知限制
 
 - 对未适配的自定义模型目录，只会展示摘要而不是完整图结构
-- 某些模型的真实视觉 token 合并策略可能比配置文件更复杂，因此图中的 token 数是近似值
+- 未声明固定 token 数的动态视觉切片策略仍可能比配置文件更复杂，因此页面会同时展示 patch 网格值与有效 token 值
 - 是否必须输入条件图像，部分 diffusion pipeline 只能根据目录结构做推断，页面会给出提示
-- 量化权重的 scale / zero-point 元数据和不同推理引擎的 kernel 效率不包含在理论上限中
+- checkpoint 显存包含索引声明的量化元数据与辅助层，但不同推理引擎的临时 buffer、通信开销和 kernel 效率不包含在理论上限中
 

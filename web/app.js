@@ -539,10 +539,15 @@ function renderBreakdownSection(metrics) {
     : "";
 
   const ft = metrics.formula_terms || {};
-  const attnNote = ft.is_mla
-    ? `注意力(层) = hidden×q_lora + q_lora×heads×qk_head_dim + hidden×(kv_lora+qk_rope) + kv_lora×heads×(qk_nope+v_head) + heads×v_head×hidden`
-    : `注意力(层) = hidden×q_dim + hidden×kv_dim×2 + q_dim×hidden，其中 q_dim=heads×head_dim，kv_dim=kv_heads×head_dim`;
-  const rows = [formulaRow("注意力", `${formatCount(ft.attn_per_layer)} × ${ft.num_layers} 层`, formatB(bd.attention))];
+  const attnNote = ft.is_deepseek_v4
+    ? `DeepSeek V4 = q 低秩 + 单头共享 K=V + grouped-o 低秩；再按每层 compress ratio 加 CSA/HCA compressor、indexer 与 mHC 参数。`
+    : ft.is_mla
+      ? `注意力(层) = hidden×q_lora + q_lora×heads×qk_head_dim + hidden×(kv_lora+qk_rope) + kv_lora×heads×(qk_nope+v_head) + heads×v_head×hidden`
+      : `注意力(层) = hidden×q_dim + hidden×kv_dim×2 + q_dim×hidden，其中 q_dim=heads×head_dim，kv_dim=kv_heads×head_dim`;
+  const attnExpr = ft.is_deepseek_v4
+    ? `${ft.num_layers} 层按压缩率逐层求和（平均 ${formatCount(ft.attn_per_layer)}/层）`
+    : `${formatCount(ft.attn_per_layer)} × ${ft.num_layers} 层`;
+  const rows = [formulaRow("注意力", attnExpr, formatB(bd.attention))];
   if (metrics.is_moe) {
     rows.push(formulaRow("路由专家", `${ft.n_moe_layers} 层 × ${ft.num_experts} 专家 × ${formatCount(ft.expert_per)}`, formatB(bd.routed_experts)));
     if (bd.shared_experts > 0) {
@@ -601,8 +606,9 @@ function renderMemorySection(metrics) {
     .join("");
   const ft = metrics.formula_terms || {};
   const bpp = mem.bytes_per_param;
+  const checkpointBpp = mem.checkpoint_bytes_per_param;
   const weightExpr = mem.weight_source === "checkpoint"
-    ? `safetensors index 的实际 checkpoint 字节数（包含量化元数据与辅助层）`
+    ? `safetensors index 的实际 checkpoint 字节数（有效 ${checkpointBpp != null ? checkpointBpp.toFixed(3) : "?"} B/参数，包含量化元数据与辅助层）`
     : `总参数 × ${bpp}B/参数 = ${formatB(metrics.total_params)} × ${bpp}`;
   const memRows = [
     formulaRow("权重", weightExpr, formatGB(mem.weights_bytes)),
@@ -621,7 +627,7 @@ function renderMemorySection(metrics) {
     </details>`;
   return `
     <div class="detail-section">
-      <h3>显存 &amp; 成本 <span class="est-badge">粗估 · ${escapeHtml(mem.precision)}</span></h3>
+      <h3>显存 &amp; 成本 <span class="est-badge">粗估 · ${escapeHtml(mem.weight_format || mem.precision)}</span></h3>
       <div class="mem-total">总需求 ≈ ${mem.total_gb.toFixed(1)} GiB <span class="subtle">(batch ${mem.batch} · seq ${mem.seq_len})</span></div>
       ${bar}
       <div class="legend">${legend}</div>
@@ -635,7 +641,10 @@ function renderThroughputSection(metrics) {
   if (!rows.length) return "";
   const tt = metrics.throughput_terms || {};
   const act = tt.active_params || metrics.active_params || 0;
-  const bpp = tt.bytes_per_param || (metrics.memory ? metrics.memory.bytes_per_param : 2);
+  const firstRow = rows[0] || {};
+  const bpp = firstRow.active_bytes_per_param || tt.bytes_per_param || (metrics.memory ? metrics.memory.bytes_per_param : 2);
+  const weightFormat = tt.uses_native_profile ? tt.weight_format : tt.precision || "bf16";
+  const computePrecision = firstRow.compute_precision || tt.precision || "bf16";
   const seq = tt.seq_len || 2048;
   const mfu = tt.mfu != null ? tt.mfu : 0.40;
 
@@ -655,7 +664,7 @@ function renderThroughputSection(metrics) {
     .map((r) => {
       return `<div class="tp-sub">
           <span class="tp-sub-name">${escapeHtml(r.name)}${r.gpu_count > 1 ? ` ×${r.gpu_count}` : ""}</span>
-          <span class="tp-sub-formula">算力上限 = ${r.per_gpu_tops} TOPS × ${r.gpu_count} 卡 × MFU ${mfu} / ${formatCount(r.decode_flops)} FLOPs/token ≈ ${formatTps(r.compute_tps)} tok/s</span>
+          <span class="tp-sub-formula">算力上限 = ${r.per_gpu_tops} ${escapeHtml(r.compute_precision || computePrecision)} TOPS × ${r.gpu_count} 卡 × MFU ${mfu} / ${formatCount(r.decode_flops)} FLOPs/token ≈ ${formatTps(r.compute_tps)} tok/s</span>
           <span class="tp-sub-formula">带宽上限：权重 ${formatGB(r.active_weight_bytes)}/batch ${r.batch} + KV 读取 ${formatGB(r.kv_read_bytes)} ≈ ${formatTps(r.bandwidth_tps)} tok/s</span>
           <span class="tp-sub-bound">→ decode = ${formatTps(r.decode_tps)} tok/s（${escapeHtml(r.bound)}瓶颈）</span>
         </div>`;
@@ -667,8 +676,8 @@ function renderThroughputSection(metrics) {
       <summary>计算公式</summary>
       <div class="formula-list">
         ${formulaRow("激活参数", "active", formatCount(act))}
-        ${formulaRow("每参数字节", `b（${escapeHtml(tt.precision || "bf16")}）`, String(bpp))}
-        ${formulaRow("有效算力", `peak = ${escapeHtml(tt.precision || "bf16")} 原生 TOPS × 10¹² × MFU`, mfu)}
+        ${formulaRow("激活权重格式", weightFormat, `${bpp.toFixed(3)} B/active 参数`)}
+        ${formulaRow("有效算力", `peak = ${escapeHtml(computePrecision)} 原生 TOPS × 10¹² × MFU`, mfu)}
         ${formulaRow("显存带宽", "bw = bw_GB/s × 10⁹", "")}
         ${formulaRow("算力上限", "peak / (线性 FLOPs + 当前上下文 QK/AV FLOPs)", "")}
         ${formulaRow("带宽上限", "bw / (active 权重字节 / batch + 当前上下文 KV 读取)", "")}

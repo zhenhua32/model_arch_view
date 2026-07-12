@@ -27,6 +27,71 @@ def read_json_file(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _parse_simple_yaml_scalar(value: str) -> Any:
+    value = value.strip()
+    if " #" in value:
+        value = value.split(" #", 1)[0].rstrip()
+    if not value:
+        return ""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    lowered = value.lower()
+    if lowered in {"null", "none", "~"}:
+        return None
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if value.startswith(("[", "{")):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+
+def read_simple_yaml_file(path: Path) -> dict[str, Any]:
+    """Read scalar YAML mappings without requiring PyYAML at runtime."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    root: dict[str, Any] = {}
+    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
+    for raw_line in lines:
+        stripped = raw_line.lstrip()
+        if not stripped or stripped.startswith(("#", "-")) or ":" not in stripped:
+            continue
+        indent = len(raw_line) - len(stripped)
+        key, raw_value = stripped.split(":", 1)
+        key = key.strip()
+        if not key:
+            continue
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if raw_value.strip():
+            parent[key] = _parse_simple_yaml_scalar(raw_value)
+            continue
+        child: dict[str, Any] = {}
+        parent[key] = child
+        stack.append((indent, child))
+    return root
+
+
+def supplemental_yaml_config(model_dir: Path) -> dict[str, Any]:
+    for name in ("config.yaml", "config.yml"):
+        path = model_dir / name
+        if path.exists():
+            return read_simple_yaml_file(path)
+    return {}
+
+
 def primary_config(model_dir: Path) -> dict[str, Any]:
     for name in ("config.json", "configuration.json"):
         path = model_dir / name
@@ -154,6 +219,47 @@ _DIFFUSERS_COMPONENT_KEYS = {
 }
 
 
+def _model_identity(config: dict[str, Any], yaml_config: dict[str, Any] | None = None) -> str:
+    values: list[Any] = [config.get("model_type")]
+    architectures = config.get("architectures")
+    if isinstance(architectures, list):
+        values.extend(architectures)
+    elif architectures:
+        values.append(architectures)
+    if yaml_config:
+        values.extend([yaml_config.get("model"), yaml_config.get("encoder"), yaml_config.get("audio_encoder")])
+    return " ".join(str(value).lower() for value in values if value)
+
+
+def is_asr_model_config(config: dict[str, Any], yaml_config: dict[str, Any] | None = None) -> bool:
+    identity = _model_identity(config, yaml_config)
+    if any(token in identity for token in ("asr", "transcrib", "sensevoice", "speechrecognition")):
+        return True
+    if not yaml_config:
+        return False
+    has_audio_encoder = bool(yaml_config.get("audio_encoder") or yaml_config.get("encoder"))
+    has_frontend = isinstance(yaml_config.get("frontend_conf"), dict)
+    dataset = str(yaml_config.get("dataset") or "").lower()
+    return has_audio_encoder and has_frontend and "ctc" in dataset
+
+
+def is_tts_model_config(config: dict[str, Any]) -> bool:
+    identity = _model_identity(config)
+    return "tts" in identity or "texttospeech" in identity
+
+
+def is_sam_video_config(config: dict[str, Any]) -> bool:
+    identity = _model_identity(config)
+    return "sam3video" in identity.replace("_", "") or "sam3_video" in identity
+
+
+def processor_has_modal_inputs(processor: dict[str, Any]) -> bool:
+    if any(key in processor for key in ("image_processor", "video_processor", "feature_extractor")):
+        return True
+    processor_class = str(processor.get("processor_class") or "").lower()
+    return any(token in processor_class for token in ("image", "video", "vision", "audio", "speech", "asr", "tts"))
+
+
 def classify_model_dir(model_dir: Path) -> str:
     model_index = model_dir / "model_index.json"
     if model_index.exists():
@@ -165,16 +271,27 @@ def classify_model_dir(model_dir: Path) -> str:
             return "diffusers"
 
     config = primary_config(model_dir)
+    yaml_config = supplemental_yaml_config(model_dir)
     params = read_json_file(model_dir / "params.json")
     processor = read_json_file(model_dir / "processor_config.json")
 
-    if config.get("vision_config") or config.get("text_config") or config.get("language_config"):
+    if is_asr_model_config(config, yaml_config) or is_tts_model_config(config) or is_sam_video_config(config):
         return "multimodal"
 
-    if processor or params.get("vision_encoder"):
+    thinker_config = config.get("thinker_config") if isinstance(config.get("thinker_config"), dict) else {}
+    if (
+        config.get("vision_config")
+        or config.get("audio_config")
+        or thinker_config.get("audio_config")
+        or config.get("image_token_id")
+        or config.get("video_token_id")
+        or config.get("audio_token_id")
+        or params.get("vision_encoder")
+        or processor_has_modal_inputs(processor)
+    ):
         return "multimodal"
 
-    if config or params:
+    if config or params or yaml_config:
         return "llm"
 
     return "unknown"
@@ -194,6 +311,11 @@ def infer_architecture_name(model_dir: Path, model_type: str) -> str:
         return "VisionLanguageModel"
     if params:
         return "TransformerModel"
+
+    yaml_config = supplemental_yaml_config(model_dir)
+    yaml_architecture = first_defined(yaml_config.get("model"), yaml_config.get("audio_encoder"), yaml_config.get("encoder"))
+    if yaml_architecture:
+        return str(yaml_architecture)
 
     return "UnknownModel"
 
@@ -418,6 +540,7 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     moe_config = params_config.get("moe") if isinstance(params_config.get("moe"), dict) else {}
     architecture = _first_architecture(config)
     model_type = str(config.get("model_type") or "").lower()
+    is_deepseek_v4 = model_type == "deepseek_v4"
     encoder_only = model_type in _ENCODER_ONLY_MODEL_TYPES or (
         architecture.endswith("Model") and not any(marker in architecture for marker in ("CausalLM", "ConditionalGeneration", "LMHead"))
     )
@@ -451,8 +574,10 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     tie_word_embeddings = bool(first_defined(config.get("tie_word_embeddings"), params_config.get("tie_word_embeddings"), False))
     ffn_projection_count = 2 if encoder_only else 3
     active_expert_multiplier = max(int(first_defined(config.get("cli_factor"), 1) or 1), 1)
-    mtp_layers = int(first_defined(config.get("mtp_num_layers"), config.get("num_nextn_predict_layers"), 0) or 0)
-    include_mtp_in_total = bool(config.get("mtp_num_layers"))
+    mtp_module_layers = int(first_defined(config.get("mtp_transformer_layers"), 1) or 1)
+    mtp_module_count = int(first_defined(config.get("num_mtp_modules"), 0) or 0)
+    mtp_layers = int(first_defined(config.get("mtp_num_layers"), mtp_module_count * mtp_module_layers if mtp_module_count else None, config.get("num_nextn_predict_layers"), 0) or 0)
+    include_mtp_in_total = bool(config.get("mtp_num_layers") or (config.get("use_mtp") and mtp_module_count))
 
     max_position_embeddings = int(first_defined(config.get("max_position_embeddings"), params_config.get("max_position_embeddings"), 0) or 0)
     position_embedding_params = hidden_size * max_position_embeddings if encoder_only and config.get("position_embedding_type", "absolute") == "absolute" else 0
@@ -467,6 +592,17 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     full_attention_layers, sliding_attention_layers, linear_attention_layers = _attention_layer_counts(
         layer_types, num_layers, use_sliding_window
     )
+    dsa_layers = config.get("dsa_layers") if isinstance(config.get("dsa_layers"), list) else []
+    swa_layers = config.get("swa_layers") if isinstance(config.get("swa_layers"), list) else []
+    sparse_attention_layers = 0
+    sparse_topk = 0
+    if dsa_layers or swa_layers:
+        sparse_attention_layers = sum(isinstance(index, int) and 0 <= index < num_layers for index in dsa_layers)
+        sliding_attention_layers = sum(isinstance(index, int) and 0 <= index < num_layers for index in swa_layers)
+        full_attention_layers = max(num_layers - sparse_attention_layers - sliding_attention_layers, 0)
+        linear_attention_layers = 0
+        sparse_topk = int(first_defined(config.get("index_topk"), 0) or 0)
+        use_sliding_window = sliding_attention_layers > 0
 
     q_lora_rank = int(first_defined(config.get("q_lora_rank"), 0) or 0)
     kv_lora_rank = int(first_defined(config.get("kv_lora_rank"), config.get("kv_lora_a"), 0) or 0)
@@ -505,18 +641,28 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
         "active_expert_multiplier": active_expert_multiplier,
         "mtp_layers": mtp_layers,
         "include_mtp_in_total": include_mtp_in_total,
-        "sliding_window": sliding_window if use_sliding_window else 0,
+        "sliding_window": sliding_window if (use_sliding_window or is_deepseek_v4) else 0,
         "use_sliding_window": use_sliding_window,
         "full_attention_layers": full_attention_layers,
         "sliding_attention_layers": sliding_attention_layers,
         "linear_attention_layers": linear_attention_layers,
+        "sparse_attention_layers": sparse_attention_layers,
+        "sparse_topk": sparse_topk,
         "q_lora_rank": q_lora_rank,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
         "qk_nope_head_dim": qk_nope_head_dim,
         "qk_head_dim": qk_head_dim,
         "v_head_dim": v_head_dim,
-        "is_mla": q_lora_rank > 0 or kv_lora_rank > 0 or bool(config.get("use_mla")) or str(config.get("attention_method", "")).upper() == "MLA",
+        "is_mla": not is_deepseek_v4 and (q_lora_rank > 0 or kv_lora_rank > 0 or bool(config.get("use_mla")) or str(config.get("attention_method", "")).upper() == "MLA"),
+        "is_deepseek_v4": is_deepseek_v4,
+        "o_lora_rank": int(first_defined(config.get("o_lora_rank"), 0) or 0),
+        "o_groups": int(first_defined(config.get("o_groups"), 1) or 1),
+        "index_head_dim": int(first_defined(config.get("index_head_dim"), 0) or 0),
+        "index_n_heads": int(first_defined(config.get("index_n_heads"), 0) or 0),
+        "index_topk": int(first_defined(config.get("index_topk"), 0) or 0),
+        "compress_ratios": [int(value) for value in config.get("compress_ratios", [])[:num_layers] if isinstance(value, (int, float))],
+        "hc_mult": int(first_defined(config.get("hc_mult"), 1) or 1),
     }
 
 
@@ -528,18 +674,114 @@ def _visible_token_pairs(seq_len: int, window: int = 0) -> int:
     return window * (window + 1) // 2 + (seq_len - window) * window
 
 
+def _compressed_visible_pairs(seq_len: int, ratio: int, limit: int = 0) -> int:
+    if seq_len <= 0 or ratio <= 0:
+        return 0
+    uncapped_len = seq_len if limit <= 0 else min(seq_len, limit * ratio - 1)
+    quotient, remainder = divmod(uncapped_len, ratio)
+    total = ratio * quotient * (quotient - 1) // 2 + quotient * (remainder + 1)
+    if limit > 0 and seq_len > uncapped_len:
+        total += (seq_len - uncapped_len) * limit
+    return total
+
+
+def _deepseek_v4_attention_params(dims: dict[str, Any]) -> tuple[int, int]:
+    hidden_size = dims["hidden_size"]
+    num_heads = dims["num_heads"]
+    head_dim = dims["head_dim"]
+    q_lora_rank = dims["q_lora_rank"]
+    o_lora_rank = dims["o_lora_rank"]
+    o_groups = dims["o_groups"]
+    index_head_dim = dims["index_head_dim"]
+    index_n_heads = dims["index_n_heads"]
+    hc_mult = dims["hc_mult"]
+    ratios = dims["compress_ratios"] or [0] * dims["num_layers"]
+
+    base = hidden_size * q_lora_rank
+    base += q_lora_rank * num_heads * head_dim
+    base += hidden_size * head_dim
+    base += num_heads * head_dim * o_lora_rank
+    base += o_groups * o_lora_rank * hidden_size
+    base += q_lora_rank + head_dim + num_heads
+    mix_width = (2 + hc_mult) * hc_mult
+    hyper_connection = 2 * (mix_width * hc_mult * hidden_size + mix_width + 3)
+
+    layer_params: list[int] = []
+    for ratio in ratios:
+        compressor = 0
+        if ratio == 4:
+            compressor += 4 * hidden_size * head_dim + 2 * ratio * head_dim + head_dim
+            compressor += 4 * hidden_size * index_head_dim + 2 * ratio * index_head_dim + index_head_dim
+            compressor += q_lora_rank * index_n_heads * index_head_dim + hidden_size * index_n_heads
+        elif ratio > 0:
+            compressor += 2 * hidden_size * head_dim + ratio * head_dim + head_dim
+        layer_params.append(base + compressor + hyper_connection)
+    total = sum(layer_params)
+    average = round(total / len(layer_params)) if layer_params else base + hyper_connection
+    return average, total
+
+
 def _context_layer_tokens(metrics: dict[str, Any], seq_len: int) -> int:
+    if metrics.get("is_deepseek_v4"):
+        ratios = metrics.get("compress_ratios") or []
+        window = int(metrics.get("sliding_window", 0) or 0)
+        head_dim = int(metrics.get("head_dim", 0) or 0)
+        index_topk = int(metrics.get("index_topk", 0) or 0)
+        if not ratios or not head_dim:
+            return 0
+        local_tokens = min(seq_len, window or seq_len)
+        total = 0
+        for ratio in ratios:
+            total += local_tokens
+            if ratio == 4:
+                total += min(index_topk, ceil_div(seq_len, ratio))
+            elif ratio > 0:
+                total += ceil_div(seq_len, ratio)
+        return total
     full_layers = int(metrics.get("full_attention_layers", metrics.get("num_layers", 0)) or 0)
     sliding_layers = int(metrics.get("sliding_attention_layers", 0) or 0)
+    sparse_layers = int(metrics.get("sparse_attention_layers", 0) or 0)
+    sparse_topk = int(metrics.get("sparse_topk", 0) or 0)
     window = int(metrics.get("sliding_window", 0) or 0)
-    return full_layers * seq_len + sliding_layers * min(seq_len, window or seq_len)
+    return full_layers * seq_len + sliding_layers * min(seq_len, window or seq_len) + sparse_layers * min(seq_len, sparse_topk or seq_len)
+
+
+def _indexer_flops_per_token(metrics: dict[str, Any], seq_len: int) -> int:
+    index_width = int(metrics.get("index_n_heads", 0) or 0) * int(metrics.get("index_head_dim", 0) or 0)
+    if index_width <= 0 or seq_len <= 0:
+        return 0
+    if metrics.get("is_deepseek_v4"):
+        csa_layers = sum(ratio == 4 for ratio in metrics.get("compress_ratios") or [])
+        return 2 * index_width * ceil_div(seq_len, 4) * csa_layers
+    sparse_layers = int(metrics.get("sparse_attention_layers", 0) or 0)
+    return 2 * index_width * seq_len * sparse_layers
 
 
 def _kv_cache_bytes(metrics: dict[str, Any], seq_len: int, batch: int = 1) -> int:
+    if metrics.get("is_deepseek_v4"):
+        ratios = metrics.get("compress_ratios") or []
+        window = int(metrics.get("sliding_window", 0) or 0)
+        head_dim = int(metrics.get("head_dim", 0) or 0)
+        index_head_dim = int(metrics.get("index_head_dim", 0) or 0)
+        local_tokens = min(seq_len, window or seq_len)
+        cached_elements = 0
+        for ratio in ratios:
+            cached_elements += local_tokens * head_dim
+            if ratio > 0:
+                compressed_tokens = ceil_div(seq_len, ratio)
+                cached_elements += compressed_tokens * head_dim
+                if ratio == 4:
+                    cached_elements += compressed_tokens * index_head_dim
+        return cached_elements * 2 * batch
     per_layer = int(metrics.get("kv_bytes_per_token_per_layer", 0) or 0)
     if per_layer <= 0:
         return int(metrics.get("kv_bytes_per_token", 0) or 0) * seq_len * batch
-    return per_layer * _context_layer_tokens(metrics, seq_len) * batch
+    full_layers = int(metrics.get("full_attention_layers", metrics.get("num_layers", 0)) or 0)
+    sparse_layers = int(metrics.get("sparse_attention_layers", 0) or 0)
+    sliding_layers = int(metrics.get("sliding_attention_layers", 0) or 0)
+    window = int(metrics.get("sliding_window", 0) or 0)
+    cached_layer_tokens = (full_layers + sparse_layers) * seq_len + sliding_layers * min(seq_len, window or seq_len)
+    return per_layer * cached_layer_tokens * batch
 
 
 def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, Any] | None:
@@ -581,9 +823,12 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
     qk_nope_head_dim = dims["qk_nope_head_dim"]
     qk_head_dim = dims["qk_head_dim"]
     v_head_dim = dims["v_head_dim"]
+    is_deepseek_v4 = dims["is_deepseek_v4"]
 
-    # ---- Attention params per layer ----
-    if is_mla:
+    special_attn_total = 0
+    if is_deepseek_v4:
+        attn_params, special_attn_total = _deepseek_v4_attention_params(dims)
+    elif is_mla:
         if q_lora_rank:
             q_params = hidden_size * q_lora_rank + q_lora_rank * num_heads * (qk_head_dim or head_dim)
         else:
@@ -612,6 +857,9 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
     routed_experts_total = 0
     shared_experts_total = 0
     dense_ffn_total = 0
+    routed_experts_active = 0
+    shared_experts_active = 0
+    dense_ffn_active = 0
     if num_experts:
         expert_dim = moe_ffn_hidden or dense_ffn_dim
         expert_params = ffn_projection_count * hidden_size * expert_dim
@@ -624,29 +872,36 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
         routed_experts_total = n_moe_layers * routed_total
         shared_experts_total = n_moe_layers * shared_params
         dense_ffn_total = n_dense_layers * dense_ffn_params
+        routed_experts_active = n_moe_layers * routed_active
+        shared_experts_active = n_moe_layers * shared_params
+        dense_ffn_active = n_dense_layers * dense_ffn_params
         ffn_total = dense_ffn_total + routed_experts_total + shared_experts_total
-        ffn_active = n_dense_layers * dense_ffn_params + n_moe_layers * (routed_active + shared_params)
+        ffn_active = dense_ffn_active + routed_experts_active + shared_experts_active
     else:
         ffn_total = ffn_active = num_layers * dense_ffn_params
         dense_ffn_total = ffn_total
+        dense_ffn_active = ffn_active
         shared_expert_params = 0
 
     embed_params = hidden_size * (vocab_size or 0)
     output_head_params = embed_params if has_output_head else 0
     output_head_total = 0 if tie_word_embeddings else output_head_params
     embed_total = embed_params + output_head_total + dims["position_embedding_params"] + dims["token_type_embedding_params"]
-    attn_total = attn_params * num_layers
+    attn_total = special_attn_total or attn_params * num_layers
     mtp_ffn_params = routed_total + shared_params if num_experts else dense_ffn_params
     mtp_params = mtp_layers * (attn_params + mtp_ffn_params)
     mtp_included = mtp_params if include_mtp_in_total else 0
     total_params = attn_total + ffn_total + embed_total + mtp_included
     active_params = attn_total + ffn_active + output_head_params
+    non_expert_active_params = active_params - routed_experts_active
 
     # ---- KV cache (per 1K tokens per batch element) ----
     kv_bytes_per_token = 0  # raw per-token KV bytes (bf16), reused by memory estimator
     kv_bytes_per_token_per_layer = 0
-    cache_layer_count = dims["full_attention_layers"] + dims["sliding_attention_layers"]
-    if has_output_head and is_mla:
+    cache_layer_count = dims["full_attention_layers"] + dims["sliding_attention_layers"] + dims["sparse_attention_layers"]
+    if has_output_head and is_deepseek_v4:
+        kv_bytes_per_token = 0
+    elif has_output_head and is_mla:
         kv_bytes_per_token_per_layer = ((kv_lora_rank or head_dim) + qk_rope_head_dim) * 2
         kv_bytes_per_token = cache_layer_count * kv_bytes_per_token_per_layer
     elif has_output_head and num_kv_heads and head_dim:
@@ -658,8 +913,23 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
     linear_flops_per_token = 2 * active_params
     full_attention_layers = dims["full_attention_layers"]
     sliding_attention_layers = dims["sliding_attention_layers"]
+    sparse_attention_layers = dims["sparse_attention_layers"]
+    sparse_topk = dims["sparse_topk"]
     sliding_window = dims["sliding_window"]
-    context_layer_tokens = full_attention_layers * seq_len + sliding_attention_layers * min(seq_len, sliding_window or seq_len)
+    context_layer_tokens = full_attention_layers * seq_len
+    context_layer_tokens += sliding_attention_layers * min(seq_len, sliding_window or seq_len)
+    context_layer_tokens += sparse_attention_layers * min(seq_len, sparse_topk or seq_len)
+    if is_deepseek_v4:
+        context_layer_tokens = _context_layer_tokens(
+            {
+                "is_deepseek_v4": True,
+                "compress_ratios": dims["compress_ratios"],
+                "sliding_window": sliding_window,
+                "head_dim": head_dim,
+                "index_topk": dims["index_topk"],
+            },
+            seq_len,
+        )
     attention_flops_per_token = 2 * (qk_width + v_width) * context_layer_tokens if seq_len else 0
 
     metrics = {
@@ -672,13 +942,21 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
         "gflops_per_token": (linear_flops_per_token + attention_flops_per_token) / 1e9,
         "hidden_size": hidden_size,
         "num_layers": num_layers,
+        "head_dim": head_dim,
         "qk_width": qk_width,
         "v_width": v_width,
         "full_attention_layers": full_attention_layers,
         "sliding_attention_layers": sliding_attention_layers,
         "linear_attention_layers": dims["linear_attention_layers"],
+        "sparse_attention_layers": sparse_attention_layers,
+        "sparse_topk": sparse_topk,
         "sliding_window": sliding_window,
         "causal_attention": has_output_head,
+        "is_deepseek_v4": is_deepseek_v4,
+        "compress_ratios": dims["compress_ratios"],
+        "index_head_dim": dims["index_head_dim"],
+        "index_n_heads": dims["index_n_heads"],
+        "index_topk": dims["index_topk"],
         "mtp_params": mtp_params,
         "mtp_included": mtp_included,
         "mtp_layers": mtp_layers,
@@ -691,6 +969,10 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
         "attn_params_per_layer": attn_params,
         "ffn_total": ffn_total,
         "ffn_active": ffn_active,
+        "routed_experts_active": routed_experts_active,
+        "shared_experts_active": shared_experts_active,
+        "dense_ffn_active": dense_ffn_active,
+        "non_expert_active_params": non_expert_active_params,
         "embed_params": embed_params,
         "embed_total": embed_total,
         "expert_params": expert_params,
@@ -706,8 +988,11 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
             "mtp": mtp_included,
         },
     }
+    if seq_len:
+        metrics["attention_flops_per_token"] += _indexer_flops_per_token(metrics, seq_len)
+        metrics["gflops_per_token"] = (linear_flops_per_token + metrics["attention_flops_per_token"]) / 1e9
     kv_cache_bytes_per_1k = _kv_cache_bytes(metrics, 1024)
-    metrics["kv_cache_mb_per_1k"] = kv_cache_bytes_per_1k / (1024 * 1024) if kv_bytes_per_token_per_layer else None
+    metrics["kv_cache_mb_per_1k"] = kv_cache_bytes_per_1k / (1024 * 1024) if (kv_bytes_per_token_per_layer or is_deepseek_v4) else None
     return metrics
 
 
@@ -766,6 +1051,46 @@ def infer_weight_precision(config: dict[str, Any], params_config: dict[str, Any]
     return "bf16"
 
 
+def infer_native_weight_profile(config: dict[str, Any], metrics: dict[str, Any], precision: str) -> dict[str, Any]:
+    quantization = config.get("quantization_config") if isinstance(config.get("quantization_config"), dict) else {}
+    quant_method = str(quantization.get("quant_method") or "").lower()
+    store_dtype = str(quantization.get("store_dtype") or "").lower()
+    checkpoint_bytes = int(metrics.get("checkpoint_bytes", 0) or 0)
+    total_params = int(metrics.get("total_params", 0) or 0)
+    checkpoint_bpp = checkpoint_bytes / total_params if checkpoint_bytes and total_params else None
+    has_routed_experts = int(metrics.get("routed_experts_active", 0) or 0) > 0
+    explicit_mixed_fp4 = "fp4" in store_dtype and any(token in quant_method for token in ("fp8", "float8"))
+    inferred_mixed_fp4 = has_routed_experts and precision == "fp8" and checkpoint_bpp is not None and checkpoint_bpp < 0.75
+
+    profile = {
+        "weight_format": precision.upper(),
+        "checkpoint_bytes_per_param": checkpoint_bpp,
+        "native_compute_precision": precision,
+        "native_active_weight_bytes": None,
+        "expert_bytes_per_param": PRECISION_BYTES[precision],
+        "non_expert_bytes_per_param": PRECISION_BYTES[precision],
+    }
+    if explicit_mixed_fp4 or inferred_mixed_fp4:
+        expert_bpp = PRECISION_BYTES["int4"]
+        non_expert_bpp = PRECISION_BYTES["fp8"]
+        routed_active = int(metrics.get("routed_experts_active", 0) or 0)
+        non_expert_active = int(metrics.get("non_expert_active_params", 0) or 0)
+        profile.update(
+            {
+                "weight_format": "混合 FP4 experts + FP8 core",
+                "native_compute_precision": "fp8",
+                "native_active_weight_bytes": routed_active * expert_bpp + non_expert_active * non_expert_bpp,
+                "expert_bytes_per_param": expert_bpp,
+                "non_expert_bytes_per_param": non_expert_bpp,
+            }
+        )
+    elif precision == "fp8" and quantization.get("modules_to_not_convert"):
+        profile["weight_format"] = "FP8（部分层保留高精度）"
+        if checkpoint_bpp is not None and checkpoint_bpp >= 1.75:
+            profile["weight_format"] = "checkpoint≈BF16 / runtime FP8"
+    return profile
+
+
 def _gpu_compute_tops(gpu: dict[str, Any], precision: str) -> float:
     compute_tops = gpu.get("compute_tops") if isinstance(gpu.get("compute_tops"), dict) else {}
     return float(compute_tops.get(precision, gpu["bf16_tflops"]))
@@ -776,12 +1101,32 @@ def _prefill_attention_flops(metrics: dict[str, Any], seq_len: int) -> int:
     v_width = int(metrics.get("v_width", 0) or 0)
     if not qk_width and not v_width:
         return 0
+    if metrics.get("is_deepseek_v4"):
+        ratios = metrics.get("compress_ratios") or []
+        window = int(metrics.get("sliding_window", 0) or 0)
+        index_topk = int(metrics.get("index_topk", 0) or 0)
+        visible_pairs = len(ratios) * _visible_token_pairs(seq_len, window)
+        for ratio in ratios:
+            if ratio == 4:
+                visible_pairs += _compressed_visible_pairs(seq_len, ratio, index_topk)
+            elif ratio > 0:
+                visible_pairs += _compressed_visible_pairs(seq_len, ratio)
+        core_flops = 2 * (qk_width + v_width) * visible_pairs
+        index_width = int(metrics.get("index_n_heads", 0) or 0) * int(metrics.get("index_head_dim", 0) or 0)
+        index_pairs = sum(ratio == 4 for ratio in ratios) * _compressed_visible_pairs(seq_len, 4)
+        return core_flops + 2 * index_width * index_pairs
     full_layers = int(metrics.get("full_attention_layers", metrics.get("num_layers", 0)) or 0)
     sliding_layers = int(metrics.get("sliding_attention_layers", 0) or 0)
+    sparse_layers = int(metrics.get("sparse_attention_layers", 0) or 0)
+    sparse_topk = int(metrics.get("sparse_topk", 0) or 0)
     window = int(metrics.get("sliding_window", 0) or 0)
     visible_pairs = full_layers * _visible_token_pairs(seq_len)
     visible_pairs += sliding_layers * _visible_token_pairs(seq_len, window)
-    return 2 * (qk_width + v_width) * visible_pairs
+    visible_pairs += sparse_layers * _visible_token_pairs(seq_len, sparse_topk)
+    core_flops = 2 * (qk_width + v_width) * visible_pairs
+    index_width = int(metrics.get("index_n_heads", 0) or 0) * int(metrics.get("index_head_dim", 0) or 0)
+    index_flops = 2 * index_width * sparse_layers * _visible_token_pairs(seq_len)
+    return core_flops + index_flops
 
 
 def estimate_memory_footprint(
@@ -822,9 +1167,11 @@ def estimate_memory_footprint(
 
     return {
         "precision": precision,
+        "weight_format": metrics.get("weight_format", precision.upper()) if precision == checkpoint_precision else precision.upper(),
         "batch": batch,
         "seq_len": seq_len,
         "bytes_per_param": PRECISION_BYTES[precision],
+        "checkpoint_bytes_per_param": weights_bytes / total_params if use_checkpoint_bytes and total_params else None,
         "weights_bytes": weights_bytes,
         "weight_source": "checkpoint" if use_checkpoint_bytes else "parameter_estimate",
         "kv_bytes": kv_bytes,
@@ -858,18 +1205,23 @@ def estimate_throughput(
         return []
 
     bytes_per_param = PRECISION_BYTES[precision]
+    use_native_profile = precision == str(metrics.get("checkpoint_precision") or "")
+    compute_precision = str(metrics.get("native_compute_precision") or precision) if use_native_profile else precision
     linear_flops = int(metrics.get("linear_flops_per_token", 2 * active_params) or 0)
     attention_flops = 2 * (int(metrics.get("qk_width", 0) or 0) + int(metrics.get("v_width", 0) or 0)) * _context_layer_tokens(metrics, seq_len)
+    attention_flops += _indexer_flops_per_token(metrics, seq_len)
     decode_flops = linear_flops + attention_flops
     prefill_flops = batch * (linear_flops * seq_len + _prefill_attention_flops(metrics, seq_len))
-    active_weight_bytes = active_params * bytes_per_param
+    native_active_weight_bytes = metrics.get("native_active_weight_bytes") if use_native_profile else None
+    active_weight_bytes = float(native_active_weight_bytes) if isinstance(native_active_weight_bytes, (int, float)) else active_params * bytes_per_param
+    active_bytes_per_param = active_weight_bytes / active_params
     kv_read_bytes = _kv_cache_bytes(metrics, seq_len, 1)
     bytes_per_output_token = active_weight_bytes / batch + kv_read_bytes
     gpu_counts = gpu_counts or {}
     rows = []
     for gpu in GPU_REFERENCE:
         gpu_count = max(int(gpu_counts.get(gpu["name"], 1) or 1), 1)
-        per_gpu_tops = _gpu_compute_tops(gpu, precision)
+        per_gpu_tops = _gpu_compute_tops(gpu, compute_precision)
         effective_tops = per_gpu_tops * gpu_count
         peak_flops = effective_tops * 1e12 * _MFU
         bw = gpu["bw_gbs"] * 1e9 * gpu_count
@@ -893,6 +1245,8 @@ def estimate_throughput(
             "decode_flops": decode_flops,
             "attention_flops": attention_flops,
             "active_weight_bytes": active_weight_bytes,
+            "active_bytes_per_param": active_bytes_per_param,
+            "compute_precision": compute_precision,
             "kv_read_bytes": kv_read_bytes,
             "bytes_per_output_token": bytes_per_output_token,
             "batch": batch,
@@ -944,6 +1298,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     v_head_dim = dims["v_head_dim"]
     o_lora_rank = int(first_defined(config.get("o_lora_rank"), 0) or 0)
     is_mla = dims["is_mla"]
+    is_deepseek_v4 = dims["is_deepseek_v4"]
 
     batch = clamp_int(query.get("batch", [1])[0], 1)
     seq_len = clamp_int(query.get("seq_len", [min(max_position, 2048)])[0], min(max_position, 2048), maximum=max_position)
@@ -957,7 +1312,11 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         if is_mla
         else shape(batch, seq_len, num_kv_heads or "kv_heads", head_dim or "head_dim")
     )
-    score_shape = shape(batch, num_heads or "heads", seq_len, seq_len)
+    score_shape = (
+        shape(batch, num_heads or "heads", seq_len, f"local≤{sliding_window}+compressed")
+        if is_deepseek_v4
+        else shape(batch, num_heads or "heads", seq_len, seq_len)
+    )
     rope_q_shape = f"Q_rope {attention_shape}; K_rope {kv_shape}"
 
     warnings = [
@@ -967,6 +1326,10 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         warnings.append("该模型的层数或隐藏维度信息不完整，图中会保留摘要级展示。")
     if dims["linear_attention_layers"]:
         warnings.append("线性注意力层不套用标准 KV cache 与 QK/AV 二次项；其固定状态开销未计入。")
+    if dims["sparse_attention_layers"]:
+        warnings.append(f"稀疏注意力按 {dims['sparse_attention_layers']} 个 DSA 层计算低维全序列 indexer 与 top-{dims['sparse_topk']} 主注意力；KV cache 仍保留这些层的完整序列。")
+    if is_deepseek_v4:
+        warnings.append("DeepSeek V4 按共享 K=V、q 低秩、grouped-o 低秩及 CSA/HCA 压缩率计算参数、注意力 FLOPs 与 KV cache。")
 
     lanes = [
         ("inputs", "输入"),
@@ -1841,6 +2204,11 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     ]
     if is_mla:
         summary.append(detail("注意力", f"MLA (q_lora={q_lora_rank}, kv_lora={kv_lora_rank or head_dim}, rope_dim={qk_rope_head_dim})"))
+    elif is_deepseek_v4:
+        ratio_counts = {ratio: dims["compress_ratios"].count(ratio) for ratio in sorted(set(dims["compress_ratios"]))}
+        summary.append(detail("注意力", f"Compressed MQA {ratio_counts} / local {sliding_window}"))
+    if dims["sparse_attention_layers"]:
+        summary.append(detail("层型", f"DSA {dims['sparse_attention_layers']} / SWA {dims['sliding_attention_layers']} / top-{dims['sparse_topk']}"))
     if num_experts:
         effective_top_k = (experts_per_tok or 1) * dims["active_expert_multiplier"]
         cli_note = f" (top-{experts_per_tok} × CLI {dims['active_expert_multiplier']})" if dims["active_expert_multiplier"] > 1 else ""
@@ -1855,11 +2223,13 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         if isinstance(checkpoint_size, (int, float)) and checkpoint_size > 0:
             metrics["checkpoint_bytes"] = int(checkpoint_size)
             metrics["checkpoint_precision"] = default_precision
+        metrics.update(infer_native_weight_profile(config, metrics, default_precision))
         total_params = metrics["total_params"]
         active_params = metrics["active_params"]
         summary.append(detail("参数量", f"{total_params / 1e9:.2f}B" + (f" (active {active_params / 1e9:.2f}B)" if num_experts else "")))
-        if metrics["mtp_params"] and not metrics["mtp_included"]:
-            summary.append(detail("MTP 参数", f"{metrics['mtp_params'] / 1e9:.2f}B（辅助预测层，未计入主干总参数）"))
+        if metrics["mtp_params"]:
+            mtp_scope = "已计入总参数" if metrics["mtp_included"] else "辅助预测层，未计入主干总参数"
+            summary.append(detail("MTP 参数", f"{metrics['mtp_params'] / 1e9:.2f}B（{mtp_scope}）"))
 
         kv_per_1k = metrics["kv_cache_mb_per_1k"]
         if kv_per_1k is not None:
@@ -1922,6 +2292,10 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 "has_output_head": dims["has_output_head"],
                 "ffn_projection_count": dims["ffn_projection_count"],
                 "is_mla": dims["is_mla"],
+                "is_deepseek_v4": dims["is_deepseek_v4"],
+                "compress_ratios": dims["compress_ratios"],
+                "sparse_attention_layers": dims["sparse_attention_layers"],
+                "sparse_topk": dims["sparse_topk"],
                 "attn_per_layer": metrics["attn_params_per_layer"],
                 "expert_per": metrics["expert_params"],
                 "shared_expert_per": metrics["shared_expert_params"],
@@ -1940,6 +2314,12 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 "active_params": active_params,
                 "bytes_per_param": PRECISION_BYTES[precision],
                 "precision": precision,
+                "weight_format": metrics.get("weight_format", precision.upper()),
+                "native_active_weight_bytes": metrics.get("native_active_weight_bytes"),
+                "native_compute_precision": metrics.get("native_compute_precision", precision),
+                "expert_bytes_per_param": metrics.get("expert_bytes_per_param", PRECISION_BYTES[precision]),
+                "non_expert_bytes_per_param": metrics.get("non_expert_bytes_per_param", PRECISION_BYTES[precision]),
+                "uses_native_profile": precision == default_precision and metrics.get("native_active_weight_bytes") is not None,
                 "seq_len": seq_len,
                 "batch": batch,
                 "mfu": _MFU,
@@ -1950,24 +2330,430 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     return payload
 
 
+def build_asr_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    config = primary_config(model_dir)
+    yaml_config = supplemental_yaml_config(model_dir)
+    preprocessor = read_json_file(model_dir / "preprocessor_config.json")
+    architecture = infer_architecture_name(model_dir, "multimodal")
+
+    thinker_config = config.get("thinker_config") if isinstance(config.get("thinker_config"), dict) else {}
+    thinker_audio = thinker_config.get("audio_config") if isinstance(thinker_config.get("audio_config"), dict) else {}
+    config_audio = config.get("audio_config") if isinstance(config.get("audio_config"), dict) else {}
+    config_encoder = config.get("encoder") if isinstance(config.get("encoder"), dict) else {}
+    yaml_encoder = first_defined(yaml_config.get("audio_encoder_conf"), yaml_config.get("encoder_conf"), {}) or {}
+    encoder_config = first_defined(config_encoder, thinker_audio, config_audio, yaml_encoder, {}) or {}
+
+    transformer_decoder = config.get("transf_decoder") if isinstance(config.get("transf_decoder"), dict) else {}
+    transformer_decoder_config = transformer_decoder.get("config_dict") if isinstance(transformer_decoder.get("config_dict"), dict) else {}
+    thinker_text = thinker_config.get("text_config") if isinstance(thinker_config.get("text_config"), dict) else {}
+    config_text = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+    language_config = config.get("language_config") if isinstance(config.get("language_config"), dict) else {}
+    decoder_config = first_defined(thinker_text, config_text, language_config, transformer_decoder_config, {}) or {}
+    adaptor_config = yaml_config.get("audio_adaptor_conf") if isinstance(yaml_config.get("audio_adaptor_conf"), dict) else {}
+    frontend_config = yaml_config.get("frontend_conf") if isinstance(yaml_config.get("frontend_conf"), dict) else {}
+    dataset_config = yaml_config.get("dataset_conf") if isinstance(yaml_config.get("dataset_conf"), dict) else {}
+
+    encoder_hidden = scalar_int(
+        first_defined(encoder_config.get("d_model"), encoder_config.get("hidden_size"), encoder_config.get("output_size")),
+        512,
+    )
+    encoder_output_hidden = scalar_int(first_defined(encoder_config.get("output_dim"), encoder_config.get("output_size"), encoder_hidden), encoder_hidden)
+    encoder_layers = scalar_int(
+        first_defined(encoder_config.get("n_layers"), encoder_config.get("encoder_layers"), encoder_config.get("num_hidden_layers"), encoder_config.get("num_blocks")),
+        1,
+    )
+    encoder_heads = scalar_int(
+        first_defined(encoder_config.get("n_heads"), encoder_config.get("encoder_attention_heads"), encoder_config.get("num_attention_heads"), encoder_config.get("attention_heads")),
+        1,
+    )
+    decoder_hidden = scalar_int(
+        first_defined(decoder_config.get("hidden_size"), adaptor_config.get("llm_dim"), config.get("head", {}).get("hidden_size") if isinstance(config.get("head"), dict) else None, encoder_output_hidden),
+        encoder_output_hidden,
+    )
+    decoder_layers = scalar_int(first_defined(decoder_config.get("num_hidden_layers"), decoder_config.get("num_layers")), 0)
+    decoder_heads = scalar_int(first_defined(decoder_config.get("num_attention_heads"), decoder_config.get("n_heads")), 0)
+    vocab_size = scalar_int(decoder_config.get("vocab_size"), 0)
+    if not vocab_size:
+        vocab_size = scalar_int(first_defined(config.get("vocab_size"), config.get("head", {}).get("num_classes") if isinstance(config.get("head"), dict) else None), 0)
+    identity = _model_identity(config, yaml_config)
+    has_decoder = bool(decoder_config or yaml_config.get("llm") or "conditionalgeneration" in identity)
+
+    inferred_sample_rate = None
+    chunk_length = first_defined(preprocessor.get("chunk_length"), config.get("max_audio_clip_s"))
+    if isinstance(preprocessor.get("n_samples"), (int, float)) and isinstance(chunk_length, (int, float)) and chunk_length > 0:
+        inferred_sample_rate = int(preprocessor["n_samples"] / chunk_length)
+    sample_rate = scalar_int(first_defined(preprocessor.get("sampling_rate"), config.get("sample_rate"), frontend_config.get("fs"), inferred_sample_rate), 16000)
+    frame_shift_ms = frontend_config.get("frame_shift")
+    inferred_hop = int(sample_rate * float(frame_shift_ms) / 1000) if isinstance(frame_shift_ms, (int, float)) and frame_shift_ms > 0 else None
+    hop_length = scalar_int(first_defined(preprocessor.get("hop_length"), preprocessor.get("n_window_stride"), inferred_hop), max(sample_rate // 100, 1))
+    feature_size = scalar_int(
+        first_defined(preprocessor.get("feature_size"), thinker_audio.get("num_mel_bins"), config_audio.get("num_mel_bins"), encoder_config.get("feat_in"), frontend_config.get("n_mels")),
+        80,
+    )
+
+    ratio_subsampling = None
+    max_feature_frames = preprocessor.get("nb_max_frames")
+    max_source_positions = thinker_audio.get("max_source_positions")
+    if isinstance(max_feature_frames, (int, float)) and isinstance(max_source_positions, (int, float)) and max_source_positions > 0:
+        ratio_subsampling = ceil_div(int(max_feature_frames), int(max_source_positions))
+    subsampling_factor = scalar_int(
+        first_defined(
+            encoder_config.get("subsampling_factor"),
+            encoder_config.get("downsample_rate"),
+            dataset_config.get("audio_encoder_downsample_rate"),
+            frontend_config.get("lfr_n"),
+            ratio_subsampling,
+        ),
+        1,
+    )
+
+    max_audio_seconds = scalar_int(first_defined(config.get("max_audio_clip_s"), preprocessor.get("chunk_length")), 30)
+    batch = clamp_int(query.get("batch", [1])[0], 1, maximum=16)
+    audio_seconds = clamp_int(query.get("audio_seconds", [min(max_audio_seconds, 30)])[0], min(max_audio_seconds, 30), maximum=max(max_audio_seconds, 1))
+    sample_count = audio_seconds * sample_rate
+    feature_frames = ceil_div(sample_count, hop_length)
+    audio_tokens = ceil_div(feature_frames, subsampling_factor)
+    max_output_tokens = scalar_int(
+        first_defined(config.get("max_seq_len"), decoder_config.get("max_sequence_length"), decoder_config.get("max_position_embeddings")),
+        1024,
+    )
+    output_tokens = clamp_int(query.get("output_tokens", [min(max_output_tokens, 256)])[0], min(max_output_tokens, 256), maximum=max_output_tokens) if has_decoder else 0
+    decoder_context_tokens = audio_tokens + output_tokens
+    projected_hidden = decoder_hidden if has_decoder else encoder_output_hidden
+
+    lanes = [("inputs", "输入"), ("processing", "处理"), ("encoding", "编码"), ("backbone", "主干"), ("output", "输出")]
+    nodes = [
+        build_node(
+            "audio_input",
+            "inputs",
+            0,
+            "音频输入",
+            f"{sample_rate} Hz waveform",
+            "原始单声道波形。",
+            shape(batch, sample_count),
+            shape(batch, sample_count),
+            [f"{audio_seconds}s", f"{sample_rate} Hz"],
+            [detail("samples", sample_count), detail("duration_seconds", audio_seconds), detail("sample_rate", sample_rate)],
+            [section("输入", [detail("waveform", shape(batch, sample_count))])],
+            "input",
+        ),
+        build_node(
+            "audio_features",
+            "processing",
+            0,
+            "声学特征",
+            "STFT / log-mel",
+            "按 hop length 提取声学帧。",
+            shape(batch, sample_count),
+            shape(batch, feature_frames, feature_size),
+            [f"frames {feature_frames}", f"mel {feature_size}"],
+            [detail("hop_length", hop_length), detail("feature_frames", feature_frames), detail("feature_size", feature_size)],
+            [section("推导公式", [detail("feature frames", f"ceil({sample_count}/{hop_length}) = {feature_frames}")])],
+            "audio",
+        ),
+        build_node(
+            "audio_encoder",
+            "encoding",
+            0,
+            "音频编码器",
+            f"{encoder_layers} layers / {encoder_heads} heads",
+            "声学帧经编码器与下采样变为音频 token。",
+            shape(batch, feature_frames, feature_size),
+            shape(batch, audio_tokens, encoder_output_hidden),
+            [f"hidden {encoder_hidden}", f"tokens {audio_tokens}"],
+            [detail("encoder_hidden", encoder_hidden), detail("output_hidden", encoder_output_hidden), detail("layers", encoder_layers), detail("heads", encoder_heads), detail("subsampling_factor", subsampling_factor)],
+            [section("推导公式", [detail("audio tokens", f"ceil({feature_frames}/{subsampling_factor}) = {audio_tokens}")])],
+            "audio",
+        ),
+    ]
+    edges = [build_edge("audio_input", "audio_features", "waveform"), build_edge("audio_features", "audio_encoder", "mel frames")]
+
+    decoder_source = "audio_encoder"
+    if has_decoder and encoder_output_hidden != decoder_hidden:
+        nodes.append(
+            build_node(
+                "audio_projector",
+                "encoding",
+                1,
+                "音频投影",
+                "audio -> language hidden",
+                "将音频编码维度映射到文本解码器维度。",
+                shape(batch, audio_tokens, encoder_output_hidden),
+                shape(batch, audio_tokens, decoder_hidden),
+                [f"to {decoder_hidden}"],
+                [detail("input_hidden", encoder_output_hidden), detail("output_hidden", decoder_hidden)],
+                [section("投影", [detail("output", shape(batch, audio_tokens, decoder_hidden))])],
+                "fusion",
+            )
+        )
+        edges.append(build_edge("audio_encoder", "audio_projector", "audio hidden"))
+        decoder_source = "audio_projector"
+
+    if has_decoder:
+        nodes.extend(
+            [
+                build_node(
+                    "text_decoder",
+                    "backbone",
+                    0,
+                    "文本解码器",
+                    f"{decoder_layers or '?'} layers / {decoder_heads or '?'} heads",
+                    "在音频条件上自回归生成转写 token。",
+                    shape(batch, decoder_context_tokens, decoder_hidden),
+                    shape(batch, output_tokens, decoder_hidden),
+                    [f"hidden {decoder_hidden}", f"output {output_tokens}"],
+                    [detail("audio_tokens", audio_tokens), detail("output_tokens", output_tokens), detail("context_tokens", decoder_context_tokens)],
+                    [section("上下文", [detail("audio + generated", f"{audio_tokens} + {output_tokens} = {decoder_context_tokens}")])],
+                    "core",
+                ),
+                build_node(
+                    "asr_logits",
+                    "output",
+                    0,
+                    "转写输出",
+                    "token logits",
+                    "输出文本词表上的转写分布。",
+                    shape(batch, output_tokens, decoder_hidden),
+                    shape(batch, output_tokens, vocab_size or "vocab"),
+                    [f"vocab {vocab_size or '?'}"],
+                    [detail("logits", shape(batch, output_tokens, vocab_size or "vocab"))],
+                    [section("输出", [detail("token ids", shape(batch, output_tokens))])],
+                    "output",
+                ),
+            ]
+        )
+        edges.extend([build_edge(decoder_source, "text_decoder", "audio tokens"), build_edge("text_decoder", "asr_logits", "decoder hidden")])
+    else:
+        nodes.append(
+            build_node(
+                "ctc_output",
+                "output",
+                0,
+                "CTC / 标签输出",
+                "frame-level predictions",
+                "编码器直接输出逐帧标签或 CTC 分布。",
+                shape(batch, audio_tokens, projected_hidden),
+                shape(batch, audio_tokens, vocab_size or "classes"),
+                ["encoder-only"],
+                [detail("time_steps", audio_tokens), detail("classes", vocab_size or "config 未提供")],
+                [section("输出", [detail("frame logits", shape(batch, audio_tokens, vocab_size or "classes"))])],
+                "output",
+            )
+        )
+        edges.append(build_edge("audio_encoder", "ctc_output", "encoded frames"))
+
+    summary = [
+        detail("类型", "语音识别"),
+        detail("采样率", f"{sample_rate} Hz"),
+        detail("声学编码维度", encoder_hidden),
+        detail("编码层数", encoder_layers),
+        detail("当前声学帧", feature_frames),
+        detail("当前音频 tokens", audio_tokens),
+    ]
+    if has_decoder:
+        summary.extend([detail("文本隐藏维度", decoder_hidden), detail("输出 tokens", output_tokens)])
+    controls = [
+        {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 16, "step": 1, "help": "并行音频条数"},
+        {"name": "audio_seconds", "label": "音频秒数", "type": "number", "value": audio_seconds, "min": 1, "max": max_audio_seconds, "step": 1, "help": "当前输入音频时长"},
+    ]
+    if has_decoder:
+        controls.append({"name": "output_tokens", "label": "输出 token", "type": "number", "value": output_tokens, "min": 1, "max": max_output_tokens, "step": 1, "help": "预计生成的转写长度"})
+
+    sources: list[str] = []
+    for source_name in ("config.json", "configuration.json", "config.yaml", "preprocessor_config.json", "processor_config.json"):
+        append_source_file(model_dir, sources, source_name)
+    warnings = ["声学帧按 ceil(samples / hop_length) 估算；实际 STFT 的 padding 与边界策略可能造成少量帧差异。"]
+    return base_model_payload(
+        model_id,
+        "multimodal",
+        architecture,
+        f"语音识别模型，{audio_seconds} 秒音频约形成 {audio_tokens} 个编码 token。",
+        summary,
+        controls,
+        {
+            "batch": batch,
+            "audio_seconds": audio_seconds,
+            "sample_rate": sample_rate,
+            "sample_count": sample_count,
+            "hop_length": hop_length,
+            "feature_frames": feature_frames,
+            "subsampling_factor": subsampling_factor,
+            "audio_tokens": audio_tokens,
+            "output_tokens": output_tokens,
+        },
+        build_graph(lanes, nodes, edges),
+        warnings,
+        sources,
+        "audio_encoder",
+    )
+
+
+def build_sam_video_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    config = primary_config(model_dir)
+    processor = read_json_file(model_dir / "processor_config.json")
+    architecture = infer_architecture_name(model_dir, "multimodal")
+    detector = config.get("detector_config") if isinstance(config.get("detector_config"), dict) else {}
+    tracker = config.get("tracker_config") if isinstance(config.get("tracker_config"), dict) else {}
+    vision_config = first_defined(detector.get("vision_config"), tracker.get("vision_config"), {}) or {}
+    backbone_config = vision_config.get("backbone_config") if isinstance(vision_config.get("backbone_config"), dict) else vision_config
+    text_config = detector.get("text_config") if isinstance(detector.get("text_config"), dict) else {}
+    image_processor = processor.get("image_processor") if isinstance(processor.get("image_processor"), dict) else processor
+    video_processor = processor.get("video_processor") if isinstance(processor.get("video_processor"), dict) else {}
+
+    patch_size = scalar_int(first_defined(backbone_config.get("patch_size"), image_processor.get("patch_size")), 16)
+    vision_hidden = scalar_int(backbone_config.get("hidden_size"), 1024)
+    vision_layers = scalar_int(backbone_config.get("num_hidden_layers"), 1)
+    vision_heads = scalar_int(backbone_config.get("num_attention_heads"), 1)
+    fpn_hidden = scalar_int(vision_config.get("fpn_hidden_size"), 256)
+    text_hidden = scalar_int(text_config.get("hidden_size"), 0)
+    text_layers = scalar_int(text_config.get("num_hidden_layers"), 0)
+    default_height, default_width = infer_default_image_size(config, backbone_config, image_processor)
+    target_size = processor.get("target_size")
+    if isinstance(target_size, (int, float)):
+        default_height = default_width = clamp_int(target_size, default_height)
+    mask_size_config = image_processor.get("mask_size") if isinstance(image_processor.get("mask_size"), dict) else {}
+    mask_height = scalar_int(first_defined(mask_size_config.get("height"), config.get("low_res_mask_size")), 256)
+    mask_width = scalar_int(first_defined(mask_size_config.get("width"), config.get("low_res_mask_size")), mask_height)
+
+    batch = clamp_int(query.get("batch", [1])[0], 1, maximum=8)
+    frames = clamp_int(query.get("frames", [video_processor.get("num_frames") or 8])[0], video_processor.get("num_frames") or 8, maximum=1024)
+    image_height = clamp_int(query.get("image_height", [default_height])[0], default_height, maximum=4096)
+    image_width = clamp_int(query.get("image_width", [default_width])[0], default_width, maximum=4096)
+    object_count = clamp_int(query.get("objects", [1])[0], 1, maximum=256)
+    prompt_tokens = clamp_int(query.get("prompt_tokens", [16])[0], 16, maximum=512)
+    patch_rows = ceil_div(image_height, patch_size)
+    patch_cols = ceil_div(image_width, patch_size)
+    tokens_per_frame = patch_rows * patch_cols
+    total_vision_tokens = frames * tokens_per_frame
+    patch_width = 3 * patch_size * patch_size
+
+    lanes = [("inputs", "输入"), ("processing", "处理"), ("encoding", "编码"), ("tracking", "检测与跟踪"), ("output", "输出")]
+    nodes = [
+        build_node("video_input", "inputs", 0, "视频输入", "frames x RGB", "待检测与分割的视频帧。", shape(batch, frames, 3, image_height, image_width), shape(batch, frames, 3, image_height, image_width), [f"frames {frames}", f"{image_height}x{image_width}"], [detail("frames", frames), detail("height", image_height), detail("width", image_width)], [section("输入", [detail("video", shape(batch, frames, 3, image_height, image_width))])], "input"),
+        build_node("prompt_input", "inputs", 1, "提示输入", "text / points / masks", "文本、点、框或已有 mask 提示。", shape(batch, prompt_tokens), shape(batch, prompt_tokens), [f"prompts {prompt_tokens}", f"objects {object_count}"], [detail("prompt_tokens", prompt_tokens), detail("objects", object_count)], [section("提示", [detail("prompt sequence", shape(batch, prompt_tokens))])], "text"),
+        build_node("frame_processor", "processing", 0, "帧预处理", "resize / normalize / patch", "逐帧缩放并切分视觉 patch。", shape(batch, frames, 3, image_height, image_width), shape(batch, frames, tokens_per_frame, patch_width), [f"patch {patch_size}", f"tokens/frame {tokens_per_frame}"], [detail("patch_rows", patch_rows), detail("patch_cols", patch_cols), detail("tokens_per_frame", tokens_per_frame), detail("total_vision_tokens", total_vision_tokens)], [section("推导公式", [detail("tokens/frame", f"ceil({image_height}/{patch_size}) * ceil({image_width}/{patch_size}) = {tokens_per_frame}"), detail("all frames", f"{frames} * {tokens_per_frame} = {total_vision_tokens}")])], "vision"),
+        build_node("vision_encoder", "encoding", 0, "视觉主干", f"{vision_layers} layers / {vision_heads} heads", "逐帧提取视觉特征。", shape(batch, frames, tokens_per_frame, patch_width), shape(batch, frames, tokens_per_frame, vision_hidden), [f"hidden {vision_hidden}", f"layers {vision_layers}"], [detail("vision_hidden", vision_hidden), detail("layers", vision_layers), detail("heads", vision_heads)], [section("输出", [detail("frame features", shape(batch, frames, tokens_per_frame, vision_hidden))])], "vision"),
+        build_node("feature_pyramid", "encoding", 1, "特征金字塔", "multi-scale FPN", "将主干特征映射到检测与 mask 解码宽度。", shape(batch, frames, tokens_per_frame, vision_hidden), shape(batch, frames, tokens_per_frame, fpn_hidden), [f"fpn {fpn_hidden}"], [detail("fpn_hidden", fpn_hidden), detail("tokens_per_frame", tokens_per_frame)], [section("输出", [detail("multi-scale features", shape(batch, frames, tokens_per_frame, fpn_hidden))])], "vision"),
+        build_node("prompt_encoder", "encoding", 2, "提示编码器", f"text hidden {text_hidden or '?'}", "编码文本或几何提示。", shape(batch, prompt_tokens), shape(batch, prompt_tokens, fpn_hidden), [f"text layers {text_layers or '?'}"], [detail("text_hidden", text_hidden), detail("text_layers", text_layers), detail("prompt_output", shape(batch, prompt_tokens, fpn_hidden))], [section("提示特征", [detail("encoded prompts", shape(batch, prompt_tokens, fpn_hidden))])], "text"),
+        build_node("detector_tracker", "tracking", 0, "检测与时序记忆", "DETR + memory attention", "融合帧特征、提示和跨帧记忆，维护对象轨迹。", shape(batch, frames, tokens_per_frame, fpn_hidden), shape(batch, frames, object_count, fpn_hidden), [f"objects {object_count}", "temporal memory"], [detail("tracked_objects", object_count), detail("memory_hidden", fpn_hidden)], [section("跟踪状态", [detail("object states", shape(batch, frames, object_count, fpn_hidden))])], "core"),
+        build_node("mask_decoder", "output", 0, "Mask 解码器", f"low-res {mask_height}x{mask_width}", "生成低分辨率 mask 并上采样到输入尺寸。", shape(batch, frames, object_count, fpn_hidden), shape(batch, frames, object_count, image_height, image_width), [f"masks {object_count}", f"low-res {mask_height}x{mask_width}"], [detail("low_res_masks", shape(batch, frames, object_count, mask_height, mask_width)), detail("output_masks", shape(batch, frames, object_count, image_height, image_width))], [section("输出", [detail("segmentation masks", shape(batch, frames, object_count, image_height, image_width))])], "output"),
+    ]
+    edges = [
+        build_edge("video_input", "frame_processor", "video frames"),
+        build_edge("frame_processor", "vision_encoder", "patches"),
+        build_edge("vision_encoder", "feature_pyramid", "backbone features"),
+        build_edge("prompt_input", "prompt_encoder", "prompts"),
+        build_edge("feature_pyramid", "detector_tracker", "frame features"),
+        build_edge("prompt_encoder", "detector_tracker", "prompt features"),
+        build_edge("detector_tracker", "mask_decoder", "object states"),
+    ]
+    sources: list[str] = []
+    for source_name in ("config.json", "configuration.json", "processor_config.json"):
+        append_source_file(model_dir, sources, source_name)
+    return base_model_payload(
+        model_id,
+        "multimodal",
+        architecture,
+        f"视频检测与分割模型，每帧 {tokens_per_frame} 个视觉 patch token。",
+        [detail("类型", "视频分割"), detail("视觉隐藏维度", vision_hidden), detail("视觉层数", vision_layers), detail("patch size", patch_size), detail("每帧视觉 tokens", tokens_per_frame), detail("总视觉 tokens", total_vision_tokens), detail("输出 masks", object_count)],
+        [
+            {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 8, "step": 1, "help": "并行视频数"},
+            {"name": "frames", "label": "视频帧数", "type": "number", "value": frames, "min": 1, "max": 1024, "step": 1, "help": "当前处理帧数"},
+            {"name": "image_height", "label": "帧高", "type": "number", "value": image_height, "min": patch_size, "max": 4096, "step": patch_size, "help": "预处理后的帧高"},
+            {"name": "image_width", "label": "帧宽", "type": "number", "value": image_width, "min": patch_size, "max": 4096, "step": patch_size, "help": "预处理后的帧宽"},
+            {"name": "objects", "label": "对象数", "type": "number", "value": object_count, "min": 1, "max": 256, "step": 1, "help": "同时跟踪的对象数量"},
+            {"name": "prompt_tokens", "label": "提示 token", "type": "number", "value": prompt_tokens, "min": 1, "max": 512, "step": 1, "help": "文本或几何提示长度"},
+        ],
+        {"batch": batch, "frames": frames, "image_height": image_height, "image_width": image_width, "objects": object_count, "patch_size": patch_size, "tokens_per_frame": tokens_per_frame, "total_vision_tokens": total_vision_tokens},
+        build_graph(lanes, nodes, edges),
+        ["视觉 token 数按 patch 网格计算；FPN 的多尺度特征图数量与内部重采样细节未重复累加为独立 token。"],
+        sources,
+        "detector_tracker",
+    )
+
+
+def build_tts_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    config = primary_config(model_dir)
+    architecture = infer_architecture_name(model_dir, "multimodal")
+    language_config = config.get("language_config") if isinstance(config.get("language_config"), dict) else {}
+    hidden_size = scalar_int(language_config.get("hidden_size"), 2048)
+    num_layers = scalar_int(language_config.get("num_hidden_layers"), 1)
+    num_heads = scalar_int(language_config.get("num_attention_heads"), 1)
+    vocab_size = scalar_int(language_config.get("vocab_size"), 0)
+    n_vq = scalar_int(config.get("n_vq"), 1)
+    audio_vocab_size = scalar_int(config.get("audio_vocab_size"), 0)
+    sample_rate = scalar_int(config.get("sampling_rate"), 24000)
+    batch = clamp_int(query.get("batch", [1])[0], 1, maximum=16)
+    text_tokens = clamp_int(query.get("text_tokens", [256])[0], 256, maximum=8192)
+    audio_frames = clamp_int(query.get("audio_frames", [750])[0], 750, maximum=16384)
+    delayed_steps = audio_frames + max(n_vq - 1, 0)
+    total_steps = text_tokens + delayed_steps
+    prediction_heads = n_vq + 1
+
+    lanes = [("inputs", "输入"), ("processing", "处理"), ("backbone", "主干"), ("output", "输出")]
+    nodes = [
+        build_node("tts_text_input", "inputs", 0, "文本输入", "token ids", "待合成文本与控制提示。", shape(batch, text_tokens), shape(batch, text_tokens, hidden_size), [f"text {text_tokens}"], [detail("text_tokens", text_tokens), detail("hidden_size", hidden_size)], [section("输入", [detail("text hidden", shape(batch, text_tokens, hidden_size))])], "text"),
+        build_node("delay_pattern", "processing", 0, "Delay Pattern", f"{n_vq} RVQ codebooks", "对并行 RVQ 码本按 codebook 索引错位，形成延迟调度序列。", shape(batch, audio_frames, n_vq), shape(batch, delayed_steps, n_vq), [f"frames {audio_frames}", f"steps {delayed_steps}"], [detail("audio_frames", audio_frames), detail("n_vq", n_vq), detail("delay_steps", delayed_steps)], [section("推导公式", [detail("delayed steps", f"{audio_frames} + {n_vq} - 1 = {delayed_steps}")])], "audio"),
+        build_node("tts_backbone", "backbone", 0, "Transformer 主干", f"{num_layers} layers / {num_heads} heads", "单一语言主干联合建模文本与延迟音频序列。", shape(batch, total_steps, hidden_size), shape(batch, total_steps, hidden_size), [f"hidden {hidden_size}", f"steps {total_steps}"], [detail("text_tokens", text_tokens), detail("delayed_audio_steps", delayed_steps), detail("total_steps", total_steps)], [section("上下文", [detail("text + delayed audio", f"{text_tokens} + {delayed_steps} = {total_steps}")])], "core"),
+        build_node("parallel_heads", "output", 0, "并行预测头", f"{prediction_heads} heads", "一个文本头加多个 RVQ 音频码本头。", shape(batch, delayed_steps, hidden_size), shape(batch, delayed_steps, n_vq, audio_vocab_size or "audio_vocab"), [f"RVQ {n_vq}", f"audio vocab {audio_vocab_size or '?'}"], [detail("prediction_heads", prediction_heads), detail("audio_logits", shape(batch, delayed_steps, n_vq, audio_vocab_size or "audio_vocab")), detail("text_vocab", vocab_size)], [section("输出", [detail("parallel RVQ logits", shape(batch, delayed_steps, n_vq, audio_vocab_size or "audio_vocab"))])], "head"),
+        build_node("codec_decoder", "output", 1, "音频 Codec 解码", f"waveform @ {sample_rate} Hz", "将 RVQ code 还原为波形；配置未提供 codec hop，因此不伪造样本长度。", shape(batch, audio_frames, n_vq), shape(batch, "waveform_samples"), [f"{sample_rate} Hz"], [detail("codec_frames", audio_frames), detail("sample_rate", sample_rate)], [section("输出", [detail("waveform", shape(batch, "waveform_samples"))])], "output"),
+    ]
+    edges = [build_edge("tts_text_input", "tts_backbone", "text hidden"), build_edge("delay_pattern", "tts_backbone", "delayed audio tokens"), build_edge("tts_backbone", "parallel_heads", "hidden states"), build_edge("parallel_heads", "codec_decoder", "RVQ codes")]
+    sources: list[str] = []
+    for source_name in ("config.json", "configuration.json", "processor_config.json"):
+        append_source_file(model_dir, sources, source_name)
+    return base_model_payload(
+        model_id,
+        "multimodal",
+        architecture,
+        f"延迟模式 TTS，{audio_frames} 个 codec 帧展开为 {delayed_steps} 个解码步。",
+        [detail("类型", "语音合成"), detail("语言隐藏维度", hidden_size), detail("主干层数", num_layers), detail("RVQ 码本数", n_vq), detail("并行预测头", prediction_heads), detail("当前解码步", delayed_steps), detail("采样率", f"{sample_rate} Hz")],
+        [
+            {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 16, "step": 1, "help": "并行合成条数"},
+            {"name": "text_tokens", "label": "文本 token", "type": "number", "value": text_tokens, "min": 1, "max": 8192, "step": 1, "help": "输入文本与提示长度"},
+            {"name": "audio_frames", "label": "Codec 帧", "type": "number", "value": audio_frames, "min": 1, "max": 16384, "step": 1, "help": "目标音频 codec 帧数"},
+        ],
+        {"batch": batch, "text_tokens": text_tokens, "audio_frames": audio_frames, "n_vq": n_vq, "delayed_steps": delayed_steps, "total_steps": total_steps, "sample_rate": sample_rate},
+        build_graph(lanes, nodes, edges),
+        ["配置未包含 codec hop length，因此只展示确定的 codec 帧与 delay-pattern 步数，不把帧数强行换算成音频秒数。"],
+        sources,
+        "tts_backbone",
+    )
+
+
 def infer_default_image_size(config: dict[str, Any], vision_config: dict[str, Any], image_processor: dict[str, Any]) -> tuple[int, int]:
     candidate_resolutions = config.get("candidate_resolutions")
     if isinstance(candidate_resolutions, list) and candidate_resolutions:
         pair = candidate_resolutions[0]
-        if isinstance(pair, list) and len(pair) >= 2:
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
             return clamp_int(pair[0], 1024), clamp_int(pair[1], 1024)
 
-    image_size = vision_config.get("image_size")
-    if isinstance(image_size, (int, float)):
-        size = clamp_int(image_size, 1024)
+    size_config = image_processor.get("size") if isinstance(image_processor, dict) else None
+    if isinstance(size_config, (list, tuple)):
+        return spatial_pair(size_config, 1024)
+    if isinstance(size_config, dict):
+        height = size_config.get("height")
+        width = size_config.get("width")
+        if isinstance(height, (int, float)) or isinstance(width, (int, float)):
+            resolved_height = clamp_int(first_defined(height, width), 1024)
+            resolved_width = clamp_int(first_defined(width, height), 1024)
+            return resolved_height, resolved_width
+        shortest = size_config.get("shortest_edge")
+        if isinstance(shortest, (int, float)) and 1 <= shortest <= 4096:
+            size = clamp_int(shortest, 1024, maximum=4096)
+            return size, size
+
+    scale_resolution = first_defined(image_processor.get("scale_resolution"), image_processor.get("target_size"))
+    if isinstance(scale_resolution, (int, float)) and 1 <= scale_resolution <= 4096:
+        size = clamp_int(scale_resolution, 1024, maximum=4096)
         return size, size
 
-    size_config = image_processor.get("size") if isinstance(image_processor, dict) else None
-    if isinstance(size_config, dict):
-        shortest = first_defined(size_config.get("shortest_edge"), size_config.get("height"), size_config.get("width"))
-        if isinstance(shortest, (int, float)):
-            size = clamp_int(shortest, 1024)
-            return size, size
+    image_size = vision_config.get("image_size")
+    if isinstance(image_size, (list, tuple)):
+        return spatial_pair(image_size, 1024)
+    if isinstance(image_size, (int, float)) and 1 <= image_size <= 4096:
+        size = clamp_int(image_size, 1024, maximum=4096)
+        return size, size
 
     return 1024, 1024
 
@@ -1976,14 +2762,23 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     config = primary_config(model_dir)
     params_config = read_json_file(model_dir / "params.json")
     processor_config = read_json_file(model_dir / "processor_config.json")
+    image_processor_config = read_json_file(model_dir / "preprocessor_config.json")
     video_processor_config = read_json_file(model_dir / "video_preprocessor_config.json")
     architecture = infer_architecture_name(model_dir, "multimodal")
 
     text_config = first_defined(config.get("text_config"), config.get("language_config"), config, params_config) or {}
     vision_config = first_defined(config.get("vision_config"), params_config.get("vision_encoder"), {}) or {}
     projector_config = config.get("projector_config") if isinstance(config.get("projector_config"), dict) else {}
-    image_processor = processor_config.get("image_processor") if isinstance(processor_config.get("image_processor"), dict) else processor_config
+    image_processor = processor_config.get("image_processor") if isinstance(processor_config.get("image_processor"), dict) else processor_config or image_processor_config
     video_processor = processor_config.get("video_processor") if isinstance(processor_config.get("video_processor"), dict) else video_processor_config
+    audio_feature_extractor = processor_config.get("feature_extractor") if isinstance(processor_config.get("feature_extractor"), dict) else {}
+    image_compression = first_defined(
+        image_processor.get("img_token_compression_config"),
+        vision_config.get("img_token_compression_config"),
+        config.get("img_token_compression_config"),
+        {},
+    ) or {}
+    media_processor = image_processor.get("media_proc_cfg") if isinstance(image_processor.get("media_proc_cfg"), dict) else {}
 
     language_hidden = int(first_defined(text_config.get("hidden_size"), config.get("hidden_size"), params_config.get("dim"), projector_config.get("n_embed"), 2048) or 2048)
     num_layers = int(first_defined(text_config.get("num_hidden_layers"), config.get("num_hidden_layers"), params_config.get("n_layers"), 0) or 0)
@@ -1992,19 +2787,41 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     vocab_size = int(first_defined(text_config.get("vocab_size"), config.get("vocab_size"), params_config.get("vocab_size"), 0) or 0)
     max_position = int(first_defined(text_config.get("max_position_embeddings"), config.get("max_position_embeddings"), params_config.get("max_position_embeddings"), 8192) or 8192)
 
-    patch_size = int(first_defined(image_processor.get("patch_size"), vision_config.get("patch_size"), 16) or 16)
-    merge_size = int(first_defined(image_processor.get("merge_size"), vision_config.get("spatial_merge_size"), processor_config.get("downsample_ratio"), 1) or 1)
-    temporal_patch = int(first_defined(video_processor.get("temporal_patch_size"), image_processor.get("temporal_patch_size"), vision_config.get("temporal_patch_size"), 1) or 1)
+    nested_patch_size = max_nested_numeric(vision_config.get("width"), "patch_size") if isinstance(vision_config.get("width"), dict) else None
+    patch_size = scalar_int(first_defined(image_processor.get("patch_size"), media_processor.get("patch_size"), vision_config.get("patch_size"), nested_patch_size), 16)
+    merge_size = scalar_int(
+        first_defined(
+            image_processor.get("merge_size"),
+            image_processor.get("merge_kernel_size"),
+            media_processor.get("merge_kernel_size"),
+            image_compression.get("spatial_merge_size"),
+            vision_config.get("spatial_merge_size"),
+            processor_config.get("spatial_merge_size"),
+            config.get("spatial_merge_size"),
+            processor_config.get("downsample_ratio"),
+        ),
+        1,
+    )
+    temporal_patch = scalar_int(
+        first_defined(
+            video_processor.get("temporal_patch_size"),
+            image_processor.get("temporal_patch_size"),
+            media_processor.get("temporal_merge_kernel_size"),
+            image_compression.get("temporal_patch_size"),
+            vision_config.get("temporal_patch_size"),
+        ),
+        1,
+    )
     vision_hidden = int(
         first_defined(
-            vision_config.get("out_hidden_size"),
-            projector_config.get("input_dim"),
             vision_config.get("hidden_size"),
             max_nested_numeric(vision_config.get("width"), "width") if isinstance(vision_config.get("width"), dict) else None,
+            projector_config.get("input_dim"),
             language_hidden,
         )
         or language_hidden
     )
+    vision_output_hidden = int(first_defined(vision_config.get("out_hidden_size"), projector_config.get("input_dim"), vision_hidden) or vision_hidden)
     projector_hidden = int(first_defined(projector_config.get("n_embed"), vision_config.get("out_hidden_size"), language_hidden) or language_hidden)
     vision_depth = int(
         first_defined(
@@ -2017,30 +2834,80 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     )
 
     default_height, default_width = infer_default_image_size(config, vision_config, image_processor if isinstance(image_processor, dict) else {})
-    has_video = bool(config.get("video_token_id") or video_processor or video_processor_config or vision_config.get("temporal_patch_size"))
+    has_video = bool(
+        config.get("video_token_id")
+        or config.get("video_token_index")
+        or processor_config.get("video_token")
+        or video_processor
+        or video_processor_config
+        or vision_config.get("temporal_patch_size")
+        or image_compression.get("temporal_patch_size")
+        or media_processor.get("temporal_merge_kernel_size")
+    )
+    has_audio = bool(audio_feature_extractor)
+    modality_options = ["image"]
+    if has_video:
+        modality_options.extend(["video", "image+video"])
+    if has_audio:
+        modality_options.append("audio")
+    requested_modality = str(query.get("modality", [modality_options[0]])[0])
+    modality = requested_modality if requested_modality in modality_options else modality_options[0]
 
     batch = clamp_int(query.get("batch", [1])[0], 1)
     seq_len = clamp_int(query.get("seq_len", [min(max_position, 1024)])[0], min(max_position, 1024), maximum=max_position)
     image_height = clamp_int(query.get("image_height", [default_height])[0], default_height)
     image_width = clamp_int(query.get("image_width", [default_width])[0], default_width)
     frames = clamp_int(query.get("frames", [max(temporal_patch, 8)])[0], max(temporal_patch, 8))
+    audio_ms_per_token = scalar_int(processor_config.get("audio_ms_per_token"), 40)
+    max_audio_tokens = scalar_int(processor_config.get("audio_seq_length"), 0)
+    max_audio_seconds = max(ceil_div(max_audio_tokens * audio_ms_per_token, 1000), 1) if max_audio_tokens else 60
+    audio_seconds = clamp_int(query.get("audio_seconds", [min(max_audio_seconds, 30)])[0], min(max_audio_seconds, 30), maximum=max_audio_seconds)
+    audio_sample_rate = scalar_int(audio_feature_extractor.get("sampling_rate"), 16000)
+    audio_hop_length = scalar_int(audio_feature_extractor.get("hop_length"), max(audio_sample_rate // 100, 1))
+    audio_feature_size = scalar_int(audio_feature_extractor.get("feature_size"), 80)
+    audio_sample_count = audio_seconds * audio_sample_rate
+    audio_feature_frames = ceil_div(audio_sample_count, audio_hop_length)
+    calculated_audio_tokens = ceil_div(audio_seconds * 1000, audio_ms_per_token)
+    audio_token_count = min(calculated_audio_tokens, max_audio_tokens) if max_audio_tokens else calculated_audio_tokens
 
     image_patch_rows = ceil_div(image_height, patch_size)
     image_patch_cols = ceil_div(image_width, patch_size)
     image_patch_count = image_patch_rows * image_patch_cols
     merged_patch_rows = ceil_div(image_patch_rows, max(merge_size, 1))
     merged_patch_cols = ceil_div(image_patch_cols, max(merge_size, 1))
-    image_token_count = merged_patch_rows * merged_patch_cols
+    grid_image_token_count = merged_patch_rows * merged_patch_cols
+    fixed_image_tokens = scalar_int(
+        first_defined(
+            config.get("image_seq_length"),
+            config.get("vision_soft_tokens_per_image"),
+            config.get("image_token_len"),
+            image_processor.get("image_seq_length"),
+            processor_config.get("image_seq_length"),
+        ),
+        0,
+    )
+    image_token_count = fixed_image_tokens or grid_image_token_count
     video_frame_groups = ceil_div(frames, temporal_patch)
     video_patch_count = video_frame_groups * image_patch_rows * image_patch_cols
-    video_token_count = video_frame_groups * merged_patch_rows * merged_patch_cols
-    total_tokens = seq_len + image_token_count + (video_token_count if has_video else 0)
+    fixed_video_tokens_per_frame = scalar_int(first_defined(video_processor.get("max_soft_tokens"), video_processor.get("image_seq_length")), 0)
+    if fixed_video_tokens_per_frame:
+        video_token_count = frames * fixed_video_tokens_per_frame
+    elif fixed_image_tokens:
+        video_token_count = video_frame_groups * fixed_image_tokens
+    else:
+        video_token_count = video_frame_groups * grid_image_token_count
+    selected_image_tokens = image_token_count if modality in {"image", "image+video"} else 0
+    selected_video_tokens = video_token_count if modality in {"video", "image+video"} else 0
+    selected_audio_tokens = audio_token_count if modality == "audio" else 0
+    total_tokens = seq_len + selected_image_tokens + selected_video_tokens + selected_audio_tokens
     image_patch_width = 3 * patch_size * patch_size
     video_patch_width = image_patch_width * temporal_patch
 
     warnings = [
         "视觉 token 数根据 patch_size、merge_size 和当前分辨率估算，实际实现可能包含额外裁剪或动态采样。"
     ]
+    if fixed_image_tokens:
+        warnings.append(f"配置显式声明每图 {fixed_image_tokens} 个视觉 token，融合总量优先使用该值；patch 网格仅用于展示视觉编码过程。")
     layer_pattern = summarize_layer_pattern(text_config.get("layer_types"))
     if layer_pattern:
         warnings.append(f"文本主干层型摘要: {layer_pattern}。")
@@ -2107,7 +2974,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
             shape(batch, 3, image_height, image_width),
             shape(batch, image_patch_count, image_patch_width),
             [f"patches {image_patch_count}", f"merge {merge_size}"],
-            [detail("raw_patch_count", image_patch_count), detail("patch_feature_width", image_patch_width), detail("merged_token_count", image_token_count)],
+            [detail("raw_patch_count", image_patch_count), detail("patch_feature_width", image_patch_width), detail("merged_token_count", image_token_count), detail("grid_merged_token_count", grid_image_token_count), detail("effective_token_count", image_token_count)],
             [
                 section("预处理参数", [detail("merge_size", merge_size), detail("patch_size", patch_size)]),
                 section(
@@ -2115,7 +2982,8 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                     [
                         detail("raw patches", f"ceil({image_height}/{patch_size}) * ceil({image_width}/{patch_size}) = {image_patch_count}"),
                         detail("patch width", f"3 * {patch_size} * {patch_size} = {image_patch_width}"),
-                        detail("merged tokens", f"ceil({image_patch_rows}/{max(merge_size, 1)}) * ceil({image_patch_cols}/{max(merge_size, 1)}) = {image_token_count}"),
+                        detail("grid merged tokens", f"ceil({image_patch_rows}/{max(merge_size, 1)}) * ceil({image_patch_cols}/{max(merge_size, 1)}) = {grid_image_token_count}"),
+                        detail("effective tokens", fixed_image_tokens or "使用网格结果"),
                     ],
                 ),
             ],
@@ -2129,10 +2997,10 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
             f"{vision_depth or '?'} 层视觉主干",
             "将视觉 patch 编码到视觉隐藏空间。",
             shape(batch, image_patch_count, image_patch_width),
-            shape(batch, image_token_count, vision_hidden),
+            shape(batch, image_token_count, vision_output_hidden),
             [f"vision {vision_hidden}", f"tokens {image_token_count}"],
-            [detail("vision_hidden", vision_hidden), detail("vision_depth", vision_depth), detail("merged_tokens", image_token_count)],
-            [section("视觉流", [detail("encoder output", shape(batch, image_token_count, vision_hidden))])],
+            [detail("backbone_hidden", vision_hidden), detail("output_hidden", vision_output_hidden), detail("vision_depth", vision_depth), detail("merged_tokens", image_token_count)],
+            [section("视觉流", [detail("encoder output", shape(batch, image_token_count, vision_output_hidden))])],
             "vision",
         ),
         build_node(
@@ -2142,7 +3010,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
             "多模态投影",
             "vision -> language hidden",
             "把视觉特征映射到语言主干维度。",
-            shape(batch, image_token_count, vision_hidden),
+            shape(batch, image_token_count, vision_output_hidden),
             shape(batch, image_token_count, projector_hidden),
             [f"to {projector_hidden}", "projector"],
             [detail("projector_out", projector_hidden), detail("vision_tokens", image_token_count)],
@@ -2162,13 +3030,13 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
             shape(batch, seq_len, language_hidden),
             shape(batch, total_tokens, language_hidden),
             [f"total {total_tokens}", "fusion"],
-            [detail("text_tokens", seq_len), detail("image_tokens", image_token_count), detail("video_tokens", video_token_count if has_video else 0), detail("total_tokens", total_tokens)],
+            [detail("modality", modality), detail("text_tokens", seq_len), detail("image_tokens", selected_image_tokens), detail("video_tokens", selected_video_tokens), detail("audio_tokens", selected_audio_tokens), detail("total_tokens", total_tokens)],
             [
                 section("融合后序列", [detail("combined hidden", shape(batch, total_tokens, language_hidden))]),
                 section(
                     "推导公式",
                     [
-                        detail("token budget", f"text {seq_len} + image {image_token_count} + video {video_token_count if has_video else 0} = {total_tokens}"),
+                        detail("token budget", f"text {seq_len} + image {selected_image_tokens} + video {selected_video_tokens} + audio {selected_audio_tokens} = {total_tokens}"),
                         detail("fusion output", f"[B, total_tokens, H] = {shape(batch, total_tokens, language_hidden)}"),
                     ],
                 ),
@@ -2248,7 +3116,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                     shape(batch, frames, 3, image_height, image_width),
                     shape(batch, video_patch_count, video_patch_width),
                     [f"patches {video_patch_count}", f"tokens {video_token_count}"],
-                    [detail("frame_groups", video_frame_groups), detail("raw_patch_count", video_patch_count), detail("merged_token_count", video_token_count)],
+                    [detail("frame_groups", video_frame_groups), detail("raw_patch_count", video_patch_count), detail("merged_token_count", video_token_count), detail("effective_token_count", video_token_count)],
                     [
                         section("时空 patch", [detail("patch width", video_patch_width), detail("temporal_patch", temporal_patch)]),
                         section(
@@ -2256,7 +3124,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                             [
                                 detail("frame groups", f"ceil({frames}/{temporal_patch}) = {video_frame_groups}"),
                                 detail("raw patches", f"{video_frame_groups} * ceil({image_height}/{patch_size}) * ceil({image_width}/{patch_size}) = {video_patch_count}"),
-                                detail("merged tokens", f"{video_frame_groups} * ceil({image_patch_rows}/{max(merge_size, 1)}) * ceil({image_patch_cols}/{max(merge_size, 1)}) = {video_token_count}"),
+                                detail("effective video tokens", video_token_count),
                             ],
                         ),
                     ],
@@ -2270,10 +3138,10 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                     "时空特征编码",
                     "与视觉编码器共享或复用类似结构，将视频 patch 编码为 token。",
                     shape(batch, video_patch_count, video_patch_width),
-                    shape(batch, video_token_count, vision_hidden),
+                    shape(batch, video_token_count, vision_output_hidden),
                     [f"vision {vision_hidden}", f"tokens {video_token_count}"],
-                    [detail("vision_hidden", vision_hidden), detail("video_tokens", video_token_count)],
-                    [section("输出张量", [detail("video encoder output", shape(batch, video_token_count, vision_hidden))])],
+                    [detail("backbone_hidden", vision_hidden), detail("output_hidden", vision_output_hidden), detail("video_tokens", video_token_count)],
+                    [section("输出张量", [detail("video encoder output", shape(batch, video_token_count, vision_output_hidden))])],
                     "vision",
                 ),
                 build_node(
@@ -2283,11 +3151,59 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                     "视频投影",
                     "video -> language hidden",
                     "将视频特征映射到语言主干维度。",
-                    shape(batch, video_token_count, vision_hidden),
+                    shape(batch, video_token_count, vision_output_hidden),
                     shape(batch, video_token_count, projector_hidden),
                     [f"to {projector_hidden}", "projector"],
                     [detail("projector_out", projector_hidden), detail("video_tokens", video_token_count)],
                     [section("投影结果", [detail("projected video tokens", shape(batch, video_token_count, projector_hidden))])],
+                    "fusion",
+                ),
+            ]
+        )
+
+    if has_audio:
+        nodes.extend(
+            [
+                build_node(
+                    "audio_input",
+                    "inputs",
+                    3,
+                    "音频输入",
+                    f"{audio_sample_rate} Hz waveform",
+                    "通用多模态模型的音频输入分支。",
+                    shape(batch, audio_sample_count),
+                    shape(batch, audio_sample_count),
+                    [f"{audio_seconds}s", f"{audio_sample_rate} Hz"],
+                    [detail("samples", audio_sample_count), detail("duration_seconds", audio_seconds)],
+                    [section("输入", [detail("waveform", shape(batch, audio_sample_count))])],
+                    "audio",
+                ),
+                build_node(
+                    "audio_processor",
+                    "processing",
+                    3,
+                    "音频预处理",
+                    "log-mel / soft tokens",
+                    "先提取声学帧，再压缩到模型声明的音频 token 预算。",
+                    shape(batch, audio_sample_count),
+                    shape(batch, audio_feature_frames, audio_feature_size),
+                    [f"frames {audio_feature_frames}", f"tokens {audio_token_count}"],
+                    [detail("hop_length", audio_hop_length), detail("feature_frames", audio_feature_frames), detail("feature_size", audio_feature_size), detail("audio_ms_per_token", audio_ms_per_token), detail("audio_tokens", audio_token_count)],
+                    [section("推导公式", [detail("feature frames", f"ceil({audio_sample_count}/{audio_hop_length}) = {audio_feature_frames}"), detail("soft tokens", f"ceil({audio_seconds}*1000/{audio_ms_per_token}) = {calculated_audio_tokens}, cap {max_audio_tokens or 'none'} -> {audio_token_count}")])],
+                    "audio",
+                ),
+                build_node(
+                    "audio_projector",
+                    "fusion",
+                    3,
+                    "音频投影",
+                    "audio -> language hidden",
+                    "将声学表示映射为语言主干可消费的 soft tokens。",
+                    shape(batch, audio_feature_frames, audio_feature_size),
+                    shape(batch, audio_token_count, language_hidden),
+                    [f"tokens {audio_token_count}", f"to {language_hidden}"],
+                    [detail("audio_tokens", audio_token_count), detail("language_hidden", language_hidden)],
+                    [section("输出", [detail("projected audio tokens", shape(batch, audio_token_count, language_hidden))])],
                     "fusion",
                 ),
             ]
@@ -2481,11 +3397,20 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                 {"source": "video_projector", "target": "fusion_context", "label": "video tokens"},
             ]
         )
+    if has_audio:
+        edges.extend(
+            [
+                {"source": "audio_input", "target": "audio_processor", "label": "waveform"},
+                {"source": "audio_processor", "target": "audio_projector", "label": "audio features"},
+                {"source": "audio_projector", "target": "fusion_context", "label": "audio tokens"},
+            ]
+        )
 
     sources: list[str] = []
     append_source_file(model_dir, sources, "config.json")
     append_source_file(model_dir, sources, "configuration.json")
     append_source_file(model_dir, sources, "processor_config.json")
+    append_source_file(model_dir, sources, "preprocessor_config.json")
     append_source_file(model_dir, sources, "video_preprocessor_config.json")
     append_source_file(model_dir, sources, "params.json")
 
@@ -2493,12 +3418,15 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
         detail("类型", "多模态"),
         detail("语言隐藏维度", language_hidden),
         detail("视觉隐藏维度", vision_hidden),
+        detail("当前模态", modality),
         detail("主干层数", num_layers),
         detail("patch size", patch_size),
         detail("当前总 tokens", total_tokens),
     ]
     if has_video:
         summary.append(detail("视频", f"temporal patch {temporal_patch}"))
+    if has_audio:
+        summary.append(detail("音频", f"{audio_token_count} tokens / {audio_seconds}s"))
 
     controls = [
         {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 8, "step": 1, "help": "并行样本数"},
@@ -2506,8 +3434,12 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
         {"name": "image_height", "label": "图像高", "type": "number", "value": image_height, "min": patch_size, "max": 8192, "step": patch_size, "help": "输入图像高度"},
         {"name": "image_width", "label": "图像宽", "type": "number", "value": image_width, "min": patch_size, "max": 8192, "step": patch_size, "help": "输入图像宽度"},
     ]
+    if len(modality_options) > 1:
+        controls.insert(1, {"name": "modality", "label": "输入模态", "type": "select", "value": modality, "options": modality_options, "help": "只把当前选择的模态分支计入 token 总量"})
     if has_video:
         controls.append({"name": "frames", "label": "视频帧数", "type": "number", "value": frames, "min": temporal_patch, "max": 1024, "step": temporal_patch, "help": "采样到模型的帧数"})
+    if has_audio:
+        controls.append({"name": "audio_seconds", "label": "音频秒数", "type": "number", "value": audio_seconds, "min": 1, "max": max_audio_seconds, "step": 1, "help": "当前音频输入时长"})
 
     headline = f"多模态条件生成模型，语言隐藏维度 {language_hidden}，视觉 token 通过投影并入同一序列。"
     return base_model_payload(
@@ -2519,10 +3451,13 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
         controls,
         {
             "batch": batch,
+            "modality": modality,
             "seq_len": seq_len,
             "image_height": image_height,
             "image_width": image_width,
             "frames": frames if has_video else 0,
+            "audio_seconds": audio_seconds if has_audio else 0,
+            "audio_tokens": audio_token_count if has_audio else 0,
         },
         build_graph(lanes, nodes, edges),
         warnings,
@@ -3193,6 +4128,14 @@ def build_model_payload(model_id: str, query: dict[str, list[str]]) -> dict[str,
     if model_type == "llm":
         return build_llm_payload(model_dir, model_id, query)
     if model_type == "multimodal":
+        config = primary_config(model_dir)
+        yaml_config = supplemental_yaml_config(model_dir)
+        if is_asr_model_config(config, yaml_config):
+            return build_asr_payload(model_dir, model_id, query)
+        if is_sam_video_config(config):
+            return build_sam_video_payload(model_dir, model_id, query)
+        if is_tts_model_config(config):
+            return build_tts_payload(model_dir, model_id, query)
         return build_multimodal_payload(model_dir, model_id, query)
     if model_type == "diffusers":
         return build_diffusers_payload(model_dir, model_id, query)

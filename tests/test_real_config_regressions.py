@@ -93,3 +93,116 @@ def test_multimodal_merge_rounds_each_grid_axis():
     details = {item["label"]: item["value"] for item in processor["details"]}
     assert details["raw_patch_count"] == "225"
     assert details["merged_token_count"] == "64"
+
+
+def test_multimodal_pixel_bounds_are_not_image_edges_and_modality_is_selected():
+    image = s.build_model_payload("InternScience__Agents-A1", {})
+    assert image["parameters"]["image_height"] == 1024
+    assert image["parameters"]["image_width"] == 1024
+    assert image["parameters"]["modality"] == "image"
+    assert _summary(image)["当前总 tokens"] == "2048"
+
+    video = s.build_model_payload(
+        "InternScience__Agents-A1",
+        {"modality": ["video"]},
+    )
+    assert _summary(video)["当前总 tokens"] == "5120"
+
+
+def test_fixed_visual_tokens_and_nested_preprocessor_aliases():
+    diffusion_gemma = s.build_model_payload("google__diffusiongemma-26B-A4B-it", {})
+    assert _summary(diffusion_gemma)["当前总 tokens"] == "1304"
+    audio = s.build_model_payload(
+        "google__diffusiongemma-26B-A4B-it",
+        {"modality": ["audio"]},
+    )
+    assert audio["parameters"]["audio_tokens"] == 750
+    assert _summary(audio)["当前总 tokens"] == "1774"
+
+    minimax = s.build_model_payload("MiniMax__MiniMax-M3", {})
+    assert minimax["parameters"]["image_height"] == 672
+    assert _summary(minimax)["当前总 tokens"] == "1600"
+
+    mistral = s.build_model_payload("mistralai__Mistral-Medium-3.5-128B", {})
+    assert _summary(mistral)["当前总 tokens"] == "4049"
+    kimi = s.build_model_payload("moonshotai__Kimi-K2.6", {})
+    assert _summary(kimi)["当前总 tokens"] == "2393"
+    step = s.build_model_payload("stepfun-ai__Step-3.7-Flash", {})
+    assert _summary(step)["当前总 tokens"] == "1193"
+
+
+def test_audio_segmentation_and_tts_models_use_dedicated_payloads():
+    cohere = s.build_model_payload("CohereLabs__cohere-transcribe-03-2026", {})
+    assert _summary(cohere)["类型"] == "语音识别"
+    assert cohere["parameters"]["feature_frames"] == 3000
+    assert cohere["parameters"]["audio_tokens"] == 375
+    assert "image_input" not in {node["id"] for node in cohere["graph"]["nodes"]}
+    asr_logits = next(node for node in cohere["graph"]["nodes"] if node["id"] == "asr_logits")
+    assert asr_logits["outputShape"].endswith(", 16384]")
+
+    qwen = s.build_model_payload("Qwen__Qwen3-ASR-1.7B", {})
+    assert qwen["model"]["type"] == "multimodal"
+    assert qwen["parameters"]["audio_tokens"] == 1500
+
+    fun_asr = s.build_model_payload("FunAudioLLM__Fun-ASR-Nano-2512", {})
+    assert fun_asr["model"]["architecture"] == "FunASRNano"
+    assert fun_asr["parameters"]["audio_tokens"] == 500
+
+    sam = s.build_model_payload("facebook__sam3.1", {})
+    assert _summary(sam)["类型"] == "视频分割"
+    assert sam["parameters"]["patch_size"] == 14
+    assert sam["parameters"]["tokens_per_frame"] == 5184
+    assert "lm_head" not in {node["id"] for node in sam["graph"]["nodes"]}
+
+    moss = s.build_model_payload("openmoss__MOSS-TTS", {})
+    assert _summary(moss)["类型"] == "语音合成"
+    assert moss["parameters"]["n_vq"] == 32
+    assert moss["parameters"]["delayed_steps"] == 781
+
+
+def test_deepseek_v4_uses_compressed_mqa_and_mixed_precision_profile():
+    flash = s.build_model_payload(
+        "deepseek-ai__DeepSeek-V4-Flash",
+        {"seq_len": ["1048576"]},
+    )
+    metrics = flash["metrics"]
+    assert 284e9 <= metrics["total_params"] <= 285e9
+    assert 13e9 <= metrics["active_params"] <= 13.5e9
+    assert metrics["is_deepseek_v4"] is True
+    assert metrics["compress_ratios"].count(4) == 21
+    assert metrics["compress_ratios"].count(128) == 20
+    assert 6 * 1024**3 <= metrics["memory"]["kv_bytes"] <= 7 * 1024**3
+    assert metrics["memory"]["weight_format"] == "混合 FP4 experts + FP8 core"
+    assert 130 <= metrics["gflops_per_token"] <= 150
+    h100 = next(row for row in metrics["throughput"] if row["name"] == "H100 80G")
+    assert h100["compute_precision"] == "fp8"
+    assert 0.75 <= h100["active_bytes_per_param"] <= 0.76
+    bf16 = s.build_model_payload(
+        "deepseek-ai__DeepSeek-V4-Flash",
+        {"precision": ["bf16"]},
+    )["metrics"]["memory"]
+    assert bf16["weight_source"] == "parameter_estimate"
+    assert bf16["weight_format"] == "BF16"
+
+    pro = s.build_model_payload("deepseek-ai__DeepSeek-V4-Pro", {})["metrics"]
+    assert 1.56e12 <= pro["total_params"] <= 1.59e12
+    assert 48e9 <= pro["active_params"] <= 50e9
+
+
+def test_openpangu_sparse_attention_and_minimax_mtp_are_accounted():
+    pangu = s.build_model_payload(
+        "openpangu__openPangu-2.0-Flash",
+        {"seq_len": ["524288"]},
+    )["metrics"]
+    assert pangu["sparse_attention_layers"] == 16
+    assert pangu["sliding_attention_layers"] == 30
+    assert pangu["sparse_topk"] == 2048
+    assert 8 * 1024**3 <= pangu["memory"]["kv_bytes"] <= 10 * 1024**3
+    assert 60 <= pangu["gflops_per_token"] <= 70
+
+    minimax = s.build_model_payload("MiniMax__MiniMax-M2.7", {})["metrics"]
+    assert minimax["mtp_layers"] == 3
+    assert minimax["mtp_included"] == minimax["mtp_params"]
+    assert 239e9 <= minimax["total_params"] <= 241e9
+    assert 1.99 <= minimax["memory"]["checkpoint_bytes_per_param"] <= 2.02
+    assert minimax["memory"]["weight_format"] == "checkpoint≈BF16 / runtime FP8"

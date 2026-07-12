@@ -18,14 +18,15 @@ import pytest
 #   kv     : KV cache MiB per 1K tokens per batch element (rounded to .1)
 #   gflops : inference GFLOPs per token (rounded to .1)
 GOLDEN = {
-    # --- MLA + MoE (DeepSeek/GLM/LongCat/Hy3 family) ---
+    # --- MLA + MoE (GLM/LongCat/Hy3 family) ---
     "ZhipuAI__GLM-5.2-FP8": dict(total=743061061632, active=39982989312, kv=87.8, gflops=80.0),
     "ZhipuAI__GLM-5.2": dict(total=743061061632, active=39982989312, kv=87.8, gflops=80.0),
-    "deepseek-ai__DeepSeek-V4-Pro": dict(total=1592836423680, active=68691623936, kv=68.6, gflops=137.4),
+    # --- Compressed MQA + MoE (q/grouped-o low rank, CSA/HCA cache) ---
+    "deepseek-ai__DeepSeek-V4-Pro": dict(total=1572828279902, active=48683480158, kv=17.2, gflops=97.4),
     "meituan-longcat__LongCat-2.0-FP8": dict(total=1592105893888, active=51488227328, kv=42.8, gflops=103.0),
     "Tencent-Hunyuan__Hy3": dict(total=294970720256, active=20117979136, kv=320.0, gflops=40.2),
     # --- Standard GQA MoE (num_local_experts alias) ---
-    "MiniMax__MiniMax-M2.7": dict(total=228640161792, active=10366353408, kv=248.0, gflops=20.7),
+    "MiniMax__MiniMax-M2.7": dict(total=239643918336, active=10366353408, kv=248.0, gflops=20.7),
     # --- Dense GQA (bf16, exact vs checkpoint) ---
     "Qwen__Qwen3-8B": dict(total=8190427136, active=7568097280, kv=144.0, gflops=15.1),
     "Qwen__Qwen3-32B": dict(total=32761446400, active=31983534080, kv=256.0, gflops=64.0),
