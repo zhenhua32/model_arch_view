@@ -32,9 +32,9 @@ LLM_METRICS = _llm_dirs_with_metrics()
 
 @pytest.mark.parametrize("name,m", LLM_METRICS, ids=[n for n, _ in LLM_METRICS])
 def test_breakdown_sums_to_total(name, m):
-    """The five components must exactly reconstruct total_params."""
+    """All reported components must exactly reconstruct total_params."""
     bd = m["breakdown"]
-    assert set(bd) == {"attention", "routed_experts", "shared_experts", "dense_ffn", "embedding"}
+    assert set(bd) == {"attention", "routed_experts", "shared_experts", "dense_ffn", "embedding", "mtp"}
     assert sum(bd.values()) == m["total_params"]
     assert all(v >= 0 for v in bd.values())
 

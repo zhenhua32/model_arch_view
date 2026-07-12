@@ -74,3 +74,23 @@ def test_bigger_gpu_needs_fewer_cards():
 def test_unknown_precision_falls_back_to_bf16():
     r = s.estimate_memory_footprint(base_metrics(), "float3", 1, 2048)
     assert r["precision"] == "bf16"
+
+
+def test_sliding_layers_cap_kv_cache():
+    metrics = base_metrics(
+        kv_bytes_per_token=28 * 2048,
+        kv_bytes_per_token_per_layer=2048,
+        num_layers=28,
+        full_attention_layers=7,
+        sliding_attention_layers=21,
+        sliding_window=1024,
+    )
+    result = s.estimate_memory_footprint(metrics, "bf16", 1, 131072)
+    expected = 2048 * (7 * 131072 + 21 * 1024)
+    assert result["kv_bytes"] == expected
+
+
+def test_activation_workspace_is_reused_across_layers():
+    one_layer = s.estimate_memory_footprint(base_metrics(num_layers=1), "bf16", 1, 2048)
+    many_layers = s.estimate_memory_footprint(base_metrics(num_layers=80), "bf16", 1, 2048)
+    assert one_layer["activation_bytes"] == many_layers["activation_bytes"]

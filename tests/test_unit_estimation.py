@@ -278,3 +278,66 @@ def test_flops_is_twice_active_params():
     m = s.estimate_llm_metrics(s.parse_llm_dims(cfg))
     assert m["gflops_per_token"] == pytest.approx(2 * m["active_params"] / 1e9)
     assert not math.isnan(m["gflops_per_token"])
+
+
+def test_shared_expert_alias_and_width_are_respected():
+    cfg = {
+        "hidden_size": 1024,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "head_dim": 128,
+        "moe_intermediate_size": 512,
+        "moe_shared_expert_intermediate_size": 768,
+        "num_experts": 16,
+        "num_experts_per_tok": 2,
+        "num_shared_experts": 1,
+        "vocab_size": 10000,
+    }
+    dims = s.parse_llm_dims(cfg)
+    metrics = s.estimate_llm_metrics(dims)
+    assert dims["n_shared_experts"] == 1
+    assert dims["shared_ffn_hidden"] == 768
+    assert metrics["shared_expert_params"] == 3 * 1024 * 768
+    assert metrics["breakdown"]["shared_experts"] == 4 * 3 * 1024 * 768
+
+
+def test_longcat_aliases_enable_topk_cli_and_mtp():
+    cfg = {
+        "hidden_size": 1024,
+        "num_layers": 4,
+        "num_attention_heads": 8,
+        "head_dim": 128,
+        "expert_ffn_hidden_size": 512,
+        "n_routed_experts": 16,
+        "moe_topk": 3,
+        "cli_factor": 2,
+        "mtp_num_layers": 2,
+        "vocab_size": 10000,
+    }
+    dims = s.parse_llm_dims(cfg)
+    metrics = s.estimate_llm_metrics(dims)
+    assert dims["experts_per_tok"] == 3
+    assert metrics["effective_experts_per_tok"] == 6
+    assert metrics["mtp_layers"] == 2
+    assert metrics["breakdown"]["mtp"] == metrics["mtp_params"] > 0
+
+
+def test_encoder_uses_two_projection_ffn_without_lm_head_or_kv():
+    cfg = {
+        "architectures": ["XLMRobertaModel"],
+        "model_type": "xlm-roberta",
+        "hidden_size": 1024,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+        "intermediate_size": 4096,
+        "max_position_embeddings": 8194,
+        "type_vocab_size": 1,
+        "vocab_size": 250002,
+    }
+    dims = s.parse_llm_dims(cfg)
+    metrics = s.estimate_llm_metrics(dims)
+    assert dims["ffn_projection_count"] == 2
+    assert dims["has_output_head"] is False
+    assert metrics["output_head_params"] == 0
+    assert metrics["kv_cache_mb_per_1k"] is None
+    assert metrics["total_params"] == 566_383_616

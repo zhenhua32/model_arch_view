@@ -78,6 +78,24 @@ def scalar_int(value: Any, default: int = 1) -> int:
     return parsed if parsed > 0 else default
 
 
+def spatial_pair(value: Any, default: int = 1) -> tuple[int, int]:
+    if isinstance(value, (list, tuple)):
+        if len(value) >= 2:
+            return scalar_int(value[-2], default), scalar_int(value[-1], default)
+        if len(value) == 1:
+            size = scalar_int(value[0], default)
+            return size, size
+        return default, default
+    size = scalar_int(value, default)
+    return size, size
+
+
+def temporal_patch_size(value: Any, default: int = 1) -> int:
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        return scalar_int(value[0], default)
+    return default
+
+
 def ceil_div(numerator: int, denominator: int) -> int:
     if denominator <= 0:
         return numerator
@@ -306,6 +324,29 @@ def derive_vae_scale(vae_config: dict[str, Any]) -> int:
     return 8
 
 
+def derive_vae_spatial_scales(vae_config: dict[str, Any]) -> tuple[int, int]:
+    base_scale = derive_vae_scale(vae_config)
+    patch_height, patch_width = spatial_pair(vae_config.get("patch_size"), 1)
+    explicit = vae_config.get("spatial_compression_ratio")
+    if isinstance(explicit, (int, float)) and explicit > 0:
+        return int(explicit), int(explicit)
+    return base_scale * patch_height, base_scale * patch_width
+
+
+def derive_vae_temporal_scale(vae_config: dict[str, Any]) -> int:
+    explicit = first_defined(
+        vae_config.get("temporal_compression_ratio"),
+        vae_config.get("time_compression_ratio"),
+        vae_config.get("temporal_downsample_factor"),
+    )
+    if isinstance(explicit, (int, float)) and explicit > 0:
+        return int(explicit)
+    downsample_flags = first_defined(vae_config.get("temporal_downsample"), vae_config.get("temperal_downsample"))
+    if isinstance(downsample_flags, list):
+        return 2 ** sum(bool(item) for item in downsample_flags)
+    return 1
+
+
 def build_edge(source: str, target: str, label: str, view_modes: list[str] | None = None) -> dict[str, Any]:
     return {
         "source": source,
@@ -329,8 +370,41 @@ def summarize_layer_pattern(layer_types: Any) -> str | None:
     if not isinstance(layer_types, list) or not layer_types:
         return None
     full_attention = sum(1 for item in layer_types if "full" in str(item))
+    sliding_attention = sum(1 for item in layer_types if "sliding" in str(item) or "local" in str(item))
     linear_attention = sum(1 for item in layer_types if "linear" in str(item))
-    return f"linear={linear_attention}, full={full_attention}"
+    return f"linear={linear_attention}, sliding={sliding_attention}, full={full_attention}"
+
+
+_ENCODER_ONLY_MODEL_TYPES = {
+    "bert",
+    "deberta",
+    "deberta-v2",
+    "electra",
+    "roberta",
+    "xlm-roberta",
+}
+
+
+def _first_architecture(config: dict[str, Any]) -> str:
+    architectures = config.get("architectures")
+    if isinstance(architectures, list) and architectures:
+        return str(architectures[0])
+    return ""
+
+
+def _attention_layer_counts(layer_types: Any, num_layers: int, use_sliding_window: bool) -> tuple[int, int, int]:
+    if isinstance(layer_types, list) and layer_types:
+        normalized = [str(item).lower() for item in layer_types[:num_layers]]
+        full = sum("full" in item for item in normalized)
+        sliding_candidates = sum("sliding" in item or "local" in item for item in normalized)
+        sliding = sliding_candidates if use_sliding_window else 0
+        full += 0 if use_sliding_window else sliding_candidates
+        linear = sum("linear" in item for item in normalized)
+        unclassified = max(num_layers - full - sliding - linear, 0)
+        return full + unclassified, sliding, linear
+    if use_sliding_window:
+        return 0, num_layers, 0
+    return num_layers, 0, 0
 
 
 def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -342,6 +416,11 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     """
     params_config = params_config or {}
     moe_config = params_config.get("moe") if isinstance(params_config.get("moe"), dict) else {}
+    architecture = _first_architecture(config)
+    model_type = str(config.get("model_type") or "").lower()
+    encoder_only = model_type in _ENCODER_ONLY_MODEL_TYPES or (
+        architecture.endswith("Model") and not any(marker in architecture for marker in ("CausalLM", "ConditionalGeneration", "LMHead"))
+    )
 
     hidden_size = int(first_defined(config.get("hidden_size"), params_config.get("dim"), 0) or 0)
     num_layers = int(first_defined(config.get("num_hidden_layers"), config.get("num_layers"), params_config.get("n_layers"), 0) or 0)
@@ -352,11 +431,42 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     vocab_size = int(first_defined(config.get("vocab_size"), params_config.get("vocab_size"), 0) or 0)
 
     num_experts = int(first_defined(config.get("n_routed_experts"), config.get("num_experts"), config.get("num_local_experts"), moe_config.get("num_experts"), 0) or 0)
-    experts_per_tok = int(first_defined(config.get("num_experts_per_tok"), moe_config.get("num_experts_per_tok"), 0) or 0)
+    experts_per_tok = int(first_defined(config.get("num_experts_per_tok"), config.get("moe_topk"), moe_config.get("num_experts_per_tok"), moe_config.get("moe_topk"), 0) or 0)
     moe_ffn_hidden = int(first_defined(config.get("moe_intermediate_size"), config.get("expert_ffn_hidden_size"), moe_config.get("moe_intermediate_size"), 0) or 0)
-    n_shared_experts = int(first_defined(config.get("n_shared_experts"), moe_config.get("n_shared_experts"), 0) or 0)
+    explicit_shared_dim = first_defined(
+        config.get("shared_expert_intermediate_size"),
+        config.get("moe_shared_expert_intermediate_size"),
+        moe_config.get("shared_expert_intermediate_size"),
+        moe_config.get("moe_shared_expert_intermediate_size"),
+    )
+    n_shared_experts = int(first_defined(
+        config.get("n_shared_experts"),
+        config.get("num_shared_experts"),
+        moe_config.get("n_shared_experts"),
+        moe_config.get("num_shared_experts"),
+        1 if explicit_shared_dim is not None else 0,
+    ) or 0)
+    shared_ffn_hidden = int(first_defined(explicit_shared_dim, moe_ffn_hidden, 0) or 0)
     first_k_dense = int(first_defined(config.get("first_k_dense_replace"), config.get("n_dense_layers"), 0) or 0)
     tie_word_embeddings = bool(first_defined(config.get("tie_word_embeddings"), params_config.get("tie_word_embeddings"), False))
+    ffn_projection_count = 2 if encoder_only else 3
+    active_expert_multiplier = max(int(first_defined(config.get("cli_factor"), 1) or 1), 1)
+    mtp_layers = int(first_defined(config.get("mtp_num_layers"), config.get("num_nextn_predict_layers"), 0) or 0)
+    include_mtp_in_total = bool(config.get("mtp_num_layers"))
+
+    max_position_embeddings = int(first_defined(config.get("max_position_embeddings"), params_config.get("max_position_embeddings"), 0) or 0)
+    position_embedding_params = hidden_size * max_position_embeddings if encoder_only and config.get("position_embedding_type", "absolute") == "absolute" else 0
+    token_type_vocab_size = int(first_defined(config.get("type_vocab_size"), 0) or 0)
+    token_type_embedding_params = hidden_size * token_type_vocab_size if encoder_only else 0
+
+    sliding_window = int(first_defined(config.get("sliding_window"), config.get("sliding_window_size"), params_config.get("sliding_window_size"), 0) or 0)
+    layer_types = config.get("layer_types")
+    layer_types_enable_sliding = isinstance(layer_types, list) and any("sliding" in str(item).lower() or "local" in str(item).lower() for item in layer_types)
+    explicit_sliding = config.get("use_sliding_window")
+    use_sliding_window = bool(explicit_sliding) if explicit_sliding is not None else layer_types_enable_sliding
+    full_attention_layers, sliding_attention_layers, linear_attention_layers = _attention_layer_counts(
+        layer_types, num_layers, use_sliding_window
+    )
 
     q_lora_rank = int(first_defined(config.get("q_lora_rank"), 0) or 0)
     kv_lora_rank = int(first_defined(config.get("kv_lora_rank"), config.get("kv_lora_a"), 0) or 0)
@@ -385,26 +495,61 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
         "experts_per_tok": experts_per_tok,
         "moe_ffn_hidden": moe_ffn_hidden,
         "n_shared_experts": n_shared_experts,
+        "shared_ffn_hidden": shared_ffn_hidden,
         "first_k_dense": first_k_dense,
         "tie_word_embeddings": tie_word_embeddings,
+        "ffn_projection_count": ffn_projection_count,
+        "has_output_head": not encoder_only,
+        "position_embedding_params": position_embedding_params,
+        "token_type_embedding_params": token_type_embedding_params,
+        "active_expert_multiplier": active_expert_multiplier,
+        "mtp_layers": mtp_layers,
+        "include_mtp_in_total": include_mtp_in_total,
+        "sliding_window": sliding_window if use_sliding_window else 0,
+        "use_sliding_window": use_sliding_window,
+        "full_attention_layers": full_attention_layers,
+        "sliding_attention_layers": sliding_attention_layers,
+        "linear_attention_layers": linear_attention_layers,
         "q_lora_rank": q_lora_rank,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
         "qk_nope_head_dim": qk_nope_head_dim,
         "qk_head_dim": qk_head_dim,
         "v_head_dim": v_head_dim,
-        "is_mla": q_lora_rank > 0,
+        "is_mla": q_lora_rank > 0 or kv_lora_rank > 0 or bool(config.get("use_mla")) or str(config.get("attention_method", "")).upper() == "MLA",
     }
 
 
-def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
+def _visible_token_pairs(seq_len: int, window: int = 0) -> int:
+    if seq_len <= 0:
+        return 0
+    if window <= 0 or window >= seq_len:
+        return seq_len * (seq_len + 1) // 2
+    return window * (window + 1) // 2 + (seq_len - window) * window
+
+
+def _context_layer_tokens(metrics: dict[str, Any], seq_len: int) -> int:
+    full_layers = int(metrics.get("full_attention_layers", metrics.get("num_layers", 0)) or 0)
+    sliding_layers = int(metrics.get("sliding_attention_layers", 0) or 0)
+    window = int(metrics.get("sliding_window", 0) or 0)
+    return full_layers * seq_len + sliding_layers * min(seq_len, window or seq_len)
+
+
+def _kv_cache_bytes(metrics: dict[str, Any], seq_len: int, batch: int = 1) -> int:
+    per_layer = int(metrics.get("kv_bytes_per_token_per_layer", 0) or 0)
+    if per_layer <= 0:
+        return int(metrics.get("kv_bytes_per_token", 0) or 0) * seq_len * batch
+    return per_layer * _context_layer_tokens(metrics, seq_len) * batch
+
+
+def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, Any] | None:
     """Estimate parameter count, KV-cache size and per-token FLOPs from parsed dims.
 
     Returns ``None`` when the config lacks the minimum required fields
     (``hidden_size`` and ``num_layers``). All returned figures are raw numbers:
       - total_params / active_params: parameter counts
       - kv_cache_mb_per_1k: MiB of KV cache per 1K tokens per batch element
-      - gflops_per_token: 2 * active_params / 1e9
+      - gflops_per_token: linear weights plus context-dependent QK/AV work
     plus a per-component breakdown for white-box assertions.
     """
     hidden_size = dims["hidden_size"]
@@ -421,8 +566,14 @@ def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
     experts_per_tok = dims["experts_per_tok"]
     moe_ffn_hidden = dims["moe_ffn_hidden"]
     n_shared_experts = dims["n_shared_experts"]
+    shared_ffn_hidden = dims["shared_ffn_hidden"]
     first_k_dense = dims["first_k_dense"]
     tie_word_embeddings = dims["tie_word_embeddings"]
+    ffn_projection_count = dims["ffn_projection_count"]
+    has_output_head = dims["has_output_head"]
+    active_expert_multiplier = dims["active_expert_multiplier"]
+    mtp_layers = dims["mtp_layers"]
+    include_mtp_in_total = dims["include_mtp_in_total"]
     is_mla = dims["is_mla"]
     q_lora_rank = dims["q_lora_rank"]
     kv_lora_rank = dims["kv_lora_rank"]
@@ -453,7 +604,7 @@ def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
 
     # ---- FFN / MoE params ----
     dense_ffn_dim = ffn_hidden or (hidden_size * 4)
-    dense_ffn_params = 3 * hidden_size * dense_ffn_dim
+    dense_ffn_params = ffn_projection_count * hidden_size * dense_ffn_dim
     # Per-component FFN totals (total-parameter convention) for the breakdown chart.
     expert_params = 0
     n_dense_layers = 0
@@ -463,10 +614,11 @@ def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
     dense_ffn_total = 0
     if num_experts:
         expert_dim = moe_ffn_hidden or dense_ffn_dim
-        expert_params = 3 * hidden_size * expert_dim
+        expert_params = ffn_projection_count * hidden_size * expert_dim
         routed_total = expert_params * num_experts
-        routed_active = expert_params * experts_per_tok if experts_per_tok else expert_params
-        shared_params = expert_params * n_shared_experts  # always active
+        routed_active = expert_params * (experts_per_tok or 1) * active_expert_multiplier
+        shared_expert_params = ffn_projection_count * hidden_size * (shared_ffn_hidden or expert_dim)
+        shared_params = shared_expert_params * n_shared_experts
         n_dense_layers = min(first_k_dense, num_layers) if first_k_dense else 0
         n_moe_layers = num_layers - n_dense_layers
         routed_experts_total = n_moe_layers * routed_total
@@ -477,32 +629,64 @@ def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
     else:
         ffn_total = ffn_active = num_layers * dense_ffn_params
         dense_ffn_total = ffn_total
+        shared_expert_params = 0
 
     embed_params = hidden_size * (vocab_size or 0)
-    embed_total = embed_params if tie_word_embeddings else embed_params * 2
+    output_head_params = embed_params if has_output_head else 0
+    output_head_total = 0 if tie_word_embeddings else output_head_params
+    embed_total = embed_params + output_head_total + dims["position_embedding_params"] + dims["token_type_embedding_params"]
     attn_total = attn_params * num_layers
-    total_params = attn_total + ffn_total + embed_total
-    active_params = attn_total + ffn_active + embed_params
+    mtp_ffn_params = routed_total + shared_params if num_experts else dense_ffn_params
+    mtp_params = mtp_layers * (attn_params + mtp_ffn_params)
+    mtp_included = mtp_params if include_mtp_in_total else 0
+    total_params = attn_total + ffn_total + embed_total + mtp_included
+    active_params = attn_total + ffn_active + output_head_params
 
     # ---- KV cache (per 1K tokens per batch element) ----
-    kv_cache_mb_per_1k: float | None = None
     kv_bytes_per_token = 0  # raw per-token KV bytes (bf16), reused by memory estimator
-    if is_mla:
-        kv_elems = num_layers * ((kv_lora_rank or head_dim) + qk_rope_head_dim)
-        kv_bytes_per_token = kv_elems * 2  # latent stored in bf16
-        kv_cache_mb_per_1k = kv_bytes_per_token * 1024 / (1024 * 1024)
-    elif num_kv_heads and head_dim:
-        kv_bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * 2  # K+V, fp16
-        kv_cache_mb_per_1k = kv_bytes_per_token * 1024 / (1024 * 1024)
+    kv_bytes_per_token_per_layer = 0
+    cache_layer_count = dims["full_attention_layers"] + dims["sliding_attention_layers"]
+    if has_output_head and is_mla:
+        kv_bytes_per_token_per_layer = ((kv_lora_rank or head_dim) + qk_rope_head_dim) * 2
+        kv_bytes_per_token = cache_layer_count * kv_bytes_per_token_per_layer
+    elif has_output_head and num_kv_heads and head_dim:
+        kv_bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * 2
+        kv_bytes_per_token = cache_layer_count * kv_bytes_per_token_per_layer
 
-    return {
+    qk_width = num_heads * ((qk_head_dim or head_dim) if is_mla else head_dim)
+    v_width = num_heads * ((v_head_dim or head_dim) if is_mla else head_dim)
+    linear_flops_per_token = 2 * active_params
+    full_attention_layers = dims["full_attention_layers"]
+    sliding_attention_layers = dims["sliding_attention_layers"]
+    sliding_window = dims["sliding_window"]
+    context_layer_tokens = full_attention_layers * seq_len + sliding_attention_layers * min(seq_len, sliding_window or seq_len)
+    attention_flops_per_token = 2 * (qk_width + v_width) * context_layer_tokens if seq_len else 0
+
+    metrics = {
         "total_params": total_params,
         "active_params": active_params,
-        "kv_cache_mb_per_1k": kv_cache_mb_per_1k,
         "kv_bytes_per_token": kv_bytes_per_token,
-        "gflops_per_token": 2 * active_params / 1e9,
+        "kv_bytes_per_token_per_layer": kv_bytes_per_token_per_layer,
+        "linear_flops_per_token": linear_flops_per_token,
+        "attention_flops_per_token": attention_flops_per_token,
+        "gflops_per_token": (linear_flops_per_token + attention_flops_per_token) / 1e9,
         "hidden_size": hidden_size,
         "num_layers": num_layers,
+        "qk_width": qk_width,
+        "v_width": v_width,
+        "full_attention_layers": full_attention_layers,
+        "sliding_attention_layers": sliding_attention_layers,
+        "linear_attention_layers": dims["linear_attention_layers"],
+        "sliding_window": sliding_window,
+        "causal_attention": has_output_head,
+        "mtp_params": mtp_params,
+        "mtp_included": mtp_included,
+        "mtp_layers": mtp_layers,
+        "output_head_params": output_head_params,
+        "position_embedding_params": dims["position_embedding_params"],
+        "token_type_embedding_params": dims["token_type_embedding_params"],
+        "shared_expert_params": shared_expert_params,
+        "effective_experts_per_tok": (experts_per_tok or 1) * active_expert_multiplier if num_experts else 0,
         # component breakdown (white-box + chart). sum(breakdown) == total_params.
         "attn_params_per_layer": attn_params,
         "ffn_total": ffn_total,
@@ -519,18 +703,34 @@ def estimate_llm_metrics(dims: dict[str, Any]) -> dict[str, Any] | None:
             "shared_experts": shared_experts_total,
             "dense_ffn": dense_ffn_total,
             "embedding": embed_total,
+            "mtp": mtp_included,
         },
     }
+    kv_cache_bytes_per_1k = _kv_cache_bytes(metrics, 1024)
+    metrics["kv_cache_mb_per_1k"] = kv_cache_bytes_per_1k / (1024 * 1024) if kv_bytes_per_token_per_layer else None
+    return metrics
 
 
 # ---- Deployment estimation reference tables --------------------------------
 # Approximate spec sheet values; centralised so they are easy to tweak.
 # bf16_tflops = dense bf16 tensor-core peak; bw_gbs = HBM bandwidth (GB/s).
 GPU_REFERENCE = [
-    {"name": "RTX 4090", "mem_gb": 24, "bf16_tflops": 165, "bw_gbs": 1008},
-    {"name": "A100 80G", "mem_gb": 80, "bf16_tflops": 312, "bw_gbs": 2039},
-    {"name": "H100 80G", "mem_gb": 80, "bf16_tflops": 990, "bw_gbs": 3350},
-    {"name": "H200 141G", "mem_gb": 141, "bf16_tflops": 990, "bw_gbs": 4800},
+    {
+        "name": "RTX 4090", "mem_gb": 24, "bf16_tflops": 165, "bw_gbs": 1008,
+        "compute_tops": {"bf16": 165, "fp16": 165, "fp8": 330, "int8": 661, "int4": 1321},
+    },
+    {
+        "name": "A100 80G", "mem_gb": 80, "bf16_tflops": 312, "bw_gbs": 2039,
+        "compute_tops": {"bf16": 312, "fp16": 312, "fp8": 312, "int8": 624, "int4": 1248},
+    },
+    {
+        "name": "H100 80G", "mem_gb": 80, "bf16_tflops": 990, "bw_gbs": 3350,
+        "compute_tops": {"bf16": 990, "fp16": 990, "fp8": 1979, "int8": 1979, "int4": 3958},
+    },
+    {
+        "name": "H200 141G", "mem_gb": 141, "bf16_tflops": 990, "bw_gbs": 4800,
+        "compute_tops": {"bf16": 990, "fp16": 990, "fp8": 1979, "int8": 1979, "int4": 3958},
+    },
 ]
 
 # Bytes per stored parameter for each weight precision.
@@ -540,8 +740,48 @@ PRECISION_BYTES = {"bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.0, "int4": 0.
 # utilisation used for the theoretical throughput ceiling.
 _VRAM_USABLE = 0.90
 _MFU = 0.40
-# Coarse per-token activation footprint factor (very approximate).
-_ACT_FACTOR = 2
+# Coarse single-layer prefill workspace factor. Intermediate buffers are reused
+# between layers during inference, so this deliberately does not multiply by L.
+_ACT_FACTOR = 8
+
+
+def infer_weight_precision(config: dict[str, Any], params_config: dict[str, Any] | None = None) -> str:
+    params_config = params_config or {}
+    quant_payload = {
+        "quantization_config": config.get("quantization_config"),
+        "compression_config": config.get("compression_config"),
+        "quantization": params_config.get("quantization"),
+        "torch_dtype": config.get("torch_dtype"),
+        "dtype": first_defined(config.get("dtype"), params_config.get("dtype")),
+    }
+    text = json.dumps(quant_payload, ensure_ascii=False).lower()
+    if any(marker in text for marker in ("mxfp4", "fp4", "int4", "w4a16", "4-bit", "4bit")):
+        return "int4"
+    if any(marker in text for marker in ("int8", "w8a8", "int-quantized")):
+        return "int8"
+    if any(marker in text for marker in ("fp8", "float8", "e4m3", "e5m2")):
+        return "fp8"
+    if "float16" in text and "bfloat16" not in text:
+        return "fp16"
+    return "bf16"
+
+
+def _gpu_compute_tops(gpu: dict[str, Any], precision: str) -> float:
+    compute_tops = gpu.get("compute_tops") if isinstance(gpu.get("compute_tops"), dict) else {}
+    return float(compute_tops.get(precision, gpu["bf16_tflops"]))
+
+
+def _prefill_attention_flops(metrics: dict[str, Any], seq_len: int) -> int:
+    qk_width = int(metrics.get("qk_width", 0) or 0)
+    v_width = int(metrics.get("v_width", 0) or 0)
+    if not qk_width and not v_width:
+        return 0
+    full_layers = int(metrics.get("full_attention_layers", metrics.get("num_layers", 0)) or 0)
+    sliding_layers = int(metrics.get("sliding_attention_layers", 0) or 0)
+    window = int(metrics.get("sliding_window", 0) or 0)
+    visible_pairs = full_layers * _visible_token_pairs(seq_len)
+    visible_pairs += sliding_layers * _visible_token_pairs(seq_len, window)
+    return 2 * (qk_width + v_width) * visible_pairs
 
 
 def estimate_memory_footprint(
@@ -555,20 +795,21 @@ def estimate_memory_footprint(
     All figures are theoretical approximations:
       - weights  = total_params * bytes/param(precision)
       - kv_cache = kv_bytes_per_token * seq_len * batch (KV kept in bf16)
-      - activation ~= batch * seq_len * hidden_size * num_layers * factor * 2B (bf16)
+      - activation ~= batch * seq_len * hidden_size * workspace_factor * 2B
     """
     precision = precision if precision in PRECISION_BYTES else "bf16"
     batch = max(int(batch or 1), 1)
     seq_len = max(int(seq_len or 1), 1)
 
     total_params = metrics.get("total_params", 0) or 0
-    kv_bytes_per_token = metrics.get("kv_bytes_per_token", 0) or 0
     hidden_size = metrics.get("hidden_size", 0) or 0
-    num_layers = metrics.get("num_layers", 0) or 0
 
-    weights_bytes = total_params * PRECISION_BYTES[precision]
-    kv_bytes = kv_bytes_per_token * seq_len * batch
-    activation_bytes = batch * seq_len * hidden_size * num_layers * _ACT_FACTOR * 2
+    checkpoint_bytes = int(metrics.get("checkpoint_bytes", 0) or 0)
+    checkpoint_precision = str(metrics.get("checkpoint_precision") or "")
+    use_checkpoint_bytes = checkpoint_bytes > 0 and precision == checkpoint_precision
+    weights_bytes = checkpoint_bytes if use_checkpoint_bytes else total_params * PRECISION_BYTES[precision]
+    kv_bytes = _kv_cache_bytes(metrics, seq_len, batch)
+    activation_bytes = batch * seq_len * hidden_size * _ACT_FACTOR * 2
     total_bytes = weights_bytes + kv_bytes + activation_bytes
 
     gib = 1024 ** 3
@@ -585,15 +826,24 @@ def estimate_memory_footprint(
         "seq_len": seq_len,
         "bytes_per_param": PRECISION_BYTES[precision],
         "weights_bytes": weights_bytes,
+        "weight_source": "checkpoint" if use_checkpoint_bytes else "parameter_estimate",
         "kv_bytes": kv_bytes,
+        "kv_bytes_per_token": metrics.get("kv_bytes_per_token", 0) or 0,
         "activation_bytes": activation_bytes,
+        "activation_factor": _ACT_FACTOR,
         "total_bytes": total_bytes,
         "total_gb": total_gb,
         "gpu_fit": gpu_fit,
     }
 
 
-def estimate_throughput(metrics: dict[str, Any], precision: str = "bf16", seq_len: int = 2048) -> list[dict[str, Any]]:
+def estimate_throughput(
+    metrics: dict[str, Any],
+    precision: str = "bf16",
+    seq_len: int = 2048,
+    batch: int = 1,
+    gpu_counts: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
     """Estimate per-GPU decode throughput (tok/s) and prefill first-token latency.
 
     Decode is the smaller of the compute ceiling and the memory-bandwidth ceiling
@@ -602,27 +852,50 @@ def estimate_throughput(metrics: dict[str, Any], precision: str = "bf16", seq_le
     """
     precision = precision if precision in PRECISION_BYTES else "bf16"
     seq_len = max(int(seq_len or 1), 1)
+    batch = max(int(batch or 1), 1)
     active_params = metrics.get("active_params", 0) or 0
     if active_params <= 0:
         return []
 
     bytes_per_param = PRECISION_BYTES[precision]
+    linear_flops = int(metrics.get("linear_flops_per_token", 2 * active_params) or 0)
+    attention_flops = 2 * (int(metrics.get("qk_width", 0) or 0) + int(metrics.get("v_width", 0) or 0)) * _context_layer_tokens(metrics, seq_len)
+    decode_flops = linear_flops + attention_flops
+    prefill_flops = batch * (linear_flops * seq_len + _prefill_attention_flops(metrics, seq_len))
+    active_weight_bytes = active_params * bytes_per_param
+    kv_read_bytes = _kv_cache_bytes(metrics, seq_len, 1)
+    bytes_per_output_token = active_weight_bytes / batch + kv_read_bytes
+    gpu_counts = gpu_counts or {}
     rows = []
     for gpu in GPU_REFERENCE:
-        peak_flops = gpu["bf16_tflops"] * 1e12 * _MFU
-        bw = gpu["bw_gbs"] * 1e9
-        compute_tps = peak_flops / (2 * active_params)
-        bandwidth_tps = bw / (active_params * bytes_per_param)
+        gpu_count = max(int(gpu_counts.get(gpu["name"], 1) or 1), 1)
+        per_gpu_tops = _gpu_compute_tops(gpu, precision)
+        effective_tops = per_gpu_tops * gpu_count
+        peak_flops = effective_tops * 1e12 * _MFU
+        bw = gpu["bw_gbs"] * 1e9 * gpu_count
+        compute_tps = peak_flops / decode_flops
+        bandwidth_tps = bw / bytes_per_output_token
         if bandwidth_tps <= compute_tps:
             decode_tps, bound = bandwidth_tps, "带宽"
         else:
             decode_tps, bound = compute_tps, "算力"
-        ttft_ms = (2 * active_params * seq_len) / peak_flops * 1000
+        ttft_ms = prefill_flops / peak_flops * 1000
         rows.append({
             "name": gpu["name"],
             "decode_tps": decode_tps,
             "ttft_ms": ttft_ms,
             "bound": bound,
+            "effective_tops": effective_tops,
+            "per_gpu_tops": per_gpu_tops,
+            "gpu_count": gpu_count,
+            "compute_tps": compute_tps,
+            "bandwidth_tps": bandwidth_tps,
+            "decode_flops": decode_flops,
+            "attention_flops": attention_flops,
+            "active_weight_bytes": active_weight_bytes,
+            "kv_read_bytes": kv_read_bytes,
+            "bytes_per_output_token": bytes_per_output_token,
+            "batch": batch,
         })
     return rows
 
@@ -631,25 +904,24 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     config = primary_config(model_dir)
     params_config = read_json_file(model_dir / "params.json")
     architecture = infer_architecture_name(model_dir, "llm")
+    dims = parse_llm_dims(config, params_config)
 
-    hidden_size = int(first_defined(config.get("hidden_size"), params_config.get("dim"), 0) or 0)
-    num_layers = int(first_defined(config.get("num_hidden_layers"), config.get("num_layers"), params_config.get("n_layers"), 0) or 0)
-    num_heads = int(first_defined(config.get("num_attention_heads"), params_config.get("n_heads"), 0) or 0)
-    num_kv_heads = int(first_defined(config.get("num_key_value_heads"), params_config.get("n_kv_heads"), num_heads) or num_heads or 0)
-    head_dim = int(first_defined(config.get("head_dim"), params_config.get("head_dim"), hidden_size // num_heads if hidden_size and num_heads else 0) or 0)
-    ffn_hidden = int(first_defined(config.get("intermediate_size"), params_config.get("hidden_dim"), config.get("moe_intermediate_size"), 0) or 0)
-    vocab_size = int(first_defined(config.get("vocab_size"), params_config.get("vocab_size"), 0) or 0)
+    hidden_size = dims["hidden_size"]
+    num_layers = dims["num_layers"]
+    num_heads = dims["num_heads"]
+    num_kv_heads = dims["num_kv_heads"]
+    head_dim = dims["head_dim"]
+    ffn_hidden = dims["ffn_hidden"]
+    vocab_size = dims["vocab_size"]
     max_position = int(first_defined(config.get("max_position_embeddings"), params_config.get("max_position_embeddings"), 4096) or 4096)
-    sliding_window = int(first_defined(config.get("sliding_window"), config.get("sliding_window_size"), params_config.get("sliding_window_size"), 0) or 0)
+    sliding_window = dims["sliding_window"]
 
-    moe_config = params_config.get("moe") if isinstance(params_config.get("moe"), dict) else {}
-    num_experts = int(first_defined(config.get("n_routed_experts"), config.get("num_experts"), config.get("num_local_experts"), moe_config.get("num_experts"), 0) or 0)
-    experts_per_tok = int(first_defined(config.get("num_experts_per_tok"), moe_config.get("num_experts_per_tok"), 0) or 0)
-    # MoE expert FFN dim (routed & shared experts), shared-expert count, and dense-layer count.
-    moe_ffn_hidden = int(first_defined(config.get("moe_intermediate_size"), config.get("expert_ffn_hidden_size"), moe_config.get("moe_intermediate_size"), 0) or 0)
-    n_shared_experts = int(first_defined(config.get("n_shared_experts"), moe_config.get("n_shared_experts"), 0) or 0)
-    first_k_dense = int(first_defined(config.get("first_k_dense_replace"), config.get("n_dense_layers"), 0) or 0)
-    tie_word_embeddings = bool(first_defined(config.get("tie_word_embeddings"), params_config.get("tie_word_embeddings"), False))
+    num_experts = dims["num_experts"]
+    experts_per_tok = dims["experts_per_tok"]
+    moe_ffn_hidden = dims["moe_ffn_hidden"]
+    n_shared_experts = dims["n_shared_experts"]
+    first_k_dense = dims["first_k_dense"]
+    tie_word_embeddings = dims["tie_word_embeddings"]
     quant = first_defined(
         config.get("quantization_config", {}).get("quant_method") if isinstance(config.get("quantization_config"), dict) else None,
         params_config.get("quantization", {}).get("qformat_weight") if isinstance(params_config.get("quantization"), dict) else None,
@@ -664,31 +936,27 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     )
 
     # MLA detection
-    q_lora_rank = int(first_defined(config.get("q_lora_rank"), 0) or 0)
-    kv_lora_rank = int(first_defined(config.get("kv_lora_rank"), config.get("kv_lora_a"), 0) or 0)
-    qk_rope_head_dim = int(first_defined(config.get("qk_rope_head_dim"), 0) or 0)
-    # Prefer explicit config value; only fall back to derivation when absent.
-    qk_nope_head_dim = int(first_defined(
-        config.get("qk_nope_head_dim"),
-        (head_dim - qk_rope_head_dim) if (head_dim and qk_rope_head_dim) else head_dim,
-        0,
-    ) or 0)
-    qk_head_dim = int(first_defined(
-        config.get("qk_head_dim"),
-        (qk_nope_head_dim + qk_rope_head_dim) if (qk_nope_head_dim and qk_rope_head_dim) else head_dim,
-        0,
-    ) or 0)
-    v_head_dim = int(first_defined(config.get("v_head_dim"), head_dim) or 0)
+    q_lora_rank = dims["q_lora_rank"]
+    kv_lora_rank = dims["kv_lora_rank"]
+    qk_rope_head_dim = dims["qk_rope_head_dim"]
+    qk_nope_head_dim = dims["qk_nope_head_dim"]
+    qk_head_dim = dims["qk_head_dim"]
+    v_head_dim = dims["v_head_dim"]
     o_lora_rank = int(first_defined(config.get("o_lora_rank"), 0) or 0)
-    is_mla = q_lora_rank > 0
+    is_mla = dims["is_mla"]
 
     batch = clamp_int(query.get("batch", [1])[0], 1)
     seq_len = clamp_int(query.get("seq_len", [min(max_position, 2048)])[0], min(max_position, 2048), maximum=max_position)
 
     hidden_shape = shape(batch, seq_len, hidden_size or "hidden")
     logits_shape = shape(batch, seq_len, vocab_size or "vocab")
-    attention_shape = shape(batch, seq_len, num_heads or "heads", head_dim or "head_dim")
-    kv_shape = shape(batch, seq_len, num_kv_heads or "kv_heads", head_dim or "head_dim")
+    display_qk_head_dim = qk_head_dim if is_mla else head_dim
+    attention_shape = shape(batch, seq_len, num_heads or "heads", display_qk_head_dim or "head_dim")
+    kv_shape = (
+        f"latent {shape(batch, seq_len, kv_lora_rank or head_dim or 'kv_lora')} + rope {shape(batch, seq_len, qk_rope_head_dim or 'rope_dim')}"
+        if is_mla
+        else shape(batch, seq_len, num_kv_heads or "kv_heads", head_dim or "head_dim")
+    )
     score_shape = shape(batch, num_heads or "heads", seq_len, seq_len)
     rope_q_shape = f"Q_rope {attention_shape}; K_rope {kv_shape}"
 
@@ -697,6 +965,8 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     ]
     if not hidden_size or not num_layers:
         warnings.append("该模型的层数或隐藏维度信息不完整，图中会保留摘要级展示。")
+    if dims["linear_attention_layers"]:
+        warnings.append("线性注意力层不套用标准 KV cache 与 QK/AV 二次项；其固定状态开销未计入。")
 
     lanes = [
         ("inputs", "输入"),
@@ -1389,8 +1659,10 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         edges = [e if "block" not in e.get("viewModes", []) else {**e, "viewModes": ["block_gqa"]} for e in edges]
 
         kv_compress_dim = kv_lora_rank or head_dim or 0
-        mla_q_shape = shape(batch, seq_len, num_heads or "heads", head_dim or "head_dim")
+        mla_q_shape = shape(batch, seq_len, num_heads or "heads", qk_head_dim or head_dim or "head_dim")
         mla_kv_latent = shape(batch, seq_len, kv_compress_dim)
+        mla_rope_key = shape(batch, seq_len, qk_rope_head_dim or "rope_dim")
+        mla_cached_shape = f"latent {mla_kv_latent} + K_rope {mla_rope_key}"
         mla_v_shape = shape(batch, seq_len, num_heads or "heads", v_head_dim or "head_dim")
 
         mla_block_nodes = [
@@ -1400,25 +1672,25 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 "Q 通过低秩投影压缩再展开，减少参数量。",
                 hidden_shape, mla_q_shape,
                 [f"q_lora {q_lora_rank}", f"{num_heads or '?'} heads"],
-                [detail("q_lora_rank", q_lora_rank), detail("head_dim", head_dim)],
-                [section("MLA Q", [detail("down", f"{hidden_size} → {q_lora_rank}"), detail("up", f"{q_lora_rank} → {num_heads}×{head_dim}")])],
+                [detail("q_lora_rank", q_lora_rank), detail("qk_head_dim", qk_head_dim)],
+                [section("MLA Q", [detail("down", f"{hidden_size} → {q_lora_rank}"), detail("up", f"{q_lora_rank} → {num_heads}×{qk_head_dim}")])],
                 "core", parent_id="decoder_stack", view_modes=["block"],
             ),
             build_node(
                 "mla_kv_compress", "core", 2, "KV Compression",
                 f"hidden → {kv_compress_dim} (latent)",
                 "KV 压缩为低秩 latent，cache 只存压缩表示。",
-                hidden_shape, mla_kv_latent,
-                [f"kv_lora {kv_compress_dim}", "cached latent"],
-                [detail("kv_compress_dim", kv_compress_dim), detail("num_kv_heads", num_kv_heads)],
-                [section("MLA KV", [detail("compress", f"{hidden_size} → {kv_compress_dim}"), detail("cache_saving", f"vs GQA: {num_kv_heads}×{head_dim} → {kv_compress_dim}")])],
+                hidden_shape, mla_cached_shape,
+                [f"kv_lora {kv_compress_dim}", f"rope {qk_rope_head_dim}"],
+                [detail("kv_compress_dim", kv_compress_dim), detail("cached_rope_dim", qk_rope_head_dim)],
+                [section("MLA KV", [detail("compress", f"{hidden_size} → latent {kv_compress_dim} + rope {qk_rope_head_dim}"), detail("cache_saving", f"vs GQA: K+V {num_kv_heads}×{head_dim}×2 → {kv_compress_dim + qk_rope_head_dim}")])],
                 "scheduler", parent_id="decoder_stack", view_modes=["block"],
             ),
             build_node(
                 "mla_kv_decompress", "core", 3, "KV Decompression",
                 f"latent → K_nope + K_rope + V",
                 "从压缩 latent 还原 K（nope + rope）和 V。",
-                mla_kv_latent, f"K/V {mla_q_shape}",
+                mla_cached_shape, f"K {mla_q_shape}; V {mla_v_shape}",
                 [f"nope {qk_nope_head_dim}", f"rope {qk_rope_head_dim}"],
                 [detail("qk_nope_head_dim", qk_nope_head_dim), detail("qk_rope_head_dim", qk_rope_head_dim), detail("v_head_dim", v_head_dim)],
                 [section("解压", [detail("K_nope", qk_nope_head_dim), detail("K_rope", qk_rope_head_dim), detail("V", v_head_dim)])],
@@ -1439,9 +1711,9 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 "[Q_nope||Q_rope] × [K_nope||K_rope]",
                 "拼接 nope 和 rope 维度后计算注意力分数。",
                 mla_q_shape, shape(batch, num_heads or "heads", seq_len, seq_len),
-                ["score", f"dim {head_dim}"],
-                [detail("Q_dim", head_dim), detail("K_dim", head_dim)],
-                [section("Score", [detail("QK", f"[B, heads, T, {head_dim}] × [B, kv, T, {head_dim}]ᵀ")])],
+                ["score", f"dim {qk_head_dim}"],
+                [detail("Q_dim", qk_head_dim), detail("K_dim", qk_head_dim)],
+                [section("Score", [detail("QK", f"[B, heads, T, {qk_head_dim}] × [B, heads, T, {qk_head_dim}]ᵀ")])],
                 "core", parent_id="decoder_stack", view_modes=["block"],
             ),
             build_node(
@@ -1493,6 +1765,66 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         nodes.extend(mla_block_nodes)
         edges.extend(mla_block_edges)
 
+    if not dims["has_output_head"]:
+        warnings.append("该配置是 encoder-only 模型；不使用 causal mask、生成式 LM Head 或自回归 KV cache。")
+        nodes = [node for node in nodes if node["id"] not in {"decoder_causal_mask", "decoder_sliding_mask"}]
+        edges = [
+            edge for edge in edges
+            if edge["source"] not in {"decoder_causal_mask", "decoder_sliding_mask"}
+            and edge["target"] not in {"decoder_causal_mask", "decoder_sliding_mask"}
+        ]
+        edges.append(build_edge("decoder_qk_score", "decoder_softmax", "bidirectional scores", ["block"]))
+        for node in nodes:
+            if node["id"] == "decoder_stack":
+                node.update({
+                    "label": "Encoder Stack",
+                    "subtitle": f"{num_layers or '?'} 层双向编码主干",
+                    "description": "双向 self-attention 与 FFN 对输入序列进行编码。",
+                    "sections": [
+                        section("编码流", [
+                            detail("hidden stream", hidden_shape),
+                            detail("attention", "bidirectional full attention"),
+                            detail("ffn", shape(batch, seq_len, ffn_hidden or "ffn")),
+                        ])
+                    ],
+                })
+            elif node["id"].startswith("decoder_layer_"):
+                node.update({
+                    "description": "重复执行双向 self-attention、FFN、残差连接与归一化。",
+                    "sections": [section("层内摘要", [
+                        detail("hidden stream", hidden_shape),
+                        detail("attention", "bidirectional"),
+                        detail("ffn", shape(batch, seq_len, ffn_hidden or "ffn")),
+                    ])],
+                    "microFlow": ["Bidirectional Attention", "FFN", "Residual"],
+                })
+            elif node["id"] == "lm_head":
+                node.update({
+                    "label": "Encoder 输出",
+                    "subtitle": "contextual hidden states",
+                    "description": "输出每个 token 的上下文化隐藏表示，不执行词表投影。",
+                    "inputShape": hidden_shape,
+                    "outputShape": hidden_shape,
+                    "badges": ["hidden states"],
+                    "details": [detail("output", hidden_shape)],
+                    "sections": [section("输出", [detail("last hidden state", hidden_shape)])],
+                })
+            elif node["id"] == "logits":
+                node.update({
+                    "label": "Embedding 输出",
+                    "subtitle": "pooling / token embeddings",
+                    "description": "根据任务选择 token 表示或池化后的句向量。",
+                    "inputShape": hidden_shape,
+                    "outputShape": shape(batch, hidden_size or "hidden"),
+                    "details": [detail("token embeddings", hidden_shape), detail("pooled", shape(batch, hidden_size or "hidden"))],
+                    "sections": [section("编码结果", [detail("last hidden state", hidden_shape)])],
+                })
+        for edge in edges:
+            if edge["source"] == "decoder_stack" and edge["target"] == "lm_head":
+                edge["label"] = "final hidden"
+            elif edge["source"] == "lm_head" and edge["target"] == "logits":
+                edge["label"] = "pool / select"
+
     sources: list[str] = []
     append_source_file(model_dir, sources, "config.json")
     append_source_file(model_dir, sources, "configuration.json")
@@ -1510,23 +1842,33 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     if is_mla:
         summary.append(detail("注意力", f"MLA (q_lora={q_lora_rank}, kv_lora={kv_lora_rank or head_dim}, rope_dim={qk_rope_head_dim})"))
     if num_experts:
-        summary.append(detail("MoE", f"{num_experts} experts / top-{experts_per_tok}"))
+        effective_top_k = (experts_per_tok or 1) * dims["active_expert_multiplier"]
+        cli_note = f" (top-{experts_per_tok} × CLI {dims['active_expert_multiplier']})" if dims["active_expert_multiplier"] > 1 else ""
+        summary.append(detail("MoE", f"{num_experts} experts / active {effective_top_k}{cli_note}"))
 
     # Runtime estimation (shared with the test-suite via estimate_llm_metrics).
-    dims = parse_llm_dims(config, params_config)
-    metrics = estimate_llm_metrics(dims)
+    metrics = estimate_llm_metrics(dims, seq_len)
+    default_precision = infer_weight_precision(config, params_config)
     if metrics is not None:
+        checkpoint_index = read_json_file(model_dir / "model.safetensors.index.json")
+        checkpoint_size = checkpoint_index.get("metadata", {}).get("total_size") if isinstance(checkpoint_index.get("metadata"), dict) else None
+        if isinstance(checkpoint_size, (int, float)) and checkpoint_size > 0:
+            metrics["checkpoint_bytes"] = int(checkpoint_size)
+            metrics["checkpoint_precision"] = default_precision
         total_params = metrics["total_params"]
         active_params = metrics["active_params"]
         summary.append(detail("参数量", f"{total_params / 1e9:.2f}B" + (f" (active {active_params / 1e9:.2f}B)" if num_experts else "")))
+        if metrics["mtp_params"] and not metrics["mtp_included"]:
+            summary.append(detail("MTP 参数", f"{metrics['mtp_params'] / 1e9:.2f}B（辅助预测层，未计入主干总参数）"))
 
         kv_per_1k = metrics["kv_cache_mb_per_1k"]
         if kv_per_1k is not None:
-            summary.append(detail("KV cache", f"{kv_per_1k:.1f} MB / 1K tokens / batch"))
+            summary.append(detail("KV cache", f"{kv_per_1k:.1f} MiB / 1K tokens / batch"))
 
-        summary.append(detail("推理 FLOPs", f"{metrics['gflops_per_token']:.1f} GFLOPs / token"))
+        metric_label = "Decode FLOPs" if dims["has_output_head"] else "Encoder FLOPs"
+        summary.append(detail(metric_label, f"{metrics['gflops_per_token']:.1f} GFLOPs / token @ seq {seq_len}"))
 
-    precision = str(query.get("precision", ["bf16"])[0] or "bf16")
+    precision = str(query.get("precision", [default_precision])[0] or default_precision)
     if precision not in PRECISION_BYTES:
         precision = "bf16"
 
@@ -1536,7 +1878,11 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         {"name": "precision", "label": "权重精度", "type": "select", "value": precision, "options": list(PRECISION_BYTES.keys()), "help": "用于显存/成本与吞吐估算"},
     ]
 
-    headline = f"Decoder-only 语言模型，隐藏维度 {hidden_size or '?'}，共 {num_layers or '?'} 层。"
+    headline = (
+        f"Decoder-only 语言模型，隐藏维度 {hidden_size or '?'}，共 {num_layers or '?'} 层。"
+        if dims["has_output_head"]
+        else f"Encoder-only 表征模型，隐藏维度 {hidden_size or '?'}，共 {num_layers or '?'} 层。"
+    )
     payload = base_model_payload(
         model_id,
         "llm",
@@ -1552,16 +1898,11 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     )
 
     if metrics is not None:
+        memory = estimate_memory_footprint(metrics, precision, batch, seq_len)
+        gpu_counts = {item["name"]: item["count"] for item in memory["gpu_fit"]}
         payload["metrics"] = {
-            "total_params": metrics["total_params"],
-            "active_params": metrics["active_params"],
-            "gflops_per_token": metrics["gflops_per_token"],
-            "kv_bytes_per_token": metrics["kv_bytes_per_token"],
-            "kv_cache_mb_per_1k": metrics["kv_cache_mb_per_1k"],
-            "hidden_size": metrics["hidden_size"],
-            "num_layers": metrics["num_layers"],
+            **metrics,
             "is_moe": bool(num_experts),
-            "breakdown": metrics["breakdown"],
             "formula_terms": {
                 "hidden_size": dims["hidden_size"],
                 "num_layers": dims["num_layers"],
@@ -1572,26 +1913,35 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 "vocab_size": dims["vocab_size"],
                 "num_experts": dims["num_experts"],
                 "experts_per_tok": dims["experts_per_tok"],
+                "effective_experts_per_tok": metrics["effective_experts_per_tok"],
                 "moe_ffn_hidden": dims["moe_ffn_hidden"],
                 "n_shared_experts": dims["n_shared_experts"],
+                "shared_ffn_hidden": dims["shared_ffn_hidden"],
                 "first_k_dense": dims["first_k_dense"],
                 "tie_word_embeddings": dims["tie_word_embeddings"],
+                "has_output_head": dims["has_output_head"],
+                "ffn_projection_count": dims["ffn_projection_count"],
                 "is_mla": dims["is_mla"],
                 "attn_per_layer": metrics["attn_params_per_layer"],
                 "expert_per": metrics["expert_params"],
+                "shared_expert_per": metrics["shared_expert_params"],
                 "dense_ffn_per": metrics["dense_ffn_params"],
                 "n_dense_layers": metrics["n_dense_layers"],
                 "n_moe_layers": metrics["n_moe_layers"],
                 "embed_params": metrics["embed_params"],
+                "embed_total": metrics["embed_total"],
+                "mtp_params": metrics["mtp_params"],
+                "mtp_layers": metrics["mtp_layers"],
             },
-            "memory": estimate_memory_footprint(metrics, precision, batch, seq_len),
-            "throughput": estimate_throughput(metrics, precision, seq_len),
+            "memory": memory,
+            "throughput": estimate_throughput(metrics, precision, seq_len, batch, gpu_counts) if dims["has_output_head"] else [],
             "gpu_reference": GPU_REFERENCE,
             "throughput_terms": {
                 "active_params": active_params,
                 "bytes_per_param": PRECISION_BYTES[precision],
                 "precision": precision,
                 "seq_len": seq_len,
+                "batch": batch,
                 "mfu": _MFU,
                 "two": 2,
             },
@@ -1675,11 +2025,15 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     image_width = clamp_int(query.get("image_width", [default_width])[0], default_width)
     frames = clamp_int(query.get("frames", [max(temporal_patch, 8)])[0], max(temporal_patch, 8))
 
-    image_patch_count = ceil_div(image_height, patch_size) * ceil_div(image_width, patch_size)
-    image_token_count = ceil_div(image_patch_count, max(merge_size, 1) ** 2)
+    image_patch_rows = ceil_div(image_height, patch_size)
+    image_patch_cols = ceil_div(image_width, patch_size)
+    image_patch_count = image_patch_rows * image_patch_cols
+    merged_patch_rows = ceil_div(image_patch_rows, max(merge_size, 1))
+    merged_patch_cols = ceil_div(image_patch_cols, max(merge_size, 1))
+    image_token_count = merged_patch_rows * merged_patch_cols
     video_frame_groups = ceil_div(frames, temporal_patch)
-    video_patch_count = video_frame_groups * ceil_div(image_height, patch_size) * ceil_div(image_width, patch_size)
-    video_token_count = ceil_div(video_patch_count, max(merge_size, 1) ** 2)
+    video_patch_count = video_frame_groups * image_patch_rows * image_patch_cols
+    video_token_count = video_frame_groups * merged_patch_rows * merged_patch_cols
     total_tokens = seq_len + image_token_count + (video_token_count if has_video else 0)
     image_patch_width = 3 * patch_size * patch_size
     video_patch_width = image_patch_width * temporal_patch
@@ -1761,7 +2115,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                     [
                         detail("raw patches", f"ceil({image_height}/{patch_size}) * ceil({image_width}/{patch_size}) = {image_patch_count}"),
                         detail("patch width", f"3 * {patch_size} * {patch_size} = {image_patch_width}"),
-                        detail("merged tokens", f"ceil({image_patch_count} / {max(merge_size, 1) ** 2}) = {image_token_count}"),
+                        detail("merged tokens", f"ceil({image_patch_rows}/{max(merge_size, 1)}) * ceil({image_patch_cols}/{max(merge_size, 1)}) = {image_token_count}"),
                     ],
                 ),
             ],
@@ -1902,7 +2256,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
                             [
                                 detail("frame groups", f"ceil({frames}/{temporal_patch}) = {video_frame_groups}"),
                                 detail("raw patches", f"{video_frame_groups} * ceil({image_height}/{patch_size}) * ceil({image_width}/{patch_size}) = {video_patch_count}"),
-                                detail("merged tokens", f"ceil({video_patch_count} / {max(merge_size, 1) ** 2}) = {video_token_count}"),
+                                detail("merged tokens", f"{video_frame_groups} * ceil({image_patch_rows}/{max(merge_size, 1)}) * ceil({image_patch_cols}/{max(merge_size, 1)}) = {video_token_count}"),
                             ],
                         ),
                     ],
@@ -2208,11 +2562,21 @@ def infer_text_layers(text_component_config: dict[str, Any], transformer_config:
 
 
 def infer_transformer_width(transformer_config: dict[str, Any]) -> int:
-    hidden_size = transformer_config.get("hidden_size")
+    hidden_size = first_defined(
+        transformer_config.get("hidden_size"),
+        transformer_config.get("dim"),
+        transformer_config.get("model_dim"),
+        transformer_config.get("inner_dim"),
+    )
     if isinstance(hidden_size, (int, float)):
         return int(hidden_size)
 
-    num_heads = first_defined(transformer_config.get("num_attention_heads"), transformer_config.get("text_num_attention_heads"))
+    num_heads = first_defined(
+        transformer_config.get("num_attention_heads"),
+        transformer_config.get("num_heads"),
+        transformer_config.get("n_heads"),
+        transformer_config.get("text_num_attention_heads"),
+    )
     head_dim = first_defined(transformer_config.get("attention_head_dim"), transformer_config.get("head_dim"))
     if isinstance(num_heads, (int, float)) and isinstance(head_dim, (int, float)):
         return int(num_heads) * int(head_dim)
@@ -2226,6 +2590,25 @@ def infer_transformer_width(transformer_config: dict[str, Any]) -> int:
         return int(text_hidden)
 
     return 0
+
+
+def infer_transformer_layers(transformer_config: dict[str, Any]) -> int:
+    if isinstance(transformer_config.get("n_layers"), (int, float)):
+        return int(transformer_config["n_layers"]) + int(transformer_config.get("n_refiner_layers", 0) or 0)
+    if isinstance(transformer_config.get("depth"), (int, float)):
+        return int(transformer_config["depth"])
+    base_layers = int(first_defined(transformer_config.get("num_layers"), transformer_config.get("num_double_stream_layers"), 0) or 0)
+    single_layers = int(transformer_config.get("num_single_layers", 0) or 0)
+    return base_layers + single_layers
+
+
+def infer_transformer_heads(transformer_config: dict[str, Any]) -> int:
+    return int(first_defined(
+        transformer_config.get("num_attention_heads"),
+        transformer_config.get("num_heads"),
+        transformer_config.get("n_heads"),
+        0,
+    ) or 0)
 
 
 def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -2252,33 +2635,69 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     prompt_tokens = clamp_int(query.get("seq_len", [min(max_position, 256)])[0], min(max_position, 256), maximum=max_position)
     batch = clamp_int(query.get("batch", [1])[0], 1)
 
-    default_image = int(first_defined(vae_config.get("sample_size"), 1024) or 1024)
-    image_height = clamp_int(query.get("image_height", [default_image])[0], default_image)
-    image_width = clamp_int(query.get("image_width", [default_image])[0], default_image)
+    sample_size = first_defined(vae_config.get("sample_size"), 1024)
+    default_height, default_width = spatial_pair(sample_size, 1024)
+    image_height = clamp_int(query.get("image_height", [default_height])[0], default_height)
+    image_width = clamp_int(query.get("image_width", [default_width])[0], default_width)
     steps = clamp_int(query.get("steps", [28 if model_index.get("is_distilled") else 40])[0], 28 if model_index.get("is_distilled") else 40)
 
-    vae_scale = derive_vae_scale(vae_config)
+    transformer_class = str(transformer_config.get("_class_name") or "")
+    video_hint = f"{model_id} {architecture} {transformer_class}".lower()
+    is_video = "video" in video_hint or "transformer3d" in video_hint
+    default_frames = int(first_defined(transformer_config.get("sample_frames"), model_index.get("num_frames"), 81) or 81)
+    frames = clamp_int(query.get("frames", [default_frames if is_video else 1])[0], default_frames if is_video else 1)
+
+    vae_scale_height, vae_scale_width = derive_vae_spatial_scales(vae_config)
+    vae_temporal_scale = derive_vae_temporal_scale(vae_config) if is_video else 1
     latent_channels = int(first_defined(vae_config.get("latent_channels"), vae_config.get("z_dim"), transformer_config.get("in_channels"), 4) or 4)
-    latent_height = ceil_div(image_height, vae_scale)
-    latent_width = ceil_div(image_width, vae_scale)
-    transformer_patch = scalar_int(first_defined(transformer_config.get("patch_size"), model_index.get("patch_size"), 1), 1)
-    latent_tokens = ceil_div(latent_height, transformer_patch) * ceil_div(latent_width, transformer_patch)
+    latent_height = ceil_div(image_height, vae_scale_height)
+    latent_width = ceil_div(image_width, vae_scale_width)
+    latent_frames = ceil_div(frames, vae_temporal_scale) if is_video else 1
+    transformer_patch_value = first_defined(
+        transformer_config.get("patch_size"),
+        transformer_config.get("all_patch_size"),
+        model_index.get("patch_size"),
+        1,
+    )
+    transformer_patch_height, transformer_patch_width = spatial_pair(transformer_patch_value, 1)
+    transformer_patch_temporal = temporal_patch_size(transformer_patch_value, 1)
+    latent_tokens = (
+        ceil_div(latent_frames, transformer_patch_temporal)
+        * ceil_div(latent_height, transformer_patch_height)
+        * ceil_div(latent_width, transformer_patch_width)
+    )
     transformer_width = infer_transformer_width(transformer_config)
-    transformer_layers = int(first_defined(transformer_config.get("num_layers"), transformer_config.get("num_double_stream_layers"), 0) or 0)
-    transformer_heads = int(first_defined(transformer_config.get("num_attention_heads"), 0) or 0)
-    transformer_head_dim = int(first_defined(transformer_config.get("attention_head_dim"), transformer_config.get("head_dim"), 0) or 0)
+    transformer_layers = infer_transformer_layers(transformer_config)
+    transformer_heads = infer_transformer_heads(transformer_config)
+    transformer_head_dim = int(first_defined(
+        transformer_config.get("attention_head_dim"),
+        transformer_config.get("head_dim"),
+        transformer_width // transformer_heads if transformer_width and transformer_heads else 0,
+    ) or 0)
 
     has_conditioning_image = bool(processor_component_name == "processor" or text_component_name == "mllm")
     conditioning_patch = int(first_defined(processor_component_config.get("patch_size"), text_component_config.get("vision_config", {}).get("patch_size") if isinstance(text_component_config.get("vision_config"), dict) else None, 16) or 16)
     conditioning_merge = int(first_defined(processor_component_config.get("merge_size"), text_component_config.get("vision_config", {}).get("spatial_merge_size") if isinstance(text_component_config.get("vision_config"), dict) else None, 1) or 1)
-    conditioning_raw_patches = ceil_div(image_height, conditioning_patch) * ceil_div(image_width, conditioning_patch)
-    conditioning_tokens = ceil_div(conditioning_raw_patches, max(conditioning_merge, 1) ** 2)
+    conditioning_patch_rows = ceil_div(image_height, conditioning_patch)
+    conditioning_patch_cols = ceil_div(image_width, conditioning_patch)
+    conditioning_raw_patches = conditioning_patch_rows * conditioning_patch_cols
+    conditioning_tokens = ceil_div(conditioning_patch_rows, max(conditioning_merge, 1)) * ceil_div(conditioning_patch_cols, max(conditioning_merge, 1))
     scheduler_seq_len = int(first_defined(scheduler_config.get("base_image_seq_len"), scheduler_config.get("seq_len"), latent_tokens) or latent_tokens)
+
+    pixel_shape = shape(batch, frames, 3, image_height, image_width) if is_video else shape(batch, 3, image_height, image_width)
+    latent_shape = shape(batch, latent_channels, latent_frames, latent_height, latent_width) if is_video else shape(batch, latent_channels, latent_height, latent_width)
+    transformer_patch_label = (
+        f"{transformer_patch_temporal}x{transformer_patch_height}x{transformer_patch_width}"
+        if is_video
+        else f"{transformer_patch_height}x{transformer_patch_width}"
+    )
 
     warnings = [
         "Diffusers 图中的 latent token 数由 VAE 下采样倍率和 transformer patch_size 估算。",
         "Scheduler 节点展示的是步数和序列长度摘要，不是单个运行时张量。",
     ]
+    if is_video:
+        warnings.append("视频 latent token 已包含 VAE 时间压缩与 transformer temporal patch。")
     if has_conditioning_image:
         warnings.append("该 pipeline 含图像条件分支，是否必须输入图像取决于具体调用方式。")
 
@@ -2373,7 +2792,10 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     latents_input_node = "latent_init"
     latent_input_label = "Latent 初始化"
     latent_input_description = "以高斯噪声 latent 开始迭代去噪。"
-    latent_input_badges = [f"scale 1/{vae_scale}", f"channels {latent_channels}"]
+    spatial_scale_label = f"{vae_scale_height}x{vae_scale_width}"
+    latent_input_badges = [f"spatial 1/{spatial_scale_label}", f"channels {latent_channels}"]
+    if is_video:
+        latent_input_badges.append(f"temporal 1/{vae_temporal_scale}")
     if has_conditioning_image:
         latent_input_label = "VAE 编码"
         latent_input_description = "将条件图像编码到 latent 空间后参与去噪。"
@@ -2386,20 +2808,21 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                 "latent",
                 1,
                 latent_input_label,
-                f"latent {latent_channels} x {latent_height} x {latent_width}",
+                f"latent {latent_channels} x " + (f"{latent_frames} x " if is_video else "") + f"{latent_height} x {latent_width}",
                 latent_input_description,
-                shape(batch, 3, image_height, image_width) if has_conditioning_image else shape(batch, latent_channels, latent_height, latent_width),
-                shape(batch, latent_channels, latent_height, latent_width),
+                pixel_shape if has_conditioning_image else latent_shape,
+                latent_shape,
                 latent_input_badges,
-                [detail("vae_scale", vae_scale), detail("latent_height", latent_height), detail("latent_width", latent_width), detail("latent_channels", latent_channels)],
+                [detail("vae_spatial_scale", spatial_scale_label), detail("vae_temporal_scale", vae_temporal_scale), detail("latent_frames", latent_frames), detail("latent_height", latent_height), detail("latent_width", latent_width), detail("latent_channels", latent_channels)],
                 [
-                    section("latent 形状", [detail("latent tensor", shape(batch, latent_channels, latent_height, latent_width)), detail("latent tokens", latent_tokens)]),
+                    section("latent 形状", [detail("latent tensor", latent_shape), detail("latent tokens", latent_tokens)]),
                     section(
                         "推导公式",
                         [
-                            detail("latent height", f"ceil({image_height}/{vae_scale}) = {latent_height}"),
-                            detail("latent width", f"ceil({image_width}/{vae_scale}) = {latent_width}"),
-                            detail("latent tokens", f"ceil({latent_height}/{transformer_patch}) * ceil({latent_width}/{transformer_patch}) = {latent_tokens}"),
+                            detail("latent frames", f"ceil({frames}/{vae_temporal_scale}) = {latent_frames}" if is_video else "image pipeline = 1"),
+                            detail("latent height", f"ceil({image_height}/{vae_scale_height}) = {latent_height}"),
+                            detail("latent width", f"ceil({image_width}/{vae_scale_width}) = {latent_width}"),
+                            detail("latent tokens", f"ceil({latent_frames}/{transformer_patch_temporal}) * ceil({latent_height}/{transformer_patch_height}) * ceil({latent_width}/{transformer_patch_width}) = {latent_tokens}"),
                         ],
                     ),
                 ],
@@ -2422,7 +2845,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                         "条件与 latent",
                         [
                             detail("text condition", shape(batch, prompt_tokens, text_hidden)),
-                            detail("latent grid", shape(batch, latent_channels, latent_height, latent_width)),
+                            detail("latent grid", latent_shape),
                             detail("tokenized latent", shape(batch, latent_tokens, transformer_width or "hidden")),
                         ],
                     ),
@@ -2447,15 +2870,15 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                 "decode",
                 0,
                 "VAE Decode",
-                "latent -> image",
-                "把最终 latent 还原到像素空间。",
-                shape(batch, latent_channels, latent_height, latent_width),
-                shape(batch, 3, image_height, image_width),
-                [f"scale x{vae_scale}", vae_config.get("_class_name", "vae")],
-                [detail("latent_channels", latent_channels), detail("vae_scale", vae_scale), detail("output_size", shape(batch, 3, image_height, image_width))],
+                "latent -> video" if is_video else "latent -> image",
+                "把最终 latent 还原到视频像素空间。" if is_video else "把最终 latent 还原到像素空间。",
+                latent_shape,
+                pixel_shape,
+                [f"spatial x{spatial_scale_label}", vae_config.get("_class_name", "vae")],
+                [detail("latent_channels", latent_channels), detail("vae_spatial_scale", spatial_scale_label), detail("vae_temporal_scale", vae_temporal_scale), detail("output_size", pixel_shape)],
                 [
-                    section("解码结果", [detail("image tensor", shape(batch, 3, image_height, image_width))]),
-                    section("推导公式", [detail("decode", f"[B, C, h, w] -> [B, 3, H, W] = {shape(batch, 3, image_height, image_width)}")]),
+                    section("解码结果", [detail("video tensor" if is_video else "image tensor", pixel_shape)]),
+                    section("推导公式", [detail("decode", f"latent -> pixels = {pixel_shape}")]),
                 ],
                 "decode",
                 view_modes=["summary", "expanded", "repeat"],
@@ -2464,13 +2887,13 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                 "image_output",
                 "output",
                 0,
-                "图像输出",
+                "视频输出" if is_video else "图像输出",
                 "像素空间结果",
-                "生成或编辑后的图像。",
-                shape(batch, 3, image_height, image_width),
-                shape(batch, 3, image_height, image_width),
+                "生成或编辑后的视频。" if is_video else "生成或编辑后的图像。",
+                pixel_shape,
+                pixel_shape,
                 ["output"],
-                [detail("image", shape(batch, 3, image_height, image_width))],
+                [detail("video" if is_video else "image", pixel_shape)],
                 [section("说明", [detail("postprocess", "可进一步保存、显示或后处理")])],
                 "output",
             ),
@@ -2478,7 +2901,6 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     )
 
     transformer_width_val = transformer_width or "hidden"
-    latent_shape = shape(batch, latent_channels, latent_height, latent_width)
     token_shape = shape(batch, latent_tokens, transformer_width_val)
     text_cond_shape = shape(batch, prompt_tokens, text_hidden)
 
@@ -2489,9 +2911,9 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
             "latent → patch tokens",
             "将 latent 空间切分为 patch token 序列。",
             latent_shape, token_shape,
-            [f"patch {transformer_patch}", f"tokens {latent_tokens}"],
+            [f"patch {transformer_patch_label}", f"tokens {latent_tokens}"],
             [detail("latent_shape", latent_shape), detail("token_shape", token_shape)],
-            [section("推导公式", [detail("patchify", f"[B, C, h, w] -> [B, tokens, width] = {token_shape}")])],
+            [section("推导公式", [detail("patchify", f"{latent_shape} -> [B, tokens, width] = {token_shape}")])],
             "core", parent_id="transformer", view_modes=["block"],
         ),
         build_node(
@@ -2555,7 +2977,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
             "patch tokens → latent",
             "将 patch token 序列还原为 latent 空间。",
             token_shape, latent_shape,
-            [f"tokens {latent_tokens}", f"patch {transformer_patch}"],
+            [f"tokens {latent_tokens}", f"patch {transformer_patch_label}"],
             [detail("token_shape", token_shape), detail("latent_shape", latent_shape)],
             [section("推导公式", [detail("unpatchify", f"[B, tokens, width] -> [B, C, h, w] = {latent_shape}")])],
             "core", parent_id="transformer", view_modes=["block"],
@@ -2678,6 +3100,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         detail("去噪层数", transformer_layers),
         detail("推理步数", steps),
         detail("latent channels", latent_channels),
+        detail("latent frames", latent_frames) if is_video else detail("VAE spatial scale", spatial_scale_label),
         detail("latent tokens", latent_tokens),
         detail("scheduler", scheduler_config.get("_class_name", "-")),
     ]
@@ -2689,8 +3112,14 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         {"name": "image_width", "label": "图像宽", "type": "number", "value": image_width, "min": 64, "max": 4096, "step": 8, "help": "输出图像宽度"},
         {"name": "steps", "label": "推理步数", "type": "number", "value": steps, "min": 1, "max": 200, "step": 1, "help": "scheduler 迭代步数"},
     ]
+    if is_video:
+        controls.insert(4, {"name": "frames", "label": "视频帧数", "type": "number", "value": frames, "min": 1, "max": 1024, "step": 1, "help": "输出视频帧数"})
 
-    headline = "Diffusion pipeline，文本条件与 latent 空间共同驱动 transformer 去噪，再通过 VAE 解码为图像。"
+    headline = (
+        "Video diffusion pipeline，文本条件与时空 latent 共同驱动 transformer 去噪，再通过 VAE 解码为视频。"
+        if is_video
+        else "Diffusion pipeline，文本条件与 latent 空间共同驱动 transformer 去噪，再通过 VAE 解码为图像。"
+    )
     return base_model_payload(
         model_id,
         "diffusers",
@@ -2703,6 +3132,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
             "seq_len": prompt_tokens,
             "image_height": image_height,
             "image_width": image_width,
+            "frames": frames,
             "steps": steps,
         },
         build_graph(lanes, nodes, edges),

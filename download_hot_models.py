@@ -114,6 +114,9 @@ def get_hot_models(
     Returns:
         模型信息列表，每项包含 Path/Name/Downloads/ChineseName 等字段
     """
+    if limit <= 0:
+        return []
+
     session = requests.Session()
     headers = {
         "Accept": "application/json, text/plain, */*",
@@ -196,9 +199,17 @@ def download_model_config(
     Returns:
         下载结果字典 {model_id, status, path, files, error}
     """
-    result = {"model_id": model_id, "status": "pending", "path": "", "files": [], "error": ""}
+    result = {"model_id": model_id, "status": "pending", "path": "", "files": [], "downloaded_files": [], "error": ""}
     t0 = time.time()
     try:
+        before: Dict[str, tuple[int, int]] = {}
+        if os.path.isdir(local_dir):
+            for root, _dirs, files in os.walk(local_dir):
+                for filename in files:
+                    path = os.path.join(root, filename)
+                    stat = os.stat(path)
+                    before[os.path.relpath(path, local_dir)] = (stat.st_size, stat.st_mtime_ns)
+
         kwargs = dict(
             model_id=model_id,
             local_dir=local_dir,
@@ -211,19 +222,25 @@ def download_model_config(
         model_dir = snapshot_download(**kwargs)
         # 收集实际下载的文件
         downloaded_files = []
+        changed_files = []
         if model_dir and os.path.isdir(model_dir):
             for root, _dirs, files in os.walk(model_dir):
                 for f in files:
                     fp = os.path.join(root, f)
                     rel = os.path.relpath(fp, model_dir)
-                    size = os.path.getsize(fp)
-                    downloaded_files.append({"file": rel, "size": size})
+                    stat = os.stat(fp)
+                    entry = {"file": rel, "size": stat.st_size}
+                    downloaded_files.append(entry)
+                    if before.get(rel) != (stat.st_size, stat.st_mtime_ns):
+                        changed_files.append(entry)
 
         result["status"] = "success"
         result["path"] = model_dir or local_dir
         result["files"] = downloaded_files
+        result["downloaded_files"] = changed_files
         result["elapsed"] = round(time.time() - t0, 1)
         result["total_size"] = sum(f["size"] for f in downloaded_files)
+        result["downloaded_size"] = sum(f["size"] for f in changed_files)
     except Exception as e:
         result["status"] = "failed"
         result["error"] = f"{type(e).__name__}: {e}"
@@ -353,7 +370,9 @@ def main():
             success_count += 1
             n_files = len(res["files"])
             total_sz = format_size(res.get("total_size", 0))
-            print(f"       [成功] {n_files} 个文件, 共 {total_sz}, 耗时 {res['elapsed']}s")
+            changed_count = len(res.get("downloaded_files", []))
+            changed_size = format_size(res.get("downloaded_size", 0))
+            print(f"       [成功] 目录共 {n_files} 个文件 / {total_sz}; 本次新增或更新 {changed_count} 个 / {changed_size}; 耗时 {res['elapsed']}s")
             for f in res["files"][:8]:
                 print(f"          - {f['file']}  ({format_size(f['size'])})")
             if len(res["files"]) > 8:
@@ -400,6 +419,8 @@ def main():
             "path": r.get("path", ""),
             "file_count": len(r.get("files", [])),
             "total_size": r.get("total_size", 0),
+            "downloaded_file_count": len(r.get("downloaded_files", [])),
+            "downloaded_size": r.get("downloaded_size", 0),
             "elapsed": r.get("elapsed", 0),
             "error": r.get("error", ""),
             "files": [{"file": f["file"], "size": f["size"]} for f in r.get("files", [])],

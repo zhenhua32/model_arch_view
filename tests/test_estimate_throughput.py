@@ -56,3 +56,54 @@ def test_lower_precision_improves_bandwidth_bound_decode():
 
 def test_zero_active_returns_empty():
     assert s.estimate_throughput(metrics(0), "bf16", 2048) == []
+
+
+def transformer_metrics():
+    cfg = {
+        "hidden_size": 1024,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "intermediate_size": 4096,
+        "vocab_size": 32000,
+    }
+    return s.estimate_llm_metrics(s.parse_llm_dims(cfg))
+
+
+def test_context_attention_makes_ttft_superlinear():
+    m = transformer_metrics()
+    short = s.estimate_throughput(m, "bf16", 1024)
+    long = s.estimate_throughput(m, "bf16", 4096)
+    for a, b in zip(short, long):
+        assert b["ttft_ms"] > a["ttft_ms"] * 4
+
+
+def test_long_context_kv_reads_reduce_decode_ceiling():
+    m = transformer_metrics()
+    short = s.estimate_throughput(m, "bf16", 1024)
+    long = s.estimate_throughput(m, "bf16", 32768)
+    for a, b in zip(short, long):
+        assert b["decode_tps"] < a["decode_tps"]
+        assert b["kv_read_bytes"] > a["kv_read_bytes"]
+
+
+def test_batch_changes_aggregate_throughput_and_ttft():
+    m = transformer_metrics()
+    one = s.estimate_throughput(m, "bf16", 2048, batch=1)
+    eight = s.estimate_throughput(m, "bf16", 2048, batch=8)
+    for a, b in zip(one, eight):
+        assert b["decode_tps"] >= a["decode_tps"]
+        assert b["ttft_ms"] == pytest.approx(a["ttft_ms"] * 8)
+
+
+def test_multi_gpu_rows_use_aggregate_ideal_ceiling():
+    m = transformer_metrics()
+    one = s.estimate_throughput(m, "bf16", 2048, batch=1)
+    counts = {gpu["name"]: 2 for gpu in s.GPU_REFERENCE}
+    two = s.estimate_throughput(m, "bf16", 2048, batch=1, gpu_counts=counts)
+    for a, b in zip(one, two):
+        assert b["gpu_count"] == 2
+        assert b["compute_tps"] == pytest.approx(a["compute_tps"] * 2)
+        assert b["bandwidth_tps"] == pytest.approx(a["bandwidth_tps"] * 2)
+        assert b["ttft_ms"] == pytest.approx(a["ttft_ms"] / 2)

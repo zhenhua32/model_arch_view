@@ -47,9 +47,19 @@ python serve_model_arch.py --port 8123
 - 多模态：根据 patch_size、merge_size、vision_config、processor_config 推导图像或视频 token 数
 - Diffusers：根据 VAE 下采样倍率、transformer patch_size、scheduler 步数推导 latent token 流
 
+## 估算口径
+
+- LLM 参数量区分 gated / 非 gated FFN、稠密层、路由专家、共享专家和可选 MTP 辅助层。
+- Decode FLOPs 包含线性层以及当前上下文长度对应的 QK / AV 注意力计算。
+- KV cache 和 decode 带宽会按 full / sliding attention 层分别应用上下文窗口。
+- 显存中的激活项按可复用的单层 inference workspace 粗估，不按层数重复累计。
+- GPU 卡数仍只是容量下界；真实部署还受并行切分、通信和框架常驻显存影响。
+- Diffusers 视频模型的 token 数包含 VAE 时间压缩与 3D transformer patch。
+
 ## 已知限制
 
 - 对未适配的自定义模型目录，只会展示摘要而不是完整图结构
 - 某些模型的真实视觉 token 合并策略可能比配置文件更复杂，因此图中的 token 数是近似值
 - 是否必须输入条件图像，部分 diffusion pipeline 只能根据目录结构做推断，页面会给出提示
+- 量化权重的 scale / zero-point 元数据和不同推理引擎的 kernel 效率不包含在理论上限中
 

@@ -22,8 +22,8 @@ GOLDEN = {
     "ZhipuAI__GLM-5.2-FP8": dict(total=743061061632, active=39982989312, kv=87.8, gflops=80.0),
     "ZhipuAI__GLM-5.2": dict(total=743061061632, active=39982989312, kv=87.8, gflops=80.0),
     "deepseek-ai__DeepSeek-V4-Pro": dict(total=1592836423680, active=68691623936, kv=68.6, gflops=137.4),
-    "meituan-longcat__LongCat-2.0-FP8": dict(total=1475806756864, active=7498366976, kv=42.8, gflops=15.0),
-    "Tencent-Hunyuan__Hy3": dict(total=293479645184, active=18626904064, kv=320.0, gflops=37.3),
+    "meituan-longcat__LongCat-2.0-FP8": dict(total=1592105893888, active=51488227328, kv=42.8, gflops=103.0),
+    "Tencent-Hunyuan__Hy3": dict(total=294970720256, active=20117979136, kv=320.0, gflops=40.2),
     # --- Standard GQA MoE (num_local_experts alias) ---
     "MiniMax__MiniMax-M2.7": dict(total=228640161792, active=10366353408, kv=248.0, gflops=20.7),
     # --- Dense GQA (bf16, exact vs checkpoint) ---

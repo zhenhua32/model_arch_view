@@ -1,5 +1,7 @@
 # GLM-5.2-FP8 架构指标核查报告
 
+> 更新说明：当前页面已把 FLOPs 拆为线性层与上下文相关的 QK/AV 项。本文中的 `80.0 GFLOPs/token` 是不含上下文 attention 的线性基线；页面会按当前 `seq_len` 显示更高的 decode FLOPs。
+
 > 核查对象：`ZhipuAI/GLM-5.2-FP8`
 > 被核查数值来源：`serve_model_arch.py`（估算段 line 1164–1184 的通用公式）
 > 真值依据：`config.json` + `model.safetensors.index.json`（`total_size = 755,617,140,416` 字节）
