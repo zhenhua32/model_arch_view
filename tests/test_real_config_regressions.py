@@ -77,6 +77,36 @@ def test_diffusers_aliases_and_video_time_tokens():
     assert any(control["name"] == "frames" for control in lingbot_payload["controls"])
 
 
+def test_wan_configs_without_model_index_use_video_latent_math():
+    abot = s.build_model_payload("amap_cvlab__ABot-World-0-5B-LF", {})
+    abot_summary = _summary(abot)
+    assert abot_summary["Transformer 宽度"] == "3072"
+    assert abot_summary["去噪层数"] == "30"
+    assert abot_summary["latent frames"] == "21"
+    assert abot_summary["latent tokens"] == "86016"
+    text_condition = next(node for node in abot["graph"]["nodes"] if node["id"] == "text_condition")
+    assert text_condition["outputShape"] == "[1, 256, 4096]"
+    assert "image_condition_input" in {node["id"] for node in abot["graph"]["nodes"]}
+
+    i2v = s.build_model_payload("Wan-AI__Wan2.2-I2V-A14B", {})
+    assert _summary(i2v)["去噪阶段"] == "2"
+    assert _summary(i2v)["latent tokens"] == "86016"
+
+    t2v = s.build_model_payload("Wan-AI__Wan2.2-T2V-A14B", {})
+    assert "image_condition_input" not in {node["id"] for node in t2v["graph"]["nodes"]}
+
+
+def test_longcat_avatar_uses_audio_conditioning_dimensions():
+    payload = s.build_model_payload("meituan-longcat__LongCat-Video-Avatar-1.5", {})
+    summary = _summary(payload)
+    assert summary["Transformer 宽度"] == "4096"
+    assert summary["去噪层数"] == "48"
+    assert summary["音频条件"] == "32 x 1280"
+    nodes = {node["id"]: node for node in payload["graph"]["nodes"]}
+    assert nodes["audio_condition_input"]["outputShape"] == "[1, 32, 1280]"
+    assert payload["parameters"]["audio_tokens"] == 32
+
+
 def test_mla_graph_uses_qk_dimension_and_caches_rope_key():
     payload = s.build_model_payload("ZhipuAI__GLM-5.2", {})
     nodes = {node["id"]: node for node in payload["graph"]["nodes"]}
@@ -152,12 +182,49 @@ def test_audio_segmentation_and_tts_models_use_dedicated_payloads():
     assert _summary(sam)["类型"] == "视频分割"
     assert sam["parameters"]["patch_size"] == 14
     assert sam["parameters"]["tokens_per_frame"] == 5184
+    assert sam["parameters"]["prompt_tokens"] == 16
     assert "lm_head" not in {node["id"] for node in sam["graph"]["nodes"]}
 
     moss = s.build_model_payload("openmoss__MOSS-TTS", {})
     assert _summary(moss)["类型"] == "语音合成"
     assert moss["parameters"]["n_vq"] == 32
     assert moss["parameters"]["delayed_steps"] == 781
+
+
+def test_non_delay_tts_families_use_their_real_acoustic_backends():
+    cosy = s.build_model_payload("iic__CosyVoice2-0.5B", {})
+    cosy_summary = _summary(cosy)
+    assert cosy_summary["语言隐藏维度"] == "896"
+    assert cosy_summary["主干层数"] == "24"
+    assert cosy_summary["声学预测头"] == "1"
+    assert cosy_summary["声学后端"] == "Causal CFM + HiFT"
+    assert cosy["parameters"]["waveform_samples"] == 720_000
+    cosy_nodes = {node["id"]: node for node in cosy["graph"]["nodes"]}
+    assert "delay_pattern" not in cosy_nodes
+    assert cosy_nodes["flow_decoder"]["outputShape"] == "[1, 1500, 80]"
+    assert cosy_nodes["vocoder"]["outputShape"] == "[1, 720000]"
+
+    index = s.build_model_payload("IndexTeam__IndexTTS-2", {})
+    index_summary = _summary(index)
+    assert index_summary["语言隐藏维度"] == "1280"
+    assert index_summary["声学后端"] == "S2Mel DiT + BigVGAN"
+    assert index["parameters"]["sample_rate"] == 22_050
+    assert "s2mel_dit" in {node["id"] for node in index["graph"]["nodes"]}
+
+    vox = s.build_model_payload("OpenBMB__VoxCPM2", {})
+    vox_summary = _summary(vox)
+    assert vox_summary["语言隐藏维度"] == "2048"
+    assert vox_summary["声学后端"] == "Residual LM + DiT + Audio VAE"
+    assert vox["parameters"]["sample_rate"] == 48_000
+    assert {"residual_lm", "audio_dit", "audio_vae_decoder"}.issubset(
+        {node["id"] for node in vox["graph"]["nodes"]}
+    )
+
+
+def test_tagged_yaml_mappings_keep_their_children():
+    config = s.supplemental_yaml_config(s.MODEL_CONFIGS_DIR / "iic__CosyVoice2-0.5B")
+    assert config["mel_spec_transform1"]["hop_size"] == 480
+    assert config["filter"]["token_max_length"] == 200
 
 
 def test_deepseek_v4_uses_compressed_mqa_and_mixed_precision_profile():

@@ -75,7 +75,13 @@ def read_simple_yaml_file(path: Path) -> dict[str, Any]:
         while len(stack) > 1 and indent <= stack[-1][0]:
             stack.pop()
         parent = stack[-1][1]
-        if raw_value.strip():
+        stripped_value = raw_value.strip()
+        if stripped_value.startswith("!"):
+            child = {"_tag": stripped_value}
+            parent[key] = child
+            stack.append((indent, child))
+            continue
+        if stripped_value:
             parent[key] = _parse_simple_yaml_scalar(raw_value)
             continue
         child: dict[str, Any] = {}
@@ -85,7 +91,7 @@ def read_simple_yaml_file(path: Path) -> dict[str, Any]:
 
 
 def supplemental_yaml_config(model_dir: Path) -> dict[str, Any]:
-    for name in ("config.yaml", "config.yml"):
+    for name in ("config.yaml", "config.yml", "cosyvoice2.yaml"):
         path = model_dir / name
         if path.exists():
             return read_simple_yaml_file(path)
@@ -219,8 +225,47 @@ _DIFFUSERS_COMPONENT_KEYS = {
 }
 
 
+_DIFFUSION_TRANSFORMER_CONFIG_PATHS = (
+    "config.json",
+    "transformer/config.json",
+    "base_model/config.json",
+    "low_noise_model/config.json",
+    "high_noise_model/config.json",
+)
+
+
+def is_diffusion_transformer_config(config: dict[str, Any]) -> bool:
+    class_name = str(config.get("_class_name") or "").lower()
+    has_width = any(config.get(key) for key in ("hidden_size", "dim", "model_dim", "num_attention_heads", "num_heads"))
+    has_depth = any(config.get(key) for key in ("num_hidden_layers", "num_layers", "depth", "num_transformer_blocks"))
+    diffusion_class = any(token in class_name for token in ("wanmodel", "transformer2d", "transformer3d", "videotransformer", "ditmodel"))
+    return bool(has_width and has_depth and (diffusion_class or config.get("_diffusers_version")))
+
+
+def discover_diffusion_transformer_configs(model_dir: Path) -> list[tuple[dict[str, Any], str]]:
+    discovered: list[tuple[dict[str, Any], str]] = []
+    for relative_path in _DIFFUSION_TRANSFORMER_CONFIG_PATHS:
+        path = model_dir / relative_path
+        if not path.exists():
+            continue
+        config = read_json_file(path)
+        if is_diffusion_transformer_config(config):
+            discovered.append((config, relative_path))
+    return discovered
+
+
+def has_llm_dimensions(config: dict[str, Any], params: dict[str, Any] | None = None) -> bool:
+    params = params or {}
+    hidden_size = first_defined(config.get("hidden_size"), params.get("dim"))
+    num_layers = first_defined(config.get("num_hidden_layers"), config.get("num_layers"), params.get("n_layers"))
+    try:
+        return int(hidden_size or 0) > 0 and int(num_layers or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _model_identity(config: dict[str, Any], yaml_config: dict[str, Any] | None = None) -> str:
-    values: list[Any] = [config.get("model_type")]
+    values: list[Any] = [config.get("model_type"), config.get("architecture"), config.get("task")]
     architectures = config.get("architectures")
     if isinstance(architectures, list):
         values.extend(architectures)
@@ -245,7 +290,7 @@ def is_asr_model_config(config: dict[str, Any], yaml_config: dict[str, Any] | No
 
 def is_tts_model_config(config: dict[str, Any]) -> bool:
     identity = _model_identity(config)
-    return "tts" in identity or "texttospeech" in identity
+    return "tts" in identity or "texttospeech" in identity or "text-to-speech" in identity or bool(config.get("audio_vae_config") and config.get("lm_config"))
 
 
 def is_sam_video_config(config: dict[str, Any]) -> bool:
@@ -270,6 +315,9 @@ def classify_model_dir(model_dir: Path) -> str:
         if any(key in index_data for key in _DIFFUSERS_COMPONENT_KEYS):
             return "diffusers"
 
+    if discover_diffusion_transformer_configs(model_dir):
+        return "diffusers"
+
     config = primary_config(model_dir)
     yaml_config = supplemental_yaml_config(model_dir)
     params = read_json_file(model_dir / "params.json")
@@ -291,7 +339,11 @@ def classify_model_dir(model_dir: Path) -> str:
     ):
         return "multimodal"
 
-    if config or params or yaml_config:
+    task = str(config.get("task") or "").lower()
+    if task and not any(token in task for token in ("text-generation", "feature-extraction", "sentence-similarity")):
+        return "unknown"
+
+    if has_llm_dimensions(config, params):
         return "llm"
 
     return "unknown"
@@ -300,11 +352,18 @@ def classify_model_dir(model_dir: Path) -> str:
 def infer_architecture_name(model_dir: Path, model_type: str) -> str:
     if model_type == "diffusers":
         model_index = read_json_file(model_dir / "model_index.json")
-        return str(model_index.get("_class_name") or "DiffusersPipeline")
+        if model_index.get("_class_name"):
+            return str(model_index["_class_name"])
+        discovered = discover_diffusion_transformer_configs(model_dir)
+        if discovered:
+            return str(discovered[0][0].get("_class_name") or "DiffusionTransformer")
+        return "DiffusersPipeline"
 
     config = primary_config(model_dir)
     if config.get("architectures"):
         return str(config["architectures"][0])
+    if config.get("architecture"):
+        return str(config["architecture"])
 
     params = read_json_file(model_dir / "params.json")
     if params.get("vision_encoder"):
@@ -316,6 +375,8 @@ def infer_architecture_name(model_dir: Path, model_type: str) -> str:
     yaml_architecture = first_defined(yaml_config.get("model"), yaml_config.get("audio_encoder"), yaml_config.get("encoder"))
     if yaml_architecture:
         return str(yaml_architecture)
+    if is_tts_model_config(config):
+        return human_model_name(model_dir.name).split("/")[-1]
 
     return "UnknownModel"
 
@@ -2664,7 +2725,7 @@ def build_sam_video_payload(model_dir: Path, model_id: str, query: dict[str, lis
             {"name": "objects", "label": "对象数", "type": "number", "value": object_count, "min": 1, "max": 256, "step": 1, "help": "同时跟踪的对象数量"},
             {"name": "prompt_tokens", "label": "提示 token", "type": "number", "value": prompt_tokens, "min": 1, "max": 512, "step": 1, "help": "文本或几何提示长度"},
         ],
-        {"batch": batch, "frames": frames, "image_height": image_height, "image_width": image_width, "objects": object_count, "patch_size": patch_size, "tokens_per_frame": tokens_per_frame, "total_vision_tokens": total_vision_tokens},
+        {"batch": batch, "frames": frames, "image_height": image_height, "image_width": image_width, "objects": object_count, "prompt_tokens": prompt_tokens, "patch_size": patch_size, "tokens_per_frame": tokens_per_frame, "total_vision_tokens": total_vision_tokens},
         build_graph(lanes, nodes, edges),
         ["视觉 token 数按 patch 网格计算；FPN 的多尺度特征图数量与内部重采样细节未重复累加为独立 token。"],
         sources,
@@ -2672,50 +2733,186 @@ def build_sam_video_payload(model_dir: Path, model_id: str, query: dict[str, lis
     )
 
 
+def discover_nested_text_backbone_config(model_dir: Path) -> tuple[dict[str, Any], str | None]:
+    for path in sorted(model_dir.glob("*/config.json")):
+        config = read_json_file(path)
+        if config.get("hidden_size") and config.get("num_hidden_layers"):
+            return config, str(path.relative_to(model_dir)).replace("\\", "/")
+    return {}, None
+
+
 def build_tts_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
     config = primary_config(model_dir)
+    yaml_config = supplemental_yaml_config(model_dir)
     architecture = infer_architecture_name(model_dir, "multimodal")
-    language_config = config.get("language_config") if isinstance(config.get("language_config"), dict) else {}
-    hidden_size = scalar_int(language_config.get("hidden_size"), 2048)
-    num_layers = scalar_int(language_config.get("num_hidden_layers"), 1)
-    num_heads = scalar_int(language_config.get("num_attention_heads"), 1)
-    vocab_size = scalar_int(language_config.get("vocab_size"), 0)
+    if architecture == "UnknownModel":
+        architecture = human_model_name(model_id).split("/")[-1]
+    nested_text_config, nested_text_source = discover_nested_text_backbone_config(model_dir)
+    yaml_gpt = yaml_config.get("gpt") if isinstance(yaml_config.get("gpt"), dict) else {}
+    yaml_llm = yaml_config.get("llm") if isinstance(yaml_config.get("llm"), dict) else {}
+    yaml_flow = yaml_config.get("flow") if isinstance(yaml_config.get("flow"), dict) else {}
+    yaml_hift = yaml_config.get("hift") if isinstance(yaml_config.get("hift"), dict) else {}
+    yaml_s2mel = yaml_config.get("s2mel") if isinstance(yaml_config.get("s2mel"), dict) else {}
+    language_config = first_defined(
+        config.get("language_config") if isinstance(config.get("language_config"), dict) else None,
+        config.get("lm_config") if isinstance(config.get("lm_config"), dict) else None,
+        yaml_gpt,
+        nested_text_config,
+        {},
+    ) or {}
+    hidden_size = scalar_int(first_defined(language_config.get("hidden_size"), language_config.get("model_dim"), yaml_config.get("llm_input_size")), 2048)
+    num_layers = scalar_int(first_defined(language_config.get("num_hidden_layers"), language_config.get("layers")), 1)
+    num_heads = scalar_int(first_defined(language_config.get("num_attention_heads"), language_config.get("heads")), 1)
+    vocab_size = scalar_int(first_defined(language_config.get("vocab_size"), language_config.get("number_text_tokens")), 0)
     n_vq = scalar_int(config.get("n_vq"), 1)
-    audio_vocab_size = scalar_int(config.get("audio_vocab_size"), 0)
-    sample_rate = scalar_int(config.get("sampling_rate"), 24000)
+    audio_vocab_size = scalar_int(first_defined(config.get("audio_vocab_size"), language_config.get("number_mel_codes"), yaml_llm.get("speech_token_size"), yaml_flow.get("vocab_size")), 0)
+    dataset_config = yaml_config.get("dataset") if isinstance(yaml_config.get("dataset"), dict) else {}
+    audio_vae_config = config.get("audio_vae_config") if isinstance(config.get("audio_vae_config"), dict) else {}
+    s2mel_preprocess = yaml_s2mel.get("preprocess_params") if isinstance(yaml_s2mel.get("preprocess_params"), dict) else {}
+    sample_rate = scalar_int(first_defined(config.get("sampling_rate"), audio_vae_config.get("out_sample_rate"), s2mel_preprocess.get("sr"), yaml_config.get("sample_rate"), dataset_config.get("sample_rate")), 24000)
+    max_text_tokens = scalar_int(first_defined(language_config.get("max_text_tokens"), config.get("max_length"), language_config.get("max_position_embeddings")), 8192)
+    max_audio_frames = scalar_int(first_defined(language_config.get("max_mel_tokens"), config.get("max_length")), 16384)
     batch = clamp_int(query.get("batch", [1])[0], 1, maximum=16)
-    text_tokens = clamp_int(query.get("text_tokens", [256])[0], 256, maximum=8192)
-    audio_frames = clamp_int(query.get("audio_frames", [750])[0], 750, maximum=16384)
-    delayed_steps = audio_frames + max(n_vq - 1, 0)
-    total_steps = text_tokens + delayed_steps
-    prediction_heads = n_vq + 1
+    text_tokens = clamp_int(query.get("text_tokens", [min(max_text_tokens, 256)])[0], min(max_text_tokens, 256), maximum=max_text_tokens)
+    audio_frames = clamp_int(query.get("audio_frames", [min(max_audio_frames, 750)])[0], min(max_audio_frames, 750), maximum=max_audio_frames)
+    uses_delay_pattern = n_vq > 1 or "delay" in str(config.get("model_type") or "").lower()
+    audio_steps = audio_frames + max(n_vq - 1, 0) if uses_delay_pattern else audio_frames
+    total_steps = text_tokens + audio_steps
+    prediction_heads = n_vq + 1 if uses_delay_pattern else 1
+    dit_config = config.get("dit_config") if isinstance(config.get("dit_config"), dict) else {}
+    encoder_config = config.get("encoder_config") if isinstance(config.get("encoder_config"), dict) else {}
+    is_continuous_tts = bool(audio_vae_config and dit_config and not audio_vocab_size)
+    token_frame_rate = scalar_int(yaml_config.get("token_frame_rate"), 0)
+    token_mel_ratio = scalar_int(yaml_config.get("token_mel_ratio"), 1)
+    mel_spec_config = yaml_config.get("mel_spec_transform1") if isinstance(yaml_config.get("mel_spec_transform1"), dict) else {}
+    mel_hop = scalar_int(mel_spec_config.get("hop_size"), 0)
+    mel_frames = audio_frames * token_mel_ratio if yaml_flow else 0
+    waveform_samples = mel_frames * mel_hop if mel_frames and mel_hop else 0
 
-    lanes = [("inputs", "输入"), ("processing", "处理"), ("backbone", "主干"), ("output", "输出")]
+    if uses_delay_pattern:
+        sequence_name = "Delay Pattern"
+        sequence_description = "对并行 RVQ 码本按 codebook 索引错位，形成延迟调度序列。"
+        sequence_input_shape = shape(batch, audio_frames, n_vq)
+        sequence_output_shape = shape(batch, audio_steps, n_vq)
+        sequence_sections = [section("推导公式", [detail("delay steps", f"{audio_frames} + {n_vq} - 1 = {audio_steps}")])]
+        sequence_kind = "RVQ codebooks"
+    elif is_continuous_tts:
+        latent_dim = scalar_int(first_defined(config.get("scalar_quantization_latent_dim"), audio_vae_config.get("latent_dim"), config.get("feat_dim")), 0)
+        sequence_name = "声学潜变量序列"
+        sequence_description = "组织连续或标量量化的声学潜变量 patch，供语言主干与残差生成器建模。"
+        sequence_input_shape = shape(batch, audio_frames, latent_dim or "latent")
+        sequence_output_shape = sequence_input_shape
+        sequence_sections = [section("声学表示", [detail("latent_dim", latent_dim), detail("patch_size", config.get("patch_size"))])]
+        sequence_kind = "continuous latents"
+    else:
+        sequence_name = "声学 Token 序列"
+        sequence_description = "组织单码流语音 token 或 mel code；没有多码本错位，因此序列长度保持不变。"
+        sequence_input_shape = shape(batch, audio_frames)
+        sequence_output_shape = sequence_input_shape
+        sequence_sections = [section("序列长度", [detail("acoustic steps", f"{audio_frames} = {audio_steps}")])]
+        sequence_kind = "single acoustic stream"
+
+    lanes = [("inputs", "输入"), ("processing", "处理"), ("backbone", "主干"), ("synthesis", "声学解码"), ("output", "输出")]
     nodes = [
         build_node("tts_text_input", "inputs", 0, "文本输入", "token ids", "待合成文本与控制提示。", shape(batch, text_tokens), shape(batch, text_tokens, hidden_size), [f"text {text_tokens}"], [detail("text_tokens", text_tokens), detail("hidden_size", hidden_size)], [section("输入", [detail("text hidden", shape(batch, text_tokens, hidden_size))])], "text"),
-        build_node("delay_pattern", "processing", 0, "Delay Pattern", f"{n_vq} RVQ codebooks", "对并行 RVQ 码本按 codebook 索引错位，形成延迟调度序列。", shape(batch, audio_frames, n_vq), shape(batch, delayed_steps, n_vq), [f"frames {audio_frames}", f"steps {delayed_steps}"], [detail("audio_frames", audio_frames), detail("n_vq", n_vq), detail("delay_steps", delayed_steps)], [section("推导公式", [detail("delayed steps", f"{audio_frames} + {n_vq} - 1 = {delayed_steps}")])], "audio"),
-        build_node("tts_backbone", "backbone", 0, "Transformer 主干", f"{num_layers} layers / {num_heads} heads", "单一语言主干联合建模文本与延迟音频序列。", shape(batch, total_steps, hidden_size), shape(batch, total_steps, hidden_size), [f"hidden {hidden_size}", f"steps {total_steps}"], [detail("text_tokens", text_tokens), detail("delayed_audio_steps", delayed_steps), detail("total_steps", total_steps)], [section("上下文", [detail("text + delayed audio", f"{text_tokens} + {delayed_steps} = {total_steps}")])], "core"),
-        build_node("parallel_heads", "output", 0, "并行预测头", f"{prediction_heads} heads", "一个文本头加多个 RVQ 音频码本头。", shape(batch, delayed_steps, hidden_size), shape(batch, delayed_steps, n_vq, audio_vocab_size or "audio_vocab"), [f"RVQ {n_vq}", f"audio vocab {audio_vocab_size or '?'}"], [detail("prediction_heads", prediction_heads), detail("audio_logits", shape(batch, delayed_steps, n_vq, audio_vocab_size or "audio_vocab")), detail("text_vocab", vocab_size)], [section("输出", [detail("parallel RVQ logits", shape(batch, delayed_steps, n_vq, audio_vocab_size or "audio_vocab"))])], "head"),
-        build_node("codec_decoder", "output", 1, "音频 Codec 解码", f"waveform @ {sample_rate} Hz", "将 RVQ code 还原为波形；配置未提供 codec hop，因此不伪造样本长度。", shape(batch, audio_frames, n_vq), shape(batch, "waveform_samples"), [f"{sample_rate} Hz"], [detail("codec_frames", audio_frames), detail("sample_rate", sample_rate)], [section("输出", [detail("waveform", shape(batch, "waveform_samples"))])], "output"),
+        build_node("delay_pattern" if uses_delay_pattern else "acoustic_sequence", "processing", 0, sequence_name, sequence_kind, sequence_description, sequence_input_shape, sequence_output_shape, [f"units {audio_frames}", f"steps {audio_steps}"], [detail("audio_units", audio_frames), detail("n_vq", n_vq if uses_delay_pattern else None), detail("sequence_steps", audio_steps)], sequence_sections, "audio"),
+        build_node("tts_backbone", "backbone", 0, "Transformer 主干", f"{num_layers} layers / {num_heads} heads", "语言主干联合建模文本条件与自回归声学序列。", shape(batch, total_steps, hidden_size), shape(batch, total_steps, hidden_size), [f"hidden {hidden_size}", f"steps {total_steps}"], [detail("text_tokens", text_tokens), detail("acoustic_steps", audio_steps), detail("total_steps", total_steps)], [section("上下文", [detail("text + acoustic", f"{text_tokens} + {audio_steps} = {total_steps}")])], "core"),
     ]
-    edges = [build_edge("tts_text_input", "tts_backbone", "text hidden"), build_edge("delay_pattern", "tts_backbone", "delayed audio tokens"), build_edge("tts_backbone", "parallel_heads", "hidden states"), build_edge("parallel_heads", "codec_decoder", "RVQ codes")]
+    sequence_node_id = "delay_pattern" if uses_delay_pattern else "acoustic_sequence"
+    prediction_node_id = "parallel_heads" if uses_delay_pattern else "acoustic_head"
+    if uses_delay_pattern:
+        prediction_shape = shape(batch, audio_steps, n_vq, audio_vocab_size or "audio_vocab")
+        prediction_name = "并行预测头"
+        prediction_subtitle = f"{prediction_heads} heads"
+        prediction_description = "一个文本头加多个 RVQ 音频码本头。"
+    elif is_continuous_tts:
+        prediction_width = scalar_int(first_defined(config.get("scalar_quantization_latent_dim"), audio_vae_config.get("latent_dim"), config.get("feat_dim")), 0)
+        prediction_shape = shape(batch, audio_steps, prediction_width or "latent")
+        prediction_name = "声学潜变量预测"
+        prediction_subtitle = f"latent {prediction_width or '?'}"
+        prediction_description = "主语言模型预测粗粒度声学潜变量，再由残差语言模型与 DiT 细化。"
+    else:
+        prediction_shape = shape(batch, audio_steps, audio_vocab_size or "audio_vocab")
+        prediction_name = "声学 Token 预测头"
+        prediction_subtitle = f"vocab {audio_vocab_size or '?'}"
+        prediction_description = "单一声学码流预测头；不额外虚构文本生成头或 RVQ 并行头。"
+    nodes.append(build_node(prediction_node_id, "backbone", 1, prediction_name, prediction_subtitle, prediction_description, shape(batch, audio_steps, hidden_size), prediction_shape, [f"heads {prediction_heads}", f"steps {audio_steps}"], [detail("prediction_heads", prediction_heads), detail("prediction", prediction_shape), detail("text_vocab", vocab_size)], [section("输出", [detail("acoustic prediction", prediction_shape)])], "head"))
+
+    edges = [
+        build_edge("tts_text_input", "tts_backbone", "text hidden"),
+        build_edge(sequence_node_id, "tts_backbone", "acoustic sequence"),
+        build_edge("tts_backbone", prediction_node_id, "hidden states"),
+    ]
+    synthesis_label = "音频解码"
+    warning = "配置未提供声学序列到波形时长的确定换算关系，因此不把序列长度强行换算成音频秒数。"
+    if uses_delay_pattern:
+        nodes.append(build_node("codec_decoder", "synthesis", 0, "音频 Codec 解码", f"waveform @ {sample_rate} Hz", "将并行 RVQ code 还原为波形；配置未提供 codec hop。", shape(batch, audio_frames, n_vq), shape(batch, "waveform_samples"), [f"{sample_rate} Hz"], [detail("codec_frames", audio_frames), detail("sample_rate", sample_rate)], [section("输出", [detail("waveform", shape(batch, "waveform_samples"))])], "output"))
+        edges.append(build_edge(prediction_node_id, "codec_decoder", "RVQ codes"))
+        synthesis_label = "RVQ Codec"
+    elif yaml_flow:
+        flow_encoder = yaml_flow.get("encoder") if isinstance(yaml_flow.get("encoder"), dict) else {}
+        flow_decoder = yaml_flow.get("decoder") if isinstance(yaml_flow.get("decoder"), dict) else {}
+        flow_estimator = flow_decoder.get("estimator") if isinstance(flow_decoder.get("estimator"), dict) else {}
+        mel_channels = scalar_int(first_defined(yaml_flow.get("output_size"), flow_estimator.get("out_channels")), 80)
+        nodes.extend([
+            build_node("flow_decoder", "synthesis", 0, "因果 Flow Matching", f"{scalar_int(flow_encoder.get('num_blocks'), 0)} conformer + {scalar_int(flow_estimator.get('num_mid_blocks'), 0)} mid blocks", "将离散语音 token 上采样并生成 mel 频谱。", shape(batch, audio_steps), shape(batch, mel_frames or "mel_frames", mel_channels), [f"token:mel 1:{token_mel_ratio}", f"mel {mel_channels}"], [detail("token_frames", audio_frames), detail("token_mel_ratio", token_mel_ratio), detail("mel_frames", mel_frames), detail("mel_channels", mel_channels)], [section("帧数推导", [detail("mel frames", f"{audio_frames} * {token_mel_ratio} = {mel_frames}")])], "audio"),
+            build_node("vocoder", "output", 0, "HiFT 声码器", f"waveform @ {sample_rate} Hz", "按配置中的 mel hop 将频谱还原为波形。", shape(batch, mel_frames, mel_channels), shape(batch, waveform_samples or "waveform_samples"), [f"hop {mel_hop or '?'}", f"{sample_rate} Hz"], [detail("mel_frames", mel_frames), detail("hop_size", mel_hop), detail("waveform_samples", waveform_samples), detail("duration_seconds", round(waveform_samples / sample_rate, 3) if waveform_samples else None)], [section("样本数推导", [detail("waveform samples", f"{mel_frames} * {mel_hop} = {waveform_samples}")])], "output"),
+        ])
+        edges.extend([build_edge(prediction_node_id, "flow_decoder", "speech tokens"), build_edge("flow_decoder", "vocoder", "mel spectrogram")])
+        synthesis_label = "Causal CFM + HiFT"
+        warning = "语音 token 帧率、token/mel 比和 mel hop 均来自配置，当前波形时长可精确由这些值推导。"
+    elif yaml_s2mel:
+        s2mel_dit = yaml_s2mel.get("DiT") if isinstance(yaml_s2mel.get("DiT"), dict) else {}
+        mel_channels = scalar_int(s2mel_dit.get("in_channels"), 80)
+        nodes.extend([
+            build_node("s2mel_dit", "synthesis", 0, "S2Mel DiT", f"{scalar_int(s2mel_dit.get('depth'), 0)} layers / hidden {scalar_int(s2mel_dit.get('hidden_dim'), 0)}", "将语义码流、风格与条件特征映射为 mel 频谱。", shape(batch, audio_steps), shape(batch, "mel_frames", mel_channels), [f"mel {mel_channels}", "flow matching"], [detail("DiT_depth", s2mel_dit.get("depth")), detail("hidden_dim", s2mel_dit.get("hidden_dim")), detail("mel_channels", mel_channels)], [section("输出", [detail("mel", shape(batch, "mel_frames", mel_channels))])], "audio"),
+            build_node("vocoder", "output", 0, "BigVGAN 声码器", f"waveform @ {sample_rate} Hz", "将 S2Mel 输出还原为波形；配置未声明语义码到 mel 帧的固定比例。", shape(batch, "mel_frames", mel_channels), shape(batch, "waveform_samples"), [f"{sample_rate} Hz"], [detail("vocoder", (yaml_config.get("vocoder") or {}).get("name") if isinstance(yaml_config.get("vocoder"), dict) else None), detail("sample_rate", sample_rate)], [section("输出", [detail("waveform", shape(batch, "waveform_samples"))])], "output"),
+        ])
+        edges.extend([build_edge(prediction_node_id, "s2mel_dit", "semantic codes"), build_edge("s2mel_dit", "vocoder", "mel spectrogram")])
+        synthesis_label = "S2Mel DiT + BigVGAN"
+    elif audio_vae_config and dit_config:
+        residual_layers = scalar_int(config.get("residual_lm_num_layers"), 0)
+        latent_dim = scalar_int(first_defined(config.get("scalar_quantization_latent_dim"), audio_vae_config.get("latent_dim"), config.get("feat_dim")), 0)
+        nodes.extend([
+            build_node("residual_lm", "synthesis", 0, "残差语言模型", f"{residual_layers} layers", "在主语言模型输出上继续细化声学潜变量。", prediction_shape, shape(batch, audio_steps, latent_dim or "latent"), [f"layers {residual_layers}", f"latent {latent_dim or '?'}"], [detail("layers", residual_layers), detail("latent_dim", latent_dim)], [section("输出", [detail("refined latents", shape(batch, audio_steps, latent_dim or "latent"))])], "core"),
+            build_node("audio_dit", "synthesis", 1, "声学 DiT", f"{scalar_int(dit_config.get('num_layers'), 0)} layers / hidden {scalar_int(dit_config.get('hidden_dim'), 0)}", "用条件流匹配将潜变量映射到音频 VAE latent。", shape(batch, audio_steps, latent_dim or "latent"), shape(batch, audio_steps, scalar_int(audio_vae_config.get("latent_dim"), 0) or "vae_latent"), [f"heads {scalar_int(dit_config.get('num_heads'), 0)}"], [detail("layers", dit_config.get("num_layers")), detail("hidden_dim", dit_config.get("hidden_dim")), detail("encoder_layers", encoder_config.get("num_layers"))], [section("输出", [detail("VAE latents", shape(batch, audio_steps, scalar_int(audio_vae_config.get("latent_dim"), 0) or "vae_latent"))])], "audio"),
+            build_node("audio_vae_decoder", "output", 0, "Audio VAE 解码", f"waveform @ {sample_rate} Hz", "将声学 DiT 输出解码为波形；配置未给出一个声学 patch 对应的固定样本数。", shape(batch, audio_steps, scalar_int(audio_vae_config.get("latent_dim"), 0) or "vae_latent"), shape(batch, "waveform_samples"), [f"{sample_rate} Hz"], [detail("decoder_dim", audio_vae_config.get("decoder_dim")), detail("decoder_rates", audio_vae_config.get("decoder_rates")), detail("sample_rate", sample_rate)], [section("输出", [detail("waveform", shape(batch, "waveform_samples"))])], "output"),
+        ])
+        edges.extend([build_edge(prediction_node_id, "residual_lm", "coarse latents"), build_edge("residual_lm", "audio_dit", "refined latents"), build_edge("audio_dit", "audio_vae_decoder", "VAE latents")])
+        synthesis_label = "Residual LM + DiT + Audio VAE"
+    else:
+        nodes.append(build_node("acoustic_decoder", "output", 0, "声学解码器", f"waveform @ {sample_rate} Hz", "将声学表示还原为波形；配置未公开内部时长换算。", prediction_shape, shape(batch, "waveform_samples"), [f"{sample_rate} Hz"], [detail("sample_rate", sample_rate)], [section("输出", [detail("waveform", shape(batch, "waveform_samples"))])], "output"))
+        edges.append(build_edge(prediction_node_id, "acoustic_decoder", "acoustic representation"))
     sources: list[str] = []
-    for source_name in ("config.json", "configuration.json", "processor_config.json"):
+    for source_name in ("config.json", "configuration.json", "config.yaml", "cosyvoice2.yaml", "processor_config.json"):
         append_source_file(model_dir, sources, source_name)
+    if nested_text_source and nested_text_source not in sources:
+        sources.append(nested_text_source)
+    headline = (
+        f"延迟模式 TTS，{audio_frames} 个 codec 帧展开为 {audio_steps} 个解码步。"
+        if uses_delay_pattern
+        else f"语音合成模型，当前按 {text_tokens} 个文本 token 与 {audio_frames} 个声学单元展示；声学后端为 {synthesis_label}。"
+    )
+    summary = [detail("类型", "语音合成"), detail("语言隐藏维度", hidden_size), detail("主干层数", num_layers)]
+    if uses_delay_pattern:
+        summary.extend([detail("RVQ 码本数", n_vq), detail("并行预测头", prediction_heads)])
+    else:
+        summary.extend([detail("声学码流", 1), detail("声学预测头", prediction_heads)])
+    summary.extend([detail("当前解码步", audio_steps), detail("声学后端", synthesis_label), detail("采样率", f"{sample_rate} Hz")])
     return base_model_payload(
         model_id,
         "multimodal",
         architecture,
-        f"延迟模式 TTS，{audio_frames} 个 codec 帧展开为 {delayed_steps} 个解码步。",
-        [detail("类型", "语音合成"), detail("语言隐藏维度", hidden_size), detail("主干层数", num_layers), detail("RVQ 码本数", n_vq), detail("并行预测头", prediction_heads), detail("当前解码步", delayed_steps), detail("采样率", f"{sample_rate} Hz")],
+        headline,
+        summary,
         [
             {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 16, "step": 1, "help": "并行合成条数"},
-            {"name": "text_tokens", "label": "文本 token", "type": "number", "value": text_tokens, "min": 1, "max": 8192, "step": 1, "help": "输入文本与提示长度"},
-            {"name": "audio_frames", "label": "Codec 帧", "type": "number", "value": audio_frames, "min": 1, "max": 16384, "step": 1, "help": "目标音频 codec 帧数"},
+            {"name": "text_tokens", "label": "文本 token", "type": "number", "value": text_tokens, "min": 1, "max": max_text_tokens, "step": 1, "help": "输入文本与提示长度"},
+            {"name": "audio_frames", "label": "Codec 帧" if uses_delay_pattern else "声学单元", "type": "number", "value": audio_frames, "min": 1, "max": max_audio_frames, "step": 1, "help": "目标 RVQ codec 帧数" if uses_delay_pattern else "目标语音 token、mel code 或声学 latent 单元数"},
         ],
-        {"batch": batch, "text_tokens": text_tokens, "audio_frames": audio_frames, "n_vq": n_vq, "delayed_steps": delayed_steps, "total_steps": total_steps, "sample_rate": sample_rate},
+        {"batch": batch, "text_tokens": text_tokens, "audio_frames": audio_frames, "n_vq": n_vq, "audio_steps": audio_steps, "delayed_steps": audio_steps if uses_delay_pattern else None, "total_steps": total_steps, "sample_rate": sample_rate, "waveform_samples": waveform_samples or None},
         build_graph(lanes, nodes, edges),
-        ["配置未包含 codec hop length，因此只展示确定的 codec 帧与 delay-pattern 步数，不把帧数强行换算成音频秒数。"],
+        [warning],
         sources,
         "tts_backbone",
     )
@@ -3485,7 +3682,9 @@ def infer_text_hidden(text_component_config: dict[str, Any], transformer_config:
             nested.get("hidden_size"),
             text_component_config.get("hidden_size"),
             transformer_config.get("text_hidden_dim"),
-            2048,
+            transformer_config.get("caption_channels"),
+            transformer_config.get("text_dim"),
+            0,
         )
         or 2048
     )
@@ -3550,6 +3749,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     model_index = read_json_file(model_dir / "model_index.json")
     architecture = infer_architecture_name(model_dir, "diffusers")
     component_keys = list(model_index.keys())
+    discovered_transformers = discover_diffusion_transformer_configs(model_dir)
 
     text_component_name = "text_encoder" if "text_encoder" in component_keys else "mllm" if "mllm" in component_keys else None
     processor_component_name = "processor" if "processor" in component_keys else "tokenizer" if "tokenizer" in component_keys else None
@@ -3562,11 +3762,21 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     scheduler_config, scheduler_source = load_component_config(model_dir, scheduler_component_name)
     transformer_config, transformer_source = load_component_config(model_dir, transformer_component_name)
     vae_config, vae_source = load_component_config(model_dir, vae_component_name)
+    if not transformer_config and discovered_transformers:
+        transformer_config, transformer_source = discovered_transformers[0]
+    uses_umt5_xxl_fallback = False
+    if not text_component_config and (model_dir / "google" / "umt5-xxl").exists():
+        text_component_config = {"hidden_size": 4096, "num_hidden_layers": 24}
+        text_source = "README.md"
+        uses_umt5_xxl_fallback = True
+    if not scheduler_config and (model_dir / "scheduler" / "scheduler_config.json").exists():
+        scheduler_config = read_json_file(model_dir / "scheduler" / "scheduler_config.json")
+        scheduler_source = "scheduler/scheduler_config.json"
 
     text_hidden = infer_text_hidden(text_component_config, transformer_config)
     text_layers = infer_text_layers(text_component_config, transformer_config)
     text_nested = text_component_config.get("text_config") if isinstance(text_component_config.get("text_config"), dict) else {}
-    max_position = int(first_defined(text_nested.get("max_position_embeddings"), text_component_config.get("max_position_embeddings"), 4096) or 4096)
+    max_position = int(first_defined(text_nested.get("max_position_embeddings"), text_component_config.get("max_position_embeddings"), transformer_config.get("model_max_length"), transformer_config.get("text_len"), 4096) or 4096)
     prompt_tokens = clamp_int(query.get("seq_len", [min(max_position, 256)])[0], min(max_position, 256), maximum=max_position)
     batch = clamp_int(query.get("batch", [1])[0], 1)
 
@@ -3577,14 +3787,24 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     steps = clamp_int(query.get("steps", [28 if model_index.get("is_distilled") else 40])[0], 28 if model_index.get("is_distilled") else 40)
 
     transformer_class = str(transformer_config.get("_class_name") or "")
-    video_hint = f"{model_id} {architecture} {transformer_class}".lower()
-    is_video = "video" in video_hint or "transformer3d" in video_hint
+    metadata_config = primary_config(model_dir)
+    video_hint = f"{model_id} {architecture} {transformer_class} {transformer_config.get('model_type', '')} {metadata_config.get('task', '')}".lower()
+    transformer_model_type = str(transformer_config.get("model_type") or "").lower()
+    is_video = "video" in video_hint or "transformer3d" in video_hint or transformer_model_type in {"t2v", "i2v", "ti2v"}
     default_frames = int(first_defined(transformer_config.get("sample_frames"), model_index.get("num_frames"), 81) or 81)
     frames = clamp_int(query.get("frames", [default_frames if is_video else 1])[0], default_frames if is_video else 1)
 
     vae_scale_height, vae_scale_width = derive_vae_spatial_scales(vae_config)
-    vae_temporal_scale = derive_vae_temporal_scale(vae_config) if is_video else 1
-    latent_channels = int(first_defined(vae_config.get("latent_channels"), vae_config.get("z_dim"), transformer_config.get("in_channels"), 4) or 4)
+    if is_video:
+        vae_temporal_scale = derive_vae_temporal_scale(vae_config)
+        if not vae_config and ("wanmodel" in transformer_class.lower() or "transformer3d" in transformer_class.lower()):
+            vae_temporal_scale = scalar_int(transformer_config.get("vae_scale"), 4)
+    else:
+        vae_temporal_scale = 1
+    if "wanmodel" in transformer_class.lower():
+        latent_channels = int(first_defined(vae_config.get("latent_channels"), vae_config.get("z_dim"), 16) or 16)
+    else:
+        latent_channels = int(first_defined(vae_config.get("latent_channels"), vae_config.get("z_dim"), transformer_config.get("out_channels"), transformer_config.get("in_channels"), 4) or 4)
     latent_height = ceil_div(image_height, vae_scale_height)
     latent_width = ceil_div(image_width, vae_scale_width)
     latent_frames = ceil_div(frames, vae_temporal_scale) if is_video else 1
@@ -3592,6 +3812,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         transformer_config.get("patch_size"),
         transformer_config.get("all_patch_size"),
         model_index.get("patch_size"),
+        [1, 2, 2] if "wanmodel" in transformer_class.lower() else None,
         1,
     )
     transformer_patch_height, transformer_patch_width = spatial_pair(transformer_patch_value, 1)
@@ -3610,13 +3831,22 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         transformer_width // transformer_heads if transformer_width and transformer_heads else 0,
     ) or 0)
 
-    has_conditioning_image = bool(processor_component_name == "processor" or text_component_name == "mllm")
+    has_conditioning_image = bool(
+        processor_component_name == "processor"
+        or text_component_name == "mllm"
+        or transformer_model_type in {"i2v", "ti2v"}
+        or "image-to-video" in str(metadata_config.get("task") or "").lower()
+    )
     conditioning_patch = int(first_defined(processor_component_config.get("patch_size"), text_component_config.get("vision_config", {}).get("patch_size") if isinstance(text_component_config.get("vision_config"), dict) else None, 16) or 16)
     conditioning_merge = int(first_defined(processor_component_config.get("merge_size"), text_component_config.get("vision_config", {}).get("spatial_merge_size") if isinstance(text_component_config.get("vision_config"), dict) else None, 1) or 1)
     conditioning_patch_rows = ceil_div(image_height, conditioning_patch)
     conditioning_patch_cols = ceil_div(image_width, conditioning_patch)
     conditioning_raw_patches = conditioning_patch_rows * conditioning_patch_cols
     conditioning_tokens = ceil_div(conditioning_patch_rows, max(conditioning_merge, 1)) * ceil_div(conditioning_patch_cols, max(conditioning_merge, 1))
+    audio_channel = scalar_int(transformer_config.get("audio_channel"), 0)
+    has_audio_condition = audio_channel > 0
+    default_audio_tokens = scalar_int(transformer_config.get("context_tokens"), 32)
+    audio_tokens = clamp_int(query.get("audio_tokens", [default_audio_tokens])[0], default_audio_tokens, maximum=4096)
     scheduler_seq_len = int(first_defined(scheduler_config.get("base_image_seq_len"), scheduler_config.get("seq_len"), latent_tokens) or latent_tokens)
 
     pixel_shape = shape(batch, frames, 3, image_height, image_width) if is_video else shape(batch, 3, image_height, image_width)
@@ -3633,8 +3863,14 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     ]
     if is_video:
         warnings.append("视频 latent token 已包含 VAE 时间压缩与 transformer temporal patch。")
+    if len(discovered_transformers) > 1:
+        warnings.append(f"检测到 {len(discovered_transformers)} 套去噪 transformer 配置；图中使用第一套共同维度作为单阶段代表，不重复累计 latent token。")
     if has_conditioning_image:
         warnings.append("该 pipeline 含图像条件分支，是否必须输入图像取决于具体调用方式。")
+    if has_audio_condition:
+        warnings.append("该 pipeline 含音频条件分支；页面使用配置声明的 audio_channel 与 context_tokens 展示条件 shape。")
+    if uses_umt5_xxl_fallback:
+        warnings.append("仓库只包含 UMT5-XXL tokenizer/权重标识，文本编码器按 UMT5-XXL 的 4096 隐藏维度与 24 层展示。")
 
     lanes = [
         ("inputs", "输入"),
@@ -3720,6 +3956,40 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                     [detail("raw_patch_count", conditioning_raw_patches), detail("merged_token_count", conditioning_tokens), detail("merge_size", conditioning_merge)],
                     [section("预处理", [detail("patch_size", conditioning_patch), detail("merge_size", conditioning_merge)])],
                     "vision",
+                ),
+            ]
+        )
+
+    if has_audio_condition:
+        nodes.extend(
+            [
+                build_node(
+                    "audio_condition_input",
+                    "inputs",
+                    2,
+                    "音频条件",
+                    "precomputed audio features",
+                    "语音驱动视频模型的音频条件序列。",
+                    shape(batch, audio_tokens, audio_channel),
+                    shape(batch, audio_tokens, audio_channel),
+                    [f"tokens {audio_tokens}", f"channels {audio_channel}"],
+                    [detail("audio_tokens", audio_tokens), detail("audio_channel", audio_channel)],
+                    [section("输入", [detail("audio features", shape(batch, audio_tokens, audio_channel))])],
+                    "audio",
+                ),
+                build_node(
+                    "audio_condition_encoder",
+                    "conditioning",
+                    2,
+                    "音频条件编码",
+                    f"window {transformer_config.get('audio_window', '?')}",
+                    "将音频特征映射为去噪 transformer 的交叉条件。",
+                    shape(batch, audio_tokens, audio_channel),
+                    shape(batch, audio_tokens, transformer_width),
+                    [f"to {transformer_width}"],
+                    [detail("audio_blocks", transformer_config.get("audio_block")), detail("output", shape(batch, audio_tokens, transformer_width))],
+                    [section("输出", [detail("audio condition", shape(batch, audio_tokens, transformer_width))])],
+                    "audio",
                 ),
             ]
         )
@@ -4015,6 +4285,13 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
                 {"source": "image_condition_processor", "target": "vae_encode", "label": "prepared image"},
             ]
         )
+    if has_audio_condition:
+        edges.extend(
+            [
+                {"source": "audio_condition_input", "target": "audio_condition_encoder", "label": "audio features"},
+                {"source": "audio_condition_encoder", "target": "transformer", "label": "audio hidden"},
+            ]
+        )
 
     sources: list[str] = []
     append_source_file(model_dir, sources, "model_index.json")
@@ -4026,6 +4303,8 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         append_source_file(model_dir, sources, scheduler_source)
     if transformer_source:
         append_source_file(model_dir, sources, transformer_source)
+    for _, discovered_source in discovered_transformers:
+        append_source_file(model_dir, sources, discovered_source)
     if vae_source:
         append_source_file(model_dir, sources, vae_source)
 
@@ -4039,6 +4318,10 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         detail("latent tokens", latent_tokens),
         detail("scheduler", scheduler_config.get("_class_name", "-")),
     ]
+    if len(discovered_transformers) > 1:
+        summary.append(detail("去噪阶段", len(discovered_transformers)))
+    if has_audio_condition:
+        summary.append(detail("音频条件", f"{audio_tokens} x {audio_channel}"))
 
     controls = [
         {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 8, "step": 1, "help": "并行样本数"},
@@ -4049,6 +4332,8 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     ]
     if is_video:
         controls.insert(4, {"name": "frames", "label": "视频帧数", "type": "number", "value": frames, "min": 1, "max": 1024, "step": 1, "help": "输出视频帧数"})
+    if has_audio_condition:
+        controls.append({"name": "audio_tokens", "label": "音频 token", "type": "number", "value": audio_tokens, "min": 1, "max": 4096, "step": 1, "help": "预计算音频条件长度"})
 
     headline = (
         "Video diffusion pipeline，文本条件与时空 latent 共同驱动 transformer 去噪，再通过 VAE 解码为视频。"
@@ -4069,6 +4354,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
             "image_width": image_width,
             "frames": frames,
             "steps": steps,
+            "audio_tokens": audio_tokens if has_audio_condition else 0,
         },
         build_graph(lanes, nodes, edges),
         warnings,

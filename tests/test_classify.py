@@ -17,6 +17,9 @@ REAL_DIFFUSERS = [
     "black-forest-labs__FLUX.2-klein-9B",
     "Tongyi-MAI__Z-Image",
     "Robbyant__lingbot-video-moe-30b-a3b",
+    "Wan-AI__Wan2.2-I2V-A14B",
+    "amap_cvlab__ABot-World-0-5B-LF",
+    "meituan-longcat__LongCat-Video-Avatar-1.5",
 ]
 
 
@@ -58,18 +61,32 @@ def test_substantive_component_keys_are_required():
 
 
 @pytest.mark.parametrize(
+    "mid",
+    [
+        "Comfy-Org__Krea-2",
+        "jd-opensource__JoyAI-Image-Edit",
+        "unsloth__Qwen3.6-35B-A3B-GGUF",
+    ],
+)
+def test_metadata_only_or_checkpoint_manifest_is_unknown(serve, mid):
+    assert serve.classify_model_dir(serve.MODEL_CONFIGS_DIR / mid) == "unknown"
+
+
+@pytest.mark.parametrize(
     "model_dir",
     [d for d in all_model_dirs() if (d / "model_index.json").exists()],
     ids=lambda d: d.name,
 )
 def test_every_model_index_dir_is_consistent(serve, model_dir):
-    """Each model_index.json must contain a substantive component OR be non-diffusers."""
+    """A pipeline needs model-index components or a numeric diffusion config."""
     import serve_model_arch as s
 
     index_data = s.read_json_file(model_dir / "model_index.json") or {}
     is_diffusers = serve.classify_model_dir(model_dir) == "diffusers"
     has_component = any(k in index_data for k in s._DIFFUSERS_COMPONENT_KEYS)
-    assert is_diffusers == has_component, (
+    has_numeric_transformer = bool(s.discover_diffusion_transformer_configs(model_dir))
+    assert is_diffusers == (has_component or has_numeric_transformer), (
         f"{model_dir.name}: classifier said diffusers={is_diffusers} but "
-        f"index has substantive component={has_component}"
+        f"index has substantive component={has_component} and "
+        f"numeric transformer={has_numeric_transformer}"
     )
