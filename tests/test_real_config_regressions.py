@@ -227,6 +227,62 @@ def test_tagged_yaml_mappings_keep_their_children():
     assert config["filter"]["token_max_length"] == 200
 
 
+def test_hy_world_moe_lists_and_composite_geometry_math():
+    model_dir = s.MODEL_CONFIGS_DIR / "Tencent-Hunyuan__HY-World-2.0"
+    pano_config = s.read_json_file(model_dir / "HY-Pano-2.0" / "config.json")
+    dims = s.parse_llm_dims(pano_config)
+    metrics = s.estimate_llm_metrics(dims)
+    assert dims["experts_per_tok"] == 8
+    assert dims["moe_ffn_hidden"] == 3072
+    assert dims["n_shared_experts"] == 1
+    assert metrics["total_params"] == 80_950_067_200
+    assert metrics["active_params"] == 12_759_072_768
+
+    payload = s.build_model_payload("Tencent-Hunyuan__HY-World-2.0", {})
+    summary = _summary(payload)
+    assert payload["model"]["architecture"] == "HYWorld2Pipeline"
+    assert summary["HY-Pano 主干参数"] == "80.95B / active 12.76B"
+    assert payload["parameters"]["pano_latent_tokens"] == 7320
+    assert payload["parameters"]["pano_output_width"] == 1920
+    assert payload["parameters"]["mirror_total_tokens"] == 10_984
+    assert payload["parameters"]["gaussian_count"] == 2_146_592
+
+    custom = s.build_model_payload(
+        "Tencent-Hunyuan__HY-World-2.0",
+        {"task": ["reconstruction"], "views": ["2"], "recon_height": ["952"], "recon_width": ["714"]},
+    )
+    assert custom["parameters"]["tokens_per_view"] == 3472
+    assert custom["parameters"]["mirror_total_tokens"] == 6944
+    assert custom["parameters"]["gaussian_count"] == 1_359_456
+
+
+def test_nemotron_streaming_chunk_and_cache_math():
+    payload = s.build_model_payload(
+        "nv-community__nemotron-3.5-asr-streaming-0.6b",
+        {"chunk_ms": ["320"], "chunks": ["10"], "language_mode": ["auto"]},
+    )
+    summary = _summary(payload)
+    assert payload["model"]["architecture"] == "FastConformerCacheAwareRNNT"
+    assert summary["编码器"] == "24 层 FastConformer / D=512"
+    assert payload["parameters"]["chunk_frames"] == 4
+    assert payload["parameters"]["right_context_frames"] == 3
+    assert payload["parameters"]["left_cache_ms"] == 4480
+    assert payload["parameters"]["total_audio_ms"] == 3200
+    nodes = {node["id"]: node for node in payload["graph"]["nodes"]}
+    assert nodes["prompt_fusion"]["inputShape"] == "[1, 4, 640]"
+
+
+def test_inherited_lora_and_gguf_payloads_use_base_shapes():
+    krea = s.build_model_payload("jonathanfu__Krea-2-Turbo-zishi", {})
+    assert _summary(krea)["Transformer 宽度"] == "6144"
+    assert any("base_model=krea/Krea-2-Turbo" in warning for warning in krea["warnings"])
+
+    gguf = s.build_model_payload("unsloth__Qwen3.6-35B-A3B-GGUF", {})
+    assert gguf["model"]["type"] == "multimodal"
+    assert _summary(gguf)["语言隐藏维度"] == "2048"
+    assert any("base_model=Qwen/Qwen3.6-35B-A3B" in warning for warning in gguf["warnings"])
+
+
 def test_deepseek_v4_uses_compressed_mqa_and_mixed_precision_profile():
     flash = s.build_model_payload(
         "deepseek-ai__DeepSeek-V4-Flash",

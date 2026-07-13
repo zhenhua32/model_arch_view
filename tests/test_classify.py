@@ -65,11 +65,26 @@ def test_substantive_component_keys_are_required():
     [
         "Comfy-Org__Krea-2",
         "jd-opensource__JoyAI-Image-Edit",
-        "unsloth__Qwen3.6-35B-A3B-GGUF",
+        "Lightricks__LTX-2.3",
     ],
 )
 def test_metadata_only_or_checkpoint_manifest_is_unknown(serve, mid):
     assert serve.classify_model_dir(serve.MODEL_CONFIGS_DIR / mid) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("mid", "expected_type", "base_dir"),
+    [
+        ("jonathanfu__Krea-2-Turbo-zishi", "diffusers", "krea__Krea-2-Turbo"),
+        ("laonansheng__ruanqing-Z-Image-Turbo-Tongyi-MAI-v1.0", "diffusers", "Tongyi-MAI__Z-Image-Turbo"),
+        ("unsloth__Qwen3.6-27B-MTP-GGUF", "multimodal", "Qwen__Qwen3.6-27B"),
+        ("unsloth__Qwen3.6-35B-A3B-GGUF", "multimodal", "Qwen__Qwen3.6-35B-A3B"),
+    ],
+)
+def test_model_card_base_model_inherits_local_architecture(serve, mid, expected_type, base_dir):
+    model_dir = serve.MODEL_CONFIGS_DIR / mid
+    assert serve.architecture_config_dir(model_dir).name == base_dir
+    assert serve.classify_model_dir(model_dir) == expected_type
 
 
 @pytest.mark.parametrize(

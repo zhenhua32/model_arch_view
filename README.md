@@ -8,7 +8,7 @@
 - 多模态模型
 - Diffusers / diffusion pipeline
 
-缺少可计算架构字段的纯元数据仓库、工作流包和 checkpoint 清单会标记为 `unknown`，不会伪造 LLM 参数或 shape。
+缺少可计算架构字段的纯元数据仓库、工作流包和 checkpoint 清单会标记为 `unknown`，不会伪造 LLM 参数或 shape。模型卡明确声明 `base_model` 且仓库内存在对应基础配置时，LoRA、重打包或 GGUF 目录会继承基础模型的架构 shape，并明确提示继承来源。
 
 ## 启动
 
@@ -46,7 +46,7 @@ python serve_model_arch.py --port 8123
 不同类型模型的 shape 推导方式如下：
 
 - LLM：根据 hidden_size、num_hidden_layers、attention heads、MoE 配置推导 token 流形状
-- 多模态：优先使用显式 soft-token 预算，否则根据 patch_size、merge_size、vision_config、processor_config 推导所选图像、视频或音频分支；ASR、SAM 视频分割及 MOSS-TTS、CosyVoice、IndexTTS、VoxCPM 等语音合成架构使用专用计算图
+- 多模态：优先使用显式 soft-token 预算，否则根据 patch_size、merge_size、vision_config、processor_config 推导所选图像、视频或音频分支；ASR、SAM 视频分割、HY-World 3D 世界模型及 MOSS-TTS、CosyVoice、IndexTTS、VoxCPM 等语音合成架构使用专用计算图
 - Diffusers：根据 VAE 下采样倍率、transformer patch_size、scheduler 步数推导 latent token 流；没有标准 `model_index.json` 时，也会读取 Wan/3D DiT 等数值 transformer 配置
 
 ## 估算口径
@@ -60,6 +60,8 @@ python serve_model_arch.py --port 8123
 - GPU 卡数仍只是容量下界；真实部署还受并行切分、通信和框架常驻显存影响。
 - Diffusers 视频模型的 token 数包含 VAE 时间压缩与 3D transformer patch。
 - 多码本 delay-pattern TTS 会计算码本错位后的解码步；单码流 TTS 不再虚构 RVQ 并行头，只有配置明确给出帧率、mel 比例和 hop 时才换算波形样本数。
+- HY-World 同时计算 HY-Pano 的 MoE 参数、VAE latent 与环形融合宽度，以及 WorldMirror 的多视图 patch token 和过滤前 Gaussian 数量。
+- Nemotron 流式 ASR 按模型卡公开的 80ms 基础帧、右上下文和 56 帧左缓存计算各档 chunk；未公开的前端和 RNN-T 维度保留为符号值。
 
 ## 已知限制
 

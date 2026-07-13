@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -91,6 +92,7 @@ def read_simple_yaml_file(path: Path) -> dict[str, Any]:
 
 
 def supplemental_yaml_config(model_dir: Path) -> dict[str, Any]:
+    model_dir = architecture_config_dir(model_dir)
     for name in ("config.yaml", "config.yml", "cosyvoice2.yaml"):
         path = model_dir / name
         if path.exists():
@@ -98,7 +100,70 @@ def supplemental_yaml_config(model_dir: Path) -> dict[str, Any]:
     return {}
 
 
-def primary_config(model_dir: Path) -> dict[str, Any]:
+@lru_cache(maxsize=None)
+def model_card_base_reference(model_dir: Path) -> str | None:
+    readme = model_dir / "README.md"
+    try:
+        lines = readme.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return None
+    if not lines or lines[0].strip() != "---":
+        return None
+    frontmatter: list[str] = []
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        frontmatter.append(line)
+    for index, line in enumerate(frontmatter):
+        if not line.startswith("base_model:"):
+            continue
+        inline = line.split(":", 1)[1].strip()
+        if inline:
+            return inline.strip("'\"")
+        for nested in frontmatter[index + 1:]:
+            if nested and not nested[0].isspace() and not nested.lstrip().startswith("-"):
+                break
+            candidate = nested.strip()
+            if candidate.startswith("-"):
+                return candidate[1:].strip().strip("'\"")
+    return None
+
+
+@lru_cache(maxsize=None)
+def local_base_model_dir(model_dir: Path) -> Path | None:
+    reference = model_card_base_reference(model_dir)
+    if not reference:
+        return None
+    normalized = reference.split("@", 1)[0].strip().replace("/", "__")
+    if not normalized or normalized in {".", ".."}:
+        return None
+    candidate = MODEL_CONFIGS_DIR / normalized
+    if candidate.is_dir() and candidate.resolve() != model_dir.resolve():
+        return candidate
+    normalized_folded = normalized.casefold()
+    for possible in MODEL_CONFIGS_DIR.iterdir():
+        if possible.is_dir() and possible.name.casefold() == normalized_folded and possible.resolve() != model_dir.resolve():
+            return possible
+    return None
+
+
+@lru_cache(maxsize=None)
+def architecture_config_dir(model_dir: Path) -> Path:
+    current = model_dir
+    seen: set[Path] = set()
+    for _ in range(4):
+        resolved = current.resolve()
+        if resolved in seen:
+            break
+        seen.add(resolved)
+        base_dir = local_base_model_dir(current)
+        if not base_dir:
+            break
+        current = base_dir
+    return current
+
+
+def direct_primary_config(model_dir: Path) -> dict[str, Any]:
     for name in ("config.json", "configuration.json"):
         path = model_dir / name
         if path.exists():
@@ -106,6 +171,10 @@ def primary_config(model_dir: Path) -> dict[str, Any]:
             if data:
                 return data
     return {}
+
+
+def primary_config(model_dir: Path) -> dict[str, Any]:
+    return direct_primary_config(architecture_config_dir(model_dir))
 
 
 def first_defined(*values: Any) -> Any:
@@ -298,6 +367,20 @@ def is_sam_video_config(config: dict[str, Any]) -> bool:
     return "sam3video" in identity.replace("_", "") or "sam3_video" in identity
 
 
+def is_hy_world_bundle(model_dir: Path) -> bool:
+    return (model_dir / "HY-Pano-2.0" / "config.json").exists() and (model_dir / "HY-WorldMirror-2.0" / "config.json").exists()
+
+
+def is_nemotron_streaming_asr(model_dir: Path) -> bool:
+    if "nemotron-3.5-asr-streaming" not in model_dir.name.lower():
+        return False
+    try:
+        readme = (model_dir / "README.md").read_text(encoding="utf-8-sig")
+    except OSError:
+        return False
+    return "FastConformer-CacheAware-RNNT" in readme and "24 encoder layers" in readme
+
+
 def processor_has_modal_inputs(processor: dict[str, Any]) -> bool:
     if any(key in processor for key in ("image_processor", "video_processor", "feature_extractor")):
         return True
@@ -306,7 +389,10 @@ def processor_has_modal_inputs(processor: dict[str, Any]) -> bool:
 
 
 def classify_model_dir(model_dir: Path) -> str:
-    model_index = model_dir / "model_index.json"
+    if is_hy_world_bundle(model_dir) or is_nemotron_streaming_asr(model_dir):
+        return "multimodal"
+    config_dir = architecture_config_dir(model_dir)
+    model_index = config_dir / "model_index.json"
     if model_index.exists():
         index_data = read_json_file(model_index) or {}
         # Only treat it as a diffusers pipeline when it actually declares a
@@ -315,13 +401,13 @@ def classify_model_dir(model_dir: Path) -> str:
         if any(key in index_data for key in _DIFFUSERS_COMPONENT_KEYS):
             return "diffusers"
 
-    if discover_diffusion_transformer_configs(model_dir):
+    if discover_diffusion_transformer_configs(config_dir):
         return "diffusers"
 
     config = primary_config(model_dir)
     yaml_config = supplemental_yaml_config(model_dir)
-    params = read_json_file(model_dir / "params.json")
-    processor = read_json_file(model_dir / "processor_config.json")
+    params = read_json_file(config_dir / "params.json")
+    processor = read_json_file(config_dir / "processor_config.json")
 
     if is_asr_model_config(config, yaml_config) or is_tts_model_config(config) or is_sam_video_config(config):
         return "multimodal"
@@ -350,11 +436,16 @@ def classify_model_dir(model_dir: Path) -> str:
 
 
 def infer_architecture_name(model_dir: Path, model_type: str) -> str:
+    if is_hy_world_bundle(model_dir):
+        return "HYWorld2Pipeline"
+    if is_nemotron_streaming_asr(model_dir):
+        return "FastConformerCacheAwareRNNT"
+    config_dir = architecture_config_dir(model_dir)
     if model_type == "diffusers":
-        model_index = read_json_file(model_dir / "model_index.json")
+        model_index = read_json_file(config_dir / "model_index.json")
         if model_index.get("_class_name"):
             return str(model_index["_class_name"])
-        discovered = discover_diffusion_transformer_configs(model_dir)
+        discovered = discover_diffusion_transformer_configs(config_dir)
         if discovered:
             return str(discovered[0][0].get("_class_name") or "DiffusionTransformer")
         return "DiffusersPipeline"
@@ -365,7 +456,7 @@ def infer_architecture_name(model_dir: Path, model_type: str) -> str:
     if config.get("architecture"):
         return str(config["architecture"])
 
-    params = read_json_file(model_dir / "params.json")
+    params = read_json_file(config_dir / "params.json")
     if params.get("vision_encoder"):
         return "VisionLanguageModel"
     if params:
@@ -615,22 +706,23 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     vocab_size = int(first_defined(config.get("vocab_size"), params_config.get("vocab_size"), 0) or 0)
 
     num_experts = int(first_defined(config.get("n_routed_experts"), config.get("num_experts"), config.get("num_local_experts"), moe_config.get("num_experts"), 0) or 0)
-    experts_per_tok = int(first_defined(config.get("num_experts_per_tok"), config.get("moe_topk"), moe_config.get("num_experts_per_tok"), moe_config.get("moe_topk"), 0) or 0)
-    moe_ffn_hidden = int(first_defined(config.get("moe_intermediate_size"), config.get("expert_ffn_hidden_size"), moe_config.get("moe_intermediate_size"), 0) or 0)
+    experts_per_tok = scalar_int(first_defined(config.get("num_experts_per_tok"), config.get("moe_topk"), moe_config.get("num_experts_per_tok"), moe_config.get("moe_topk")), 0)
+    moe_ffn_hidden = scalar_int(first_defined(config.get("moe_intermediate_size"), config.get("expert_ffn_hidden_size"), moe_config.get("moe_intermediate_size")), 0)
     explicit_shared_dim = first_defined(
         config.get("shared_expert_intermediate_size"),
         config.get("moe_shared_expert_intermediate_size"),
         moe_config.get("shared_expert_intermediate_size"),
         moe_config.get("moe_shared_expert_intermediate_size"),
     )
-    n_shared_experts = int(first_defined(
+    n_shared_experts = scalar_int(first_defined(
         config.get("n_shared_experts"),
         config.get("num_shared_experts"),
+        config.get("num_shared_expert"),
         moe_config.get("n_shared_experts"),
         moe_config.get("num_shared_experts"),
         1 if explicit_shared_dim is not None else 0,
-    ) or 0)
-    shared_ffn_hidden = int(first_defined(explicit_shared_dim, moe_ffn_hidden, 0) or 0)
+    ), 0)
+    shared_ffn_hidden = scalar_int(first_defined(explicit_shared_dim, moe_ffn_hidden), 0)
     first_k_dense = int(first_defined(config.get("first_k_dense_replace"), config.get("n_dense_layers"), 0) or 0)
     tie_word_embeddings = bool(first_defined(config.get("tie_word_embeddings"), params_config.get("tie_word_embeddings"), False))
     ffn_projection_count = 2 if encoder_only else 3
@@ -2391,6 +2483,91 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     return payload
 
 
+def build_nemotron_streaming_asr_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    chunk_options = [80, 160, 320, 560, 1120]
+    right_context_by_chunk = {80: 0, 160: 1, 320: 3, 560: 6, 1120: 13}
+    try:
+        requested_chunk = int(query.get("chunk_ms", [1120])[0])
+    except (TypeError, ValueError):
+        requested_chunk = 1120
+    chunk_ms = requested_chunk if requested_chunk in chunk_options else 1120
+    chunks = clamp_int(query.get("chunks", [1])[0], 1, maximum=10000)
+    language_mode = str(query.get("language_mode", ["provided"])[0]).lower()
+    if language_mode not in {"provided", "auto"}:
+        language_mode = "provided"
+    batch = clamp_int(query.get("batch", [1])[0], 1, maximum=256)
+    base_frame_ms = 80
+    left_context_frames = 56
+    right_context_frames = right_context_by_chunk[chunk_ms]
+    chunk_frames = 1 + right_context_frames
+    left_cache_ms = left_context_frames * base_frame_ms
+    total_audio_ms = chunks * chunk_ms
+    encoder_layers = 24
+    encoder_hidden = 512
+    language_dim = 128
+    fused_hidden = encoder_hidden + language_dim
+
+    lanes = [("inputs", "输入"), ("features", "特征"), ("encoder", "流式编码"), ("decoder", "转录解码"), ("output", "输出")]
+    nodes = [
+        build_node("stream_audio", "inputs", 0, "流式音频", f"{chunk_ms} ms non-overlap chunks", "每次只输入新 chunk，不重复计算历史重叠窗口。", shape(batch, chunks, "waveform_chunk"), shape(batch, chunks, "waveform_chunk"), [f"chunks {chunks}", f"total {total_audio_ms / 1000:.2f}s"], [detail("chunk_ms", chunk_ms), detail("chunks", chunks), detail("total_audio_ms", total_audio_ms)], [section("流式输入", [detail("total duration", f"{chunks} * {chunk_ms}ms = {total_audio_ms}ms")])], "input"),
+        build_node("language_prompt", "inputs", 1, "语言 ID 提示", "provided / auto detect", "将语言身份编码为 128 维 one-hot，并广播到每个声学时间步。", shape(batch, language_dim), shape(batch, chunk_frames, language_dim), [f"mode {language_mode}", f"dim {language_dim}"], [detail("language_dim", language_dim), detail("broadcast_frames", chunk_frames)], [section("输出", [detail("language features", shape(batch, chunk_frames, language_dim))])], "text"),
+        build_node("stream_features", "features", 0, "流式声学特征", f"{base_frame_ms} ms encoder frames", "将当前 chunk 转换为 FastConformer 输入特征；模型卡未公开 mel bins，因此该维保持符号。", shape(batch, "waveform_chunk"), shape(batch, chunk_frames, "feature_bins"), [f"frames {chunk_frames}", f"right ctx {right_context_frames}"], [detail("base_frame_ms", base_frame_ms), detail("current_frames", 1), detail("right_context_frames", right_context_frames), detail("chunk_frames", chunk_frames)], [section("Chunk 推导", [detail("frames", f"1 current + {right_context_frames} right = {chunk_frames}"), detail("duration", f"{chunk_frames} * {base_frame_ms}ms = {chunk_ms}ms")])], "audio"),
+        build_node("cache_aware_encoder", "encoder", 0, "Cache-Aware FastConformer", f"{encoder_layers} layers / D={encoder_hidden}", "所有自注意力与卷积层复用历史缓存，只编码当前非重叠 chunk。", shape(batch, chunk_frames, "feature_bins"), shape(batch, chunk_frames, encoder_hidden), [f"layers {encoder_layers}", f"left cache {left_context_frames}"], [detail("encoder_layers", encoder_layers), detail("encoder_hidden", encoder_hidden), detail("left_context_frames", left_context_frames), detail("left_cache_ms", left_cache_ms), detail("right_context_frames", right_context_frames)], [section("缓存窗口", [detail("left cache", f"{left_context_frames} * {base_frame_ms}ms = {left_cache_ms}ms"), detail("new encoder output", shape(batch, chunk_frames, encoder_hidden))])], "core"),
+        build_node("prompt_fusion", "encoder", 1, "语言条件融合", f"{encoder_hidden} + {language_dim} = {fused_hidden}", "拼接声学表示与逐帧语言编码，再投影到 RNN-T 解码器。", shape(batch, chunk_frames, fused_hidden), shape(batch, chunk_frames, "rnnt_joint_dim"), [f"fused {fused_hidden}"], [detail("acoustic_dim", encoder_hidden), detail("language_dim", language_dim), detail("fused_dim", fused_hidden)], [section("维度推导", [detail("concat", f"{encoder_hidden} + {language_dim} = {fused_hidden}")])], "fusion"),
+        build_node("rnnt_decoder", "decoder", 0, "RNN-T 解码器", "streaming transducer", "联合声学帧与预测网络状态，增量输出带标点和大小写的文本 token。", shape(batch, chunk_frames, "rnnt_joint_dim"), shape(batch, "emitted_tokens"), ["RNNT", "incremental"], [detail("encoder_frames", chunk_frames), detail("output_tokens", "data-dependent")], [section("输出", [detail("token stream", shape(batch, "emitted_tokens"))])], "head"),
+        build_node("transcript", "output", 0, "多语言转录", "text + optional language tag", "输出文本，并按设置保留或移除自动语言标签。", shape(batch, "emitted_tokens"), shape(batch, "transcript"), ["40 language-locales", f"lang {language_mode}"], [detail("language_mode", language_mode), detail("punctuation", True), detail("capitalization", True)], [section("结果", [detail("transcript", shape(batch, "transcript"))])], "output"),
+    ]
+    edges = [
+        build_edge("stream_audio", "stream_features", "new non-overlap chunk"),
+        build_edge("stream_features", "cache_aware_encoder", "acoustic features"),
+        build_edge("cache_aware_encoder", "prompt_fusion", "D=512 embeddings"),
+        build_edge("language_prompt", "prompt_fusion", "K=128 language code"),
+        build_edge("prompt_fusion", "rnnt_decoder", "projected joint features"),
+        build_edge("rnnt_decoder", "transcript", "incremental tokens"),
+    ]
+    sources: list[str] = []
+    append_source_file(model_dir, sources, "README.md")
+    return base_model_payload(
+        model_id,
+        "multimodal",
+        "FastConformerCacheAwareRNNT",
+        f"流式 ASR 每个 {chunk_ms}ms chunk 包含 {chunk_frames} 个 80ms 帧，并复用 {left_cache_ms / 1000:.2f}s 左侧编码缓存。",
+        [
+            detail("类型", "流式语音识别"),
+            detail("参数量", "约 600M"),
+            detail("编码器", f"{encoder_layers} 层 FastConformer / D={encoder_hidden}"),
+            detail("当前 chunk", f"{chunk_ms} ms / {chunk_frames} frames"),
+            detail("左侧缓存", f"{left_context_frames} frames / {left_cache_ms / 1000:.2f}s"),
+            detail("语言提示", f"{language_dim} dim / {language_mode}"),
+        ],
+        [
+            {"name": "batch", "label": "并行流", "type": "number", "value": batch, "min": 1, "max": 256, "step": 1, "help": "并行实时音频流数量"},
+            {"name": "chunk_ms", "label": "Chunk 时长", "type": "select", "value": chunk_ms, "options": chunk_options, "help": "模型卡公开支持的非重叠 chunk 时长"},
+            {"name": "chunks", "label": "Chunk 数", "type": "number", "value": chunks, "min": 1, "max": 10000, "step": 1, "help": "连续处理的 chunk 数量"},
+            {"name": "language_mode", "label": "语言模式", "type": "select", "value": language_mode, "options": ["provided", "auto"], "help": "显式语言 ID 或自动检测"},
+        ],
+        {
+            "batch": batch,
+            "chunk_ms": chunk_ms,
+            "chunks": chunks,
+            "language_mode": language_mode,
+            "base_frame_ms": base_frame_ms,
+            "chunk_frames": chunk_frames,
+            "right_context_frames": right_context_frames,
+            "left_context_frames": left_context_frames,
+            "left_cache_ms": left_cache_ms,
+            "total_audio_ms": total_audio_ms,
+        },
+        build_graph(lanes, nodes, edges),
+        [
+            "模型目录未包含 .nemo 配置；24 层、D=512、语言向量 K=128 与 chunk/cache 映射均来自随仓库保存的模型卡。",
+            "模型卡未公开前端 mel bins、RNN-T joint 维度和 tokenizer 大小，因此这些 shape 保持符号值。",
+        ],
+        sources,
+        "cache_aware_encoder",
+    )
+
+
 def build_asr_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
     config = primary_config(model_dir)
     yaml_config = supplemental_yaml_config(model_dir)
@@ -2918,6 +3095,143 @@ def build_tts_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     )
 
 
+def build_hy_world_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    pano_config = read_json_file(model_dir / "HY-Pano-2.0" / "config.json")
+    generation_config = read_json_file(model_dir / "HY-Pano-2.0" / "generation_config.json")
+    mirror_config = read_json_file(model_dir / "HY-WorldMirror-2.0" / "config.json")
+    pano_vae = pano_config.get("vae") if isinstance(pano_config.get("vae"), dict) else {}
+    pano_vit = pano_config.get("vit") if isinstance(pano_config.get("vit"), dict) else {}
+    pano_dims = parse_llm_dims(pano_config)
+    pano_metrics = estimate_llm_metrics(pano_dims)
+
+    task = str(query.get("task", ["panorama"])[0]).lower()
+    if task not in {"panorama", "reconstruction"}:
+        task = "panorama"
+    batch = 1
+    prompt_tokens = clamp_int(query.get("seq_len", [1024])[0], 1024, maximum=int(pano_config.get("max_position_embeddings", 22800) or 22800))
+    pano_height = clamp_int(query.get("image_height", [960])[0], 960, minimum=16, maximum=4096)
+    pano_width = clamp_int(query.get("image_width", [1952])[0], 1952, minimum=16, maximum=8192)
+    denoise_steps = clamp_int(query.get("steps", [generation_config.get("diff_infer_steps", 50)])[0], 50, maximum=200)
+    blend_width = clamp_int(query.get("blend_width", [32])[0], 32, maximum=max(pano_width - 1, 1))
+    output_width = max(pano_width - blend_width, 1)
+    vae_scale_height, vae_scale_width = spatial_pair(first_defined(pano_config.get("vae_downsample_factor"), pano_vae.get("ffactor_spatial")), 16)
+    pano_latent_height = ceil_div(pano_height, vae_scale_height)
+    pano_latent_width = ceil_div(pano_width, vae_scale_width)
+    pano_latent_channels = scalar_int(pano_vae.get("latent_channels"), 32)
+    pano_latent_tokens = pano_latent_height * pano_latent_width
+    pano_condition_tokens = scalar_int(pano_config.get("vit_token"), 64)
+
+    views = clamp_int(query.get("views", [8])[0], 8, maximum=32)
+    mirror_patch = scalar_int(mirror_config.get("patch_size"), 14)
+    mirror_height = clamp_int(query.get("recon_height", [mirror_config.get("img_size", 518)])[0], scalar_int(mirror_config.get("img_size"), 518), minimum=mirror_patch, maximum=2048)
+    mirror_width = clamp_int(query.get("recon_width", [mirror_config.get("img_size", 518)])[0], scalar_int(mirror_config.get("img_size"), 518), minimum=mirror_patch, maximum=2048)
+    mirror_rows = ceil_div(mirror_height, mirror_patch)
+    mirror_cols = ceil_div(mirror_width, mirror_patch)
+    mirror_registers = scalar_int(mirror_config.get("num_register_tokens"), 0)
+    mirror_tokens_per_view = mirror_rows * mirror_cols + mirror_registers
+    mirror_total_tokens = views * mirror_tokens_per_view
+    gaussian_count = views * mirror_height * mirror_width
+    mirror_hidden = scalar_int(mirror_config.get("embed_dim"), 1024)
+    mirror_layers = scalar_int(mirror_config.get("depth"), 24)
+    mirror_heads = scalar_int(mirror_config.get("num_heads"), 16)
+
+    lanes = [
+        ("inputs", "输入"),
+        ("conditioning", "条件编码"),
+        ("panorama", "全景生成"),
+        ("reconstruction", "三维重建"),
+        ("output", "输出"),
+    ]
+    nodes = [
+        build_node("world_prompt", "inputs", 0, "文本提示", "reasoning / recaption", "HY-Pano 可先进行思考与重写，再生成 360° 全景。", shape(batch, prompt_tokens), shape(batch, prompt_tokens, pano_dims["hidden_size"]), [f"tokens {prompt_tokens}"], [detail("prompt_tokens", prompt_tokens), detail("hidden_size", pano_dims["hidden_size"])], [section("输入", [detail("text hidden", shape(batch, prompt_tokens, pano_dims["hidden_size"]))])], "text"),
+        build_node("reference_image", "inputs", 1, "参考图像", "single perspective image", "用于 image-to-panorama 的单视角参考图。", shape(batch, 3, "input_h", "input_w"), shape(batch, 3, "input_h", "input_w"), ["single view"], [detail("mode", "image-to-panorama")], [section("输入", [detail("RGB", shape(batch, 3, "input_h", "input_w"))])], "vision"),
+        build_node("multiview_input", "inputs", 2, "多视图 / 视频帧", f"{views} views", "WorldMirror 使用多视图图像或抽取后的视频帧进行前馈重建。", shape(batch, views, 3, mirror_height, mirror_width), shape(batch, views, 3, mirror_height, mirror_width), [f"views {views}", f"{mirror_height}x{mirror_width}"], [detail("views", views), detail("height", mirror_height), detail("width", mirror_width)], [section("输入", [detail("multi-view RGB", shape(batch, views, 3, mirror_height, mirror_width))])], "vision"),
+        build_node("pano_vision_encoder", "conditioning", 0, "SigLIP2 视觉条件", f"{pano_vit.get('num_hidden_layers', '?')} layers / hidden {pano_vit.get('hidden_size', '?')}", "视觉编码后通过两层对齐器压缩为固定数量的条件 token。", shape(batch, 3, "input_h", "input_w"), shape(batch, pano_condition_tokens, pano_dims["hidden_size"]), [f"tokens {pano_condition_tokens}", f"patch {pano_vit.get('patch_size', '?')}"], [detail("vision_hidden", pano_vit.get("hidden_size")), detail("vision_layers", pano_vit.get("num_hidden_layers")), detail("aligned_tokens", pano_condition_tokens), detail("aligned_hidden", pano_dims["hidden_size"])], [section("输出", [detail("image condition", shape(batch, pano_condition_tokens, pano_dims["hidden_size"]))])], "vision"),
+        build_node("pano_moe_backbone", "conditioning", 1, "HY-Pano MoE 主干", f"{pano_dims['num_layers']} layers / {pano_dims['num_experts']} experts", "统一处理文本推理、重写提示与图像生成条件。", shape(batch, prompt_tokens + pano_condition_tokens, pano_dims["hidden_size"]), shape(batch, prompt_tokens + pano_condition_tokens, pano_dims["hidden_size"]), [f"top-{pano_dims['experts_per_tok']}", f"active {pano_metrics['active_params'] / 1e9:.2f}B" if pano_metrics else "active ?"], [detail("hidden_size", pano_dims["hidden_size"]), detail("layers", pano_dims["num_layers"]), detail("experts", pano_dims["num_experts"]), detail("experts_per_token", pano_dims["experts_per_tok"]), detail("total_params", pano_metrics["total_params"] if pano_metrics else None), detail("active_params", pano_metrics["active_params"] if pano_metrics else None)], [section("参数估算", [detail("total", f"{pano_metrics['total_params'] / 1e9:.2f}B" if pano_metrics else "?"), detail("active/token", f"{pano_metrics['active_params'] / 1e9:.2f}B" if pano_metrics else "?")])], "core"),
+        build_node("pano_latent", "panorama", 0, "全景 Latent", f"VAE scale {vae_scale_height}x{vae_scale_width}", "输出画布经 VAE 空间压缩形成去噪 latent。", shape(batch, 3, pano_height, pano_width), shape(batch, pano_latent_channels, pano_latent_height, pano_latent_width), [f"tokens {pano_latent_tokens}", f"channels {pano_latent_channels}"], [detail("latent_height", pano_latent_height), detail("latent_width", pano_latent_width), detail("latent_tokens", pano_latent_tokens)], [section("推导公式", [detail("latent grid", f"ceil({pano_height}/{vae_scale_height}) x ceil({pano_width}/{vae_scale_width}) = {pano_latent_height} x {pano_latent_width}"), detail("tokens", f"{pano_latent_height} * {pano_latent_width} = {pano_latent_tokens}")])], "latent"),
+        build_node("pano_denoiser", "panorama", 1, "条件扩散去噪", f"{denoise_steps} steps", "HY-Pano 主干以文本与参考图条件迭代更新全景 latent。", shape(batch, pano_latent_tokens, pano_latent_channels), shape(batch, pano_latent_tokens, pano_latent_channels), [f"steps {denoise_steps}", "joint full attention"], [detail("steps", denoise_steps), detail("latent_tokens", pano_latent_tokens), detail("condition_tokens", prompt_tokens + pano_condition_tokens)], [section("循环", [detail("denoise iterations", denoise_steps)])], "core"),
+        build_node("pano_vae_decode", "panorama", 2, "3D VAE 解码", f"RGB {pano_height}x{pano_width}", "将去噪 latent 解码为带左右重叠区的 ERP 全景。", shape(batch, pano_latent_channels, pano_latent_height, pano_latent_width), shape(batch, 3, pano_height, pano_width), [f"scale {vae_scale_height}x{vae_scale_width}"], [detail("decoded", shape(batch, 3, pano_height, pano_width)), detail("blend_overlap", blend_width)], [section("输出", [detail("pre-blend panorama", shape(batch, 3, pano_height, pano_width))])], "output"),
+        build_node("pano_blend", "output", 0, "环形边缘融合", f"remove {blend_width}px overlap", "将左右重叠区环形融合，得到无缝 360° ERP 图像。", shape(batch, 3, pano_height, pano_width), shape(batch, 3, pano_height, output_width), [f"final {pano_height}x{output_width}"], [detail("input_width", pano_width), detail("blend_width", blend_width), detail("output_width", output_width)], [section("宽度推导", [detail("final width", f"{pano_width} - {blend_width} = {output_width}")])], "output"),
+        build_node("mirror_patch_embed", "reconstruction", 0, "多视图 Patch Embedding", f"patch {mirror_patch} + {mirror_registers} registers", "逐视图切分 patch，并加入 register token。", shape(batch, views, 3, mirror_height, mirror_width), shape(batch, views, mirror_tokens_per_view, mirror_hidden), [f"tokens/view {mirror_tokens_per_view}", f"total {mirror_total_tokens}"], [detail("patch_rows", mirror_rows), detail("patch_cols", mirror_cols), detail("register_tokens", mirror_registers), detail("tokens_per_view", mirror_tokens_per_view), detail("total_tokens", mirror_total_tokens)], [section("推导公式", [detail("tokens/view", f"ceil({mirror_height}/{mirror_patch}) * ceil({mirror_width}/{mirror_patch}) + {mirror_registers} = {mirror_tokens_per_view}"), detail("all views", f"{views} * {mirror_tokens_per_view} = {mirror_total_tokens}")])], "vision"),
+        build_node("world_mirror", "reconstruction", 1, "WorldMirror Transformer", f"{mirror_layers} layers / {mirror_heads} heads", "通过几何上下文 Transformer 融合多视图与可选相机、深度先验。", shape(batch, views, mirror_tokens_per_view, mirror_hidden), shape(batch, views, mirror_tokens_per_view, mirror_hidden), [f"hidden {mirror_hidden}", "normalized RoPE"], [detail("hidden_size", mirror_hidden), detail("layers", mirror_layers), detail("heads", mirror_heads), detail("condition_strategy", mirror_config.get("condition_strategy"))], [section("主干", [detail("features", shape(batch, views, mirror_tokens_per_view, mirror_hidden))])], "core"),
+        build_node("geometry_heads", "reconstruction", 2, "DPT 几何预测头", "depth / normals / points / cameras", "一次前向同时预测逐像素几何与逐视图相机参数。", shape(batch, views, mirror_tokens_per_view, mirror_hidden), shape(batch, views, mirror_height, mirror_width, 3), ["dense geometry", f"pixels {gaussian_count}"], [detail("depth", shape(batch, views, mirror_height, mirror_width, 1)), detail("normals", shape(batch, views, mirror_height, mirror_width, 3)), detail("pts3d", shape(batch, views, mirror_height, mirror_width, 3)), detail("camera_poses", shape(batch, views, 4, 4)), detail("camera_intrs", shape(batch, views, 3, 3))], [section("输出", [detail("point maps", shape(batch, views, mirror_height, mirror_width, 3)), detail("camera params", shape(batch, views, 9))])], "head"),
+        build_node("gaussian_splats", "output", 1, "3D Gaussian Splats", f"N = {gaussian_count}", "每个输入像素产生一个候选 Gaussian，后续可按置信度过滤或压缩。", shape(batch, views, mirror_height, mirror_width, 3), shape(batch, gaussian_count, 3), [f"gaussians {gaussian_count}", "PLY / 3DGS"], [detail("N", gaussian_count), detail("means", shape(batch, gaussian_count, 3)), detail("scales", shape(batch, gaussian_count, 3)), detail("quaternions", shape(batch, gaussian_count, 4)), detail("opacities", shape(batch, gaussian_count)), detail("SH", shape(batch, gaussian_count, 1, 3))], [section("数量推导", [detail("N", f"{views} * {mirror_height} * {mirror_width} = {gaussian_count}")])], "output"),
+    ]
+    edges = [
+        build_edge("world_prompt", "pano_moe_backbone", "prompt hidden"),
+        build_edge("reference_image", "pano_vision_encoder", "reference RGB"),
+        build_edge("pano_vision_encoder", "pano_moe_backbone", "64 image tokens"),
+        build_edge("pano_moe_backbone", "pano_denoiser", "reasoned condition"),
+        build_edge("pano_latent", "pano_denoiser", "initial latent"),
+        build_edge("pano_denoiser", "pano_vae_decode", "denoised latent"),
+        build_edge("pano_vae_decode", "pano_blend", "overlapped ERP"),
+        build_edge("multiview_input", "mirror_patch_embed", "multi-view RGB"),
+        build_edge("mirror_patch_embed", "world_mirror", "view tokens"),
+        build_edge("world_mirror", "geometry_heads", "geometric features"),
+        build_edge("geometry_heads", "gaussian_splats", "points + GS attributes"),
+    ]
+    summary = [
+        detail("类型", "三维世界生成与重建"),
+        detail("当前任务", "360° 全景生成" if task == "panorama" else "多视图三维重建"),
+        detail("HY-Pano 主干参数", f"{pano_metrics['total_params'] / 1e9:.2f}B / active {pano_metrics['active_params'] / 1e9:.2f}B" if pano_metrics else "?"),
+        detail("全景 latent tokens", pano_latent_tokens),
+        detail("最终全景", f"{pano_height}x{output_width}"),
+        detail("WorldMirror tokens", mirror_total_tokens),
+        detail("候选 Gaussians", gaussian_count),
+    ]
+    controls = [
+        {"name": "task", "label": "任务", "type": "select", "value": task, "options": ["panorama", "reconstruction"], "help": "选择当前重点查看的 HY-World 分支"},
+        {"name": "seq_len", "label": "提示 token", "type": "number", "value": prompt_tokens, "min": 1, "max": int(pano_config.get("max_position_embeddings", 22800) or 22800), "step": 1, "help": "HY-Pano 推理与重写上下文长度"},
+        {"name": "image_height", "label": "全景生成高度", "type": "number", "value": pano_height, "min": 16, "max": 4096, "step": 16, "help": "融合前 ERP 高度"},
+        {"name": "image_width", "label": "全景生成宽度", "type": "number", "value": pano_width, "min": 16, "max": 8192, "step": 16, "help": "包含环形融合重叠区的宽度"},
+        {"name": "steps", "label": "去噪步数", "type": "number", "value": denoise_steps, "min": 1, "max": 200, "step": 1, "help": "HY-Pano diffusion 迭代次数"},
+        {"name": "blend_width", "label": "环形融合宽度", "type": "number", "value": blend_width, "min": 1, "max": max(pano_width - 1, 1), "step": 1, "help": "最终输出会移除的左右重叠宽度"},
+        {"name": "views", "label": "重建视图数", "type": "number", "value": views, "min": 1, "max": 32, "step": 1, "help": "输入 WorldMirror 的图像或视频帧数量"},
+        {"name": "recon_height", "label": "重建输入高", "type": "number", "value": mirror_height, "min": mirror_patch, "max": 2048, "step": mirror_patch, "help": "WorldMirror 输入高度"},
+        {"name": "recon_width", "label": "重建输入宽", "type": "number", "value": mirror_width, "min": mirror_patch, "max": 2048, "step": mirror_patch, "help": "WorldMirror 输入宽度"},
+    ]
+    sources: list[str] = []
+    for source_name in ("README.md", "DOCUMENTATION.md", "HY-Pano-2.0/config.json", "HY-Pano-2.0/generation_config.json", "HY-WorldMirror-2.0/config.json"):
+        append_source_file(model_dir, sources, source_name)
+    headline = (
+        f"HY-Pano 以 {pano_latent_tokens} 个 latent 位置生成 {pano_height}x{output_width} 的无缝 ERP 全景。"
+        if task == "panorama"
+        else f"WorldMirror 将 {views} 个视图编码为 {mirror_total_tokens} 个 token，并产生 {gaussian_count} 个候选 Gaussian。"
+    )
+    return base_model_payload(
+        model_id,
+        "multimodal",
+        "HYWorld2Pipeline",
+        headline,
+        summary,
+        controls,
+        {
+            "task": task,
+            "seq_len": prompt_tokens,
+            "image_height": pano_height,
+            "image_width": pano_width,
+            "steps": denoise_steps,
+            "blend_width": blend_width,
+            "pano_latent_tokens": pano_latent_tokens,
+            "pano_output_width": output_width,
+            "views": views,
+            "recon_height": mirror_height,
+            "recon_width": mirror_width,
+            "tokens_per_view": mirror_tokens_per_view,
+            "mirror_total_tokens": mirror_total_tokens,
+            "gaussian_count": gaussian_count,
+        },
+        build_graph(lanes, nodes, edges),
+        [
+            "HY-Pano 参数量只按配置中的统一 MoE 主干估算；VAE 与 SigLIP2 子模块未重复并入该数字。",
+            "默认 1952 像素生成宽度包含 32 像素环形重叠，融合后的官方默认输出宽度为 1920。",
+            "WorldMirror 的候选 Gaussian 数 N=S*H*W 是过滤和压缩前数量。",
+        ],
+        sources,
+        "pano_denoiser" if task == "panorama" else "world_mirror",
+    )
+
+
 def infer_default_image_size(config: dict[str, Any], vision_config: dict[str, Any], image_processor: dict[str, Any]) -> tuple[int, int]:
     candidate_resolutions = config.get("candidate_resolutions")
     if isinstance(candidate_resolutions, list) and candidate_resolutions:
@@ -2956,11 +3270,13 @@ def infer_default_image_size(config: dict[str, Any], vision_config: dict[str, An
 
 
 def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    config_dir = architecture_config_dir(model_dir)
+    inherited_base = model_card_base_reference(model_dir) if config_dir != model_dir else None
     config = primary_config(model_dir)
-    params_config = read_json_file(model_dir / "params.json")
-    processor_config = read_json_file(model_dir / "processor_config.json")
-    image_processor_config = read_json_file(model_dir / "preprocessor_config.json")
-    video_processor_config = read_json_file(model_dir / "video_preprocessor_config.json")
+    params_config = read_json_file(config_dir / "params.json")
+    processor_config = read_json_file(config_dir / "processor_config.json")
+    image_processor_config = read_json_file(config_dir / "preprocessor_config.json")
+    video_processor_config = read_json_file(config_dir / "video_preprocessor_config.json")
     architecture = infer_architecture_name(model_dir, "multimodal")
 
     text_config = first_defined(config.get("text_config"), config.get("language_config"), config, params_config) or {}
@@ -3604,12 +3920,15 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
         )
 
     sources: list[str] = []
-    append_source_file(model_dir, sources, "config.json")
-    append_source_file(model_dir, sources, "configuration.json")
-    append_source_file(model_dir, sources, "processor_config.json")
-    append_source_file(model_dir, sources, "preprocessor_config.json")
-    append_source_file(model_dir, sources, "video_preprocessor_config.json")
-    append_source_file(model_dir, sources, "params.json")
+    append_source_file(model_dir, sources, "README.md")
+    append_source_file(config_dir, sources, "config.json")
+    append_source_file(config_dir, sources, "configuration.json")
+    append_source_file(config_dir, sources, "processor_config.json")
+    append_source_file(config_dir, sources, "preprocessor_config.json")
+    append_source_file(config_dir, sources, "video_preprocessor_config.json")
+    append_source_file(config_dir, sources, "params.json")
+    if inherited_base:
+        warnings.append(f"当前目录没有独立架构配置，按模型卡 base_model={inherited_base} 复用主干结构；适配器或 GGUF 的存储格式不改变张量 shape。")
 
     summary = [
         detail("类型", "多模态"),
@@ -3746,10 +4065,12 @@ def infer_transformer_heads(transformer_config: dict[str, Any]) -> int:
 
 
 def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
-    model_index = read_json_file(model_dir / "model_index.json")
+    config_dir = architecture_config_dir(model_dir)
+    inherited_base = model_card_base_reference(model_dir) if config_dir != model_dir else None
+    model_index = read_json_file(config_dir / "model_index.json")
     architecture = infer_architecture_name(model_dir, "diffusers")
     component_keys = list(model_index.keys())
-    discovered_transformers = discover_diffusion_transformer_configs(model_dir)
+    discovered_transformers = discover_diffusion_transformer_configs(config_dir)
 
     text_component_name = "text_encoder" if "text_encoder" in component_keys else "mllm" if "mllm" in component_keys else None
     processor_component_name = "processor" if "processor" in component_keys else "tokenizer" if "tokenizer" in component_keys else None
@@ -3757,20 +4078,20 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     transformer_component_name = "transformer" if "transformer" in component_keys else None
     vae_component_name = "vae" if "vae" in component_keys else None
 
-    text_component_config, text_source = load_component_config(model_dir, text_component_name)
-    processor_component_config, processor_source = load_component_config(model_dir, processor_component_name)
-    scheduler_config, scheduler_source = load_component_config(model_dir, scheduler_component_name)
-    transformer_config, transformer_source = load_component_config(model_dir, transformer_component_name)
-    vae_config, vae_source = load_component_config(model_dir, vae_component_name)
+    text_component_config, text_source = load_component_config(config_dir, text_component_name)
+    processor_component_config, processor_source = load_component_config(config_dir, processor_component_name)
+    scheduler_config, scheduler_source = load_component_config(config_dir, scheduler_component_name)
+    transformer_config, transformer_source = load_component_config(config_dir, transformer_component_name)
+    vae_config, vae_source = load_component_config(config_dir, vae_component_name)
     if not transformer_config and discovered_transformers:
         transformer_config, transformer_source = discovered_transformers[0]
     uses_umt5_xxl_fallback = False
-    if not text_component_config and (model_dir / "google" / "umt5-xxl").exists():
+    if not text_component_config and (config_dir / "google" / "umt5-xxl").exists():
         text_component_config = {"hidden_size": 4096, "num_hidden_layers": 24}
         text_source = "README.md"
         uses_umt5_xxl_fallback = True
-    if not scheduler_config and (model_dir / "scheduler" / "scheduler_config.json").exists():
-        scheduler_config = read_json_file(model_dir / "scheduler" / "scheduler_config.json")
+    if not scheduler_config and (config_dir / "scheduler" / "scheduler_config.json").exists():
+        scheduler_config = read_json_file(config_dir / "scheduler" / "scheduler_config.json")
         scheduler_source = "scheduler/scheduler_config.json"
 
     text_hidden = infer_text_hidden(text_component_config, transformer_config)
@@ -3787,7 +4108,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     steps = clamp_int(query.get("steps", [28 if model_index.get("is_distilled") else 40])[0], 28 if model_index.get("is_distilled") else 40)
 
     transformer_class = str(transformer_config.get("_class_name") or "")
-    metadata_config = primary_config(model_dir)
+    metadata_config = direct_primary_config(model_dir)
     video_hint = f"{model_id} {architecture} {transformer_class} {transformer_config.get('model_type', '')} {metadata_config.get('task', '')}".lower()
     transformer_model_type = str(transformer_config.get("model_type") or "").lower()
     is_video = "video" in video_hint or "transformer3d" in video_hint or transformer_model_type in {"t2v", "i2v", "ti2v"}
@@ -3871,6 +4192,8 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         warnings.append("该 pipeline 含音频条件分支；页面使用配置声明的 audio_channel 与 context_tokens 展示条件 shape。")
     if uses_umt5_xxl_fallback:
         warnings.append("仓库只包含 UMT5-XXL tokenizer/权重标识，文本编码器按 UMT5-XXL 的 4096 隐藏维度与 24 层展示。")
+    if inherited_base:
+        warnings.append(f"当前目录没有独立 pipeline 配置，按模型卡 base_model={inherited_base} 复用基础 diffusion 结构；LoRA 仅改变权重，不改变 latent shape。")
 
     lanes = [
         ("inputs", "输入"),
@@ -4294,19 +4617,20 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
         )
 
     sources: list[str] = []
-    append_source_file(model_dir, sources, "model_index.json")
+    append_source_file(model_dir, sources, "README.md")
+    append_source_file(config_dir, sources, "model_index.json")
     if text_source:
-        append_source_file(model_dir, sources, text_source)
+        append_source_file(config_dir, sources, text_source)
     if processor_source:
-        append_source_file(model_dir, sources, processor_source)
+        append_source_file(config_dir, sources, processor_source)
     if scheduler_source:
-        append_source_file(model_dir, sources, scheduler_source)
+        append_source_file(config_dir, sources, scheduler_source)
     if transformer_source:
-        append_source_file(model_dir, sources, transformer_source)
+        append_source_file(config_dir, sources, transformer_source)
     for _, discovered_source in discovered_transformers:
-        append_source_file(model_dir, sources, discovered_source)
+        append_source_file(config_dir, sources, discovered_source)
     if vae_source:
-        append_source_file(model_dir, sources, vae_source)
+        append_source_file(config_dir, sources, vae_source)
 
     summary = [
         detail("类型", "Diffusers"),
@@ -4411,6 +4735,10 @@ def build_fallback_payload(model_dir: Path, model_id: str, query: dict[str, list
 def build_model_payload(model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
     model_dir = resolve_model_dir(model_id)
     model_type = classify_model_dir(model_dir)
+    if is_hy_world_bundle(model_dir):
+        return build_hy_world_payload(model_dir, model_id, query)
+    if is_nemotron_streaming_asr(model_dir):
+        return build_nemotron_streaming_asr_payload(model_dir, model_id, query)
     if model_type == "llm":
         return build_llm_payload(model_dir, model_id, query)
     if model_type == "multimodal":
