@@ -1128,6 +1128,75 @@ function getNodeOffset(element, container) {
   };
 }
 
+function isMeasurableElement(element) {
+  return Boolean(element && element.offsetWidth > 0 && element.offsetHeight > 0);
+}
+
+function buildEdgeAnchorIndex(visibleGraph) {
+  const nodeById = new Map((visibleGraph.nodes || []).map((node) => [node.id, node]));
+  const nodeElements = new Map();
+  const collapsedLaneElements = new Map();
+
+  ui.graphBoard.querySelectorAll(".graph-node").forEach((element) => {
+    nodeElements.set(element.dataset.nodeId, element);
+  });
+  ui.graphBoard.querySelectorAll(".lane.collapsed").forEach((laneElement) => {
+    const laneTitle = laneElement.querySelector(".lane-title");
+    if (isMeasurableElement(laneTitle)) {
+      collapsedLaneElements.set(laneElement.dataset.laneId, laneTitle);
+    }
+  });
+
+  function resolve(nodeId) {
+    const nodeElement = nodeElements.get(nodeId);
+    if (isMeasurableElement(nodeElement)) {
+      return { element: nodeElement, key: `node:${nodeId}` };
+    }
+
+    const node = nodeById.get(nodeId);
+    const laneElement = node ? collapsedLaneElements.get(node.lane) : null;
+    if (isMeasurableElement(laneElement)) {
+      return { element: laneElement, key: `lane:${node.lane}` };
+    }
+    return null;
+  }
+
+  return { nodeElements, collapsedLaneElements, resolve };
+}
+
+function buildDrawableEdges(visibleGraph, relations, anchors) {
+  const relationPriority = { dimmed: 0, related: 1, upstream: 2, downstream: 2 };
+  const grouped = new Map();
+
+  (visibleGraph.edges || []).forEach((edge) => {
+    const source = anchors.resolve(edge.source);
+    const target = anchors.resolve(edge.target);
+    if (!source || !target || source.key === target.key) {
+      return;
+    }
+
+    const groupKey = `${source.key}\u0000${target.key}`;
+    const relationClass = relations.edgeClass(edge);
+    let group = grouped.get(groupKey);
+    if (!group) {
+      group = { source, target, labels: [], relationClass };
+      grouped.set(groupKey, group);
+    } else if ((relationPriority[relationClass] ?? 0) > (relationPriority[group.relationClass] ?? 0)) {
+      group.relationClass = relationClass;
+    }
+
+    const label = String(edge.label || "");
+    if (label && !group.labels.includes(label)) {
+      group.labels.push(label);
+    }
+  });
+
+  return Array.from(grouped.values()).map((group) => ({
+    ...group,
+    label: group.labels.length > 1 ? `${group.labels[0]} +${group.labels.length - 1}` : group.labels[0] || "",
+  }));
+}
+
 function updateNodeSelection() {
   const payload = state.payload;
   if (!payload) {
@@ -1158,10 +1227,8 @@ function drawEdges() {
   const visibleGraph = getVisibleGraph(payload);
   const relations = buildGraphRelations(payload);
   const canvasRect = { left: 0, top: 0 };
-  const nodes = new Map();
-  ui.graphBoard.querySelectorAll(".graph-node").forEach((element) => {
-    nodes.set(element.dataset.nodeId, element);
-  });
+  const anchors = buildEdgeAnchorIndex(visibleGraph);
+  const drawableEdges = buildDrawableEdges(visibleGraph, relations, anchors);
 
   const width = Math.max(ui.graphBoard.scrollWidth + 24, ui.graphBoard.clientWidth);
   const height = Math.max(ui.graphBoard.scrollHeight + 24, ui.graphBoard.clientHeight);
@@ -1177,22 +1244,19 @@ function drawEdges() {
     </defs>
   `;
 
-  (visibleGraph.edges || []).forEach((edge) => {
-    const source = nodes.get(edge.source);
-    const target = nodes.get(edge.target);
-    if (!source || !target) {
-      return;
-    }
-
-    const geometry = buildEdgeGeometry(getNodeOffset(source, ui.graphCanvas), getNodeOffset(target, ui.graphCanvas), canvasRect);
-    const labelText = escapeHtml(edge.label || "");
-    const labelWidth = Math.max(56, labelText.length * 7.4);
-    const relationClass = relations.edgeClass(edge);
+  drawableEdges.forEach((edge) => {
+    const geometry = buildEdgeGeometry(
+      getNodeOffset(edge.source.element, ui.graphCanvas),
+      getNodeOffset(edge.target.element, ui.graphCanvas),
+      canvasRect
+    );
+    const labelText = escapeHtml(edge.label);
+    const labelWidth = Math.max(56, edge.label.length * 7.4);
 
     markup += `
-      <path class="edge-path ${relationClass}" d="${geometry.path}" marker-end="url(#arrow)"></path>
-      <rect class="edge-label-bg ${relationClass}" x="${geometry.labelX - labelWidth / 2}" y="${geometry.labelY - 12}" rx="10" ry="10" width="${labelWidth}" height="24"></rect>
-      <text class="edge-label ${relationClass}" x="${geometry.labelX}" y="${geometry.labelY + 4}" text-anchor="middle">${labelText}</text>
+      <path class="edge-path ${edge.relationClass}" data-source-anchor="${escapeHtml(edge.source.key)}" data-target-anchor="${escapeHtml(edge.target.key)}" d="${geometry.path}" marker-end="url(#arrow)"></path>
+      <rect class="edge-label-bg ${edge.relationClass}" x="${geometry.labelX - labelWidth / 2}" y="${geometry.labelY - 12}" rx="10" ry="10" width="${labelWidth}" height="24"></rect>
+      <text class="edge-label ${edge.relationClass}" x="${geometry.labelX}" y="${geometry.labelY + 4}" text-anchor="middle">${labelText}</text>
     `;
   });
 
@@ -1385,23 +1449,20 @@ function exportCurrentSvg() {
   const canvasRect = { left: 0, top: 0 };
   const width = Math.max(ui.graphBoard.scrollWidth + 24, ui.graphBoard.clientWidth);
   const height = Math.max(ui.graphBoard.scrollHeight + 24, ui.graphBoard.clientHeight);
-  const nodeElements = new Map();
-  ui.graphBoard.querySelectorAll(".graph-node").forEach((element) => {
-    nodeElements.set(element.dataset.nodeId, element);
-  });
+  const anchors = buildEdgeAnchorIndex(visibleGraph);
+  const drawableEdges = buildDrawableEdges(visibleGraph, relations, anchors);
+  const laneById = new Map((visibleGraph.lanes || []).map((lane) => [lane.id, lane]));
 
-  const edgeMarkup = (visibleGraph.edges || [])
+  const edgeMarkup = drawableEdges
     .map((edge) => {
-      const source = nodeElements.get(edge.source);
-      const target = nodeElements.get(edge.target);
-      if (!source || !target) {
-        return "";
-      }
-
-      const geometry = buildEdgeGeometry(getNodeOffset(source, ui.graphCanvas), getNodeOffset(target, ui.graphCanvas), canvasRect);
+      const geometry = buildEdgeGeometry(
+        getNodeOffset(edge.source.element, ui.graphCanvas),
+        getNodeOffset(edge.target.element, ui.graphCanvas),
+        canvasRect
+      );
       const label = truncateText(edge.label || "", 24);
       const labelWidth = Math.max(56, label.length * 7.2);
-      const color = relationColor(relations.edgeClass(edge));
+      const color = relationColor(edge.relationClass);
       return `
         <path d="${geometry.path}" fill="none" stroke="${color}" stroke-width="2.4" marker-end="url(#arrow)" />
         <rect x="${geometry.labelX - labelWidth / 2}" y="${geometry.labelY - 12}" width="${labelWidth}" height="24" rx="10" ry="10" fill="rgba(255,255,255,0.92)" stroke="rgba(15,23,42,0.08)" />
@@ -1410,10 +1471,23 @@ function exportCurrentSvg() {
     })
     .join("");
 
+  const collapsedLaneMarkup = Array.from(anchors.collapsedLaneElements.entries())
+    .map(([laneId, element]) => {
+      const lane = laneById.get(laneId);
+      const rect = getNodeOffset(element, ui.graphCanvas);
+      return `
+        <g>
+          <rect x="${rect.left}" y="${rect.top}" width="${rect.width}" height="${rect.height}" rx="8" ry="8" fill="rgba(255,255,255,0.98)" stroke="rgba(15,23,42,0.12)" />
+          <text x="${rect.left + rect.width / 2}" y="${rect.top + rect.height / 2 + 4}" fill="#0f172a" font-family="Aptos, Microsoft YaHei UI, sans-serif" font-size="12" font-weight="600" text-anchor="middle">${escapeHtml(lane?.label || laneId)}</text>
+        </g>
+      `;
+    })
+    .join("");
+
   const nodeMarkup = (visibleGraph.nodes || [])
     .map((node) => {
-      const element = nodeElements.get(node.id);
-      if (!element) {
+      const element = anchors.nodeElements.get(node.id);
+      if (!isMeasurableElement(element)) {
         return "";
       }
 
@@ -1457,6 +1531,7 @@ function exportCurrentSvg() {
   </defs>
   <rect width="100%" height="100%" fill="url(#bg)" />
   ${edgeMarkup}
+  ${collapsedLaneMarkup}
   ${nodeMarkup}
 </svg>`;
 
