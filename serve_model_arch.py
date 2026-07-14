@@ -23,7 +23,8 @@ WEB_DIR = ROOT_DIR / "web"
 
 def read_json_file(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -173,8 +174,40 @@ def direct_primary_config(model_dir: Path) -> dict[str, Any]:
     return {}
 
 
+def merge_config_mappings(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_config_mappings(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def primary_config(model_dir: Path) -> dict[str, Any]:
-    return direct_primary_config(architecture_config_dir(model_dir))
+    chain: list[Path] = []
+    current = model_dir
+    seen: set[Path] = set()
+    for _ in range(5):
+        resolved = current.resolve()
+        if resolved in seen:
+            break
+        seen.add(resolved)
+        chain.append(current)
+        base_dir = local_base_model_dir(current)
+        if not base_dir:
+            break
+        current = base_dir
+
+    merged: dict[str, Any] = {}
+    for config_dir in reversed(chain):
+        merged = merge_config_mappings(merged, direct_primary_config(config_dir))
+    return merged
+
+
+def is_sentence_embedding_model_dir(model_dir: Path) -> bool:
+    config_dirs = {model_dir, architecture_config_dir(model_dir)}
+    return any((config_dir / "config_sentence_transformers.json").exists() for config_dir in config_dirs)
 
 
 def first_defined(*values: Any) -> Any:
@@ -669,13 +702,21 @@ def _first_architecture(config: dict[str, Any]) -> str:
 def _attention_layer_counts(layer_types: Any, num_layers: int, use_sliding_window: bool) -> tuple[int, int, int]:
     if isinstance(layer_types, list) and layer_types:
         normalized = [str(item).lower() for item in layer_types[:num_layers]]
-        full = sum("full" in item for item in normalized)
-        sliding_candidates = sum("sliding" in item or "local" in item for item in normalized)
-        sliding = sliding_candidates if use_sliding_window else 0
-        full += 0 if use_sliding_window else sliding_candidates
-        linear = sum("linear" in item for item in normalized)
-        unclassified = max(num_layers - full - sliding - linear, 0)
-        return full + unclassified, sliding, linear
+        full = 0
+        sliding = 0
+        linear = 0
+        for layer_type in normalized:
+            if "linear" in layer_type:
+                linear += 1
+            elif "sliding" in layer_type or "local" in layer_type:
+                if use_sliding_window:
+                    sliding += 1
+                else:
+                    full += 1
+            else:
+                full += 1
+        full += max(num_layers - len(normalized), 0)
+        return full, sliding, linear
     if use_sliding_window:
         return 0, num_layers, 0
     return num_layers, 0, 0
@@ -729,8 +770,8 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     active_expert_multiplier = max(int(first_defined(config.get("cli_factor"), 1) or 1), 1)
     mtp_module_layers = int(first_defined(config.get("mtp_transformer_layers"), 1) or 1)
     mtp_module_count = int(first_defined(config.get("num_mtp_modules"), 0) or 0)
-    mtp_layers = int(first_defined(config.get("mtp_num_layers"), mtp_module_count * mtp_module_layers if mtp_module_count else None, config.get("num_nextn_predict_layers"), 0) or 0)
-    include_mtp_in_total = bool(config.get("mtp_num_layers") or (config.get("use_mtp") and mtp_module_count))
+    mtp_layers = max(int(first_defined(config.get("mtp_num_layers"), mtp_module_count * mtp_module_layers if mtp_module_count else None, config.get("num_nextn_predict_layers"), 0) or 0), 0)
+    include_mtp_in_total = mtp_layers > 0
 
     max_position_embeddings = int(first_defined(config.get("max_position_embeddings"), params_config.get("max_position_embeddings"), 0) or 0)
     position_embedding_params = hidden_size * max_position_embeddings if encoder_only and config.get("position_embedding_type", "absolute") == "absolute" else 0
@@ -750,8 +791,10 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     sparse_attention_layers = 0
     sparse_topk = 0
     if dsa_layers or swa_layers:
-        sparse_attention_layers = sum(isinstance(index, int) and 0 <= index < num_layers for index in dsa_layers)
-        sliding_attention_layers = sum(isinstance(index, int) and 0 <= index < num_layers for index in swa_layers)
+        sparse_indices = {index for index in dsa_layers if isinstance(index, int) and 0 <= index < num_layers}
+        sliding_indices = {index for index in swa_layers if isinstance(index, int) and 0 <= index < num_layers} - sparse_indices
+        sparse_attention_layers = len(sparse_indices)
+        sliding_attention_layers = len(sliding_indices)
         full_attention_layers = max(num_layers - sparse_attention_layers - sliding_attention_layers, 0)
         linear_attention_layers = 0
         sparse_topk = int(first_defined(config.get("index_topk"), 0) or 0)
@@ -771,6 +814,10 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
         0,
     ) or 0)
     v_head_dim = int(first_defined(config.get("v_head_dim"), head_dim) or 0)
+    raw_compress_ratios = config.get("compress_ratios") if isinstance(config.get("compress_ratios"), list) else []
+    compress_ratios = [int(value) if isinstance(value, (int, float)) else 0 for value in raw_compress_ratios[:num_layers]]
+    if is_deepseek_v4 and len(compress_ratios) < num_layers:
+        compress_ratios.extend([0] * (num_layers - len(compress_ratios)))
 
     return {
         "hidden_size": hidden_size,
@@ -788,6 +835,9 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
         "first_k_dense": first_k_dense,
         "tie_word_embeddings": tie_word_embeddings,
         "ffn_projection_count": ffn_projection_count,
+        "encoder_only": encoder_only,
+        "causal_attention": not encoder_only,
+        "task_type": "encoder" if encoder_only else "causal_lm",
         "has_output_head": not encoder_only,
         "position_embedding_params": position_embedding_params,
         "token_type_embedding_params": token_type_embedding_params,
@@ -814,9 +864,24 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
         "index_head_dim": int(first_defined(config.get("index_head_dim"), 0) or 0),
         "index_n_heads": int(first_defined(config.get("index_n_heads"), 0) or 0),
         "index_topk": int(first_defined(config.get("index_topk"), 0) or 0),
-        "compress_ratios": [int(value) for value in config.get("compress_ratios", [])[:num_layers] if isinstance(value, (int, float))],
+        "compress_ratios": compress_ratios,
         "hc_mult": int(first_defined(config.get("hc_mult"), 1) or 1),
     }
+
+
+def parse_model_llm_dims(
+    model_dir: Path,
+    config: dict[str, Any] | None = None,
+    params_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = primary_config(model_dir) if config is None else config
+    if params_config is None:
+        params_config = read_json_file(architecture_config_dir(model_dir) / "params.json")
+    dims = parse_llm_dims(config, params_config)
+    if is_sentence_embedding_model_dir(model_dir):
+        dims["has_output_head"] = False
+        dims["task_type"] = "embedding"
+    return dims
 
 
 def _visible_token_pairs(seq_len: int, window: int = 0) -> int:
@@ -887,7 +952,8 @@ def _context_layer_tokens(metrics: dict[str, Any], seq_len: int) -> int:
         for ratio in ratios:
             total += local_tokens
             if ratio == 4:
-                total += min(index_topk, ceil_div(seq_len, ratio))
+                compressed_tokens = ceil_div(seq_len, ratio)
+                total += min(index_topk, compressed_tokens) if index_topk > 0 else compressed_tokens
             elif ratio > 0:
                 total += ceil_div(seq_len, ratio)
         return total
@@ -1017,7 +1083,8 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
         expert_dim = moe_ffn_hidden or dense_ffn_dim
         expert_params = ffn_projection_count * hidden_size * expert_dim
         routed_total = expert_params * num_experts
-        routed_active = expert_params * (experts_per_tok or 1) * active_expert_multiplier
+        effective_experts_per_tok = min((experts_per_tok or 1) * active_expert_multiplier, num_experts)
+        routed_active = expert_params * effective_experts_per_tok
         shared_expert_params = ffn_projection_count * hidden_size * (shared_ffn_hidden or expert_dim)
         shared_params = shared_expert_params * n_shared_experts
         n_dense_layers = min(first_k_dense, num_layers) if first_k_dense else 0
@@ -1104,7 +1171,7 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
         "sparse_attention_layers": sparse_attention_layers,
         "sparse_topk": sparse_topk,
         "sliding_window": sliding_window,
-        "causal_attention": has_output_head,
+        "causal_attention": dims["causal_attention"],
         "is_deepseek_v4": is_deepseek_v4,
         "compress_ratios": dims["compress_ratios"],
         "index_head_dim": dims["index_head_dim"],
@@ -1117,7 +1184,7 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
         "position_embedding_params": dims["position_embedding_params"],
         "token_type_embedding_params": dims["token_type_embedding_params"],
         "shared_expert_params": shared_expert_params,
-        "effective_experts_per_tok": (experts_per_tok or 1) * active_expert_multiplier if num_experts else 0,
+        "effective_experts_per_tok": effective_experts_per_tok if num_experts else 0,
         # component breakdown (white-box + chart). sum(breakdown) == total_params.
         "attn_params_per_layer": attn_params,
         "ffn_total": ffn_total,
@@ -1409,9 +1476,9 @@ def estimate_throughput(
 
 def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
     config = primary_config(model_dir)
-    params_config = read_json_file(model_dir / "params.json")
+    params_config = read_json_file(architecture_config_dir(model_dir) / "params.json")
     architecture = infer_architecture_name(model_dir, "llm")
-    dims = parse_llm_dims(config, params_config)
+    dims = parse_model_llm_dims(model_dir, config, params_config)
 
     hidden_size = dims["hidden_size"]
     num_layers = dims["num_layers"]
@@ -1453,7 +1520,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     is_mla = dims["is_mla"]
     is_deepseek_v4 = dims["is_deepseek_v4"]
 
-    batch = clamp_int(query.get("batch", [1])[0], 1)
+    batch = clamp_int(query.get("batch", [1])[0], 1, maximum=16)
     seq_len = clamp_int(query.get("seq_len", [min(max_position, 2048)])[0], min(max_position, 2048), maximum=max_position)
 
     hidden_shape = shape(batch, seq_len, hidden_size or "hidden")
@@ -2281,7 +2348,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         nodes.extend(mla_block_nodes)
         edges.extend(mla_block_edges)
 
-    if not dims["has_output_head"]:
+    if dims["encoder_only"]:
         warnings.append("该配置是 encoder-only 模型；不使用 causal mask、生成式 LM Head 或自回归 KV cache。")
         nodes = [node for node in nodes if node["id"] not in {"decoder_causal_mask", "decoder_sliding_mask"}]
         edges = [
@@ -2340,6 +2407,37 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
                 edge["label"] = "final hidden"
             elif edge["source"] == "lm_head" and edge["target"] == "logits":
                 edge["label"] = "pool / select"
+    elif dims["task_type"] == "embedding":
+        warnings.append("检测到 Sentence Transformers 池化配置；保留 causal decoder attention，但不计算生成式 LM Head 或自回归 KV cache。")
+        pooled_shape = shape(batch, hidden_size or "hidden")
+        for node in nodes:
+            if node["id"] == "lm_head":
+                node.update({
+                    "label": "Embedding Pooling",
+                    "subtitle": "select / pool hidden states",
+                    "description": "从 causal decoder 的隐藏态中选择或池化句向量，不执行词表投影。",
+                    "inputShape": hidden_shape,
+                    "outputShape": pooled_shape,
+                    "badges": ["pooling", f"hidden {hidden_size or '?'}"],
+                    "details": [detail("hidden states", hidden_shape), detail("pooled", pooled_shape)],
+                    "sections": [section("表征输出", [detail("pooled embedding", pooled_shape)])],
+                })
+            elif node["id"] == "logits":
+                node.update({
+                    "label": "Embedding 输出",
+                    "subtitle": "normalized sentence embedding",
+                    "description": "输出可用于相似度、检索或聚类的句向量。",
+                    "inputShape": pooled_shape,
+                    "outputShape": pooled_shape,
+                    "badges": ["embedding"],
+                    "details": [detail("embedding", pooled_shape)],
+                    "sections": [section("输出", [detail("sentence embedding", pooled_shape)])],
+                })
+        for edge in edges:
+            if edge["target"] == "lm_head":
+                edge["label"] = "final hidden"
+            elif edge["source"] == "lm_head" and edge["target"] == "logits":
+                edge["label"] = "pool / normalize"
 
     sources: list[str] = []
     append_source_file(model_dir, sources, "config.json")
@@ -2348,7 +2446,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     append_source_file(model_dir, sources, "params.json")
 
     summary = [
-        detail("类型", "LLM"),
+        detail("类型", "Embedding" if dims["task_type"] == "embedding" else "LLM"),
         detail("隐藏维度", hidden_size),
         detail("层数", num_layers),
         detail("注意力头", num_heads),
@@ -2363,7 +2461,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     if dims["sparse_attention_layers"]:
         summary.append(detail("层型", f"DSA {dims['sparse_attention_layers']} / SWA {dims['sliding_attention_layers']} / top-{dims['sparse_topk']}"))
     if num_experts:
-        effective_top_k = (experts_per_tok or 1) * dims["active_expert_multiplier"]
+        effective_top_k = min((experts_per_tok or 1) * dims["active_expert_multiplier"], num_experts)
         cli_note = f" (top-{experts_per_tok} × CLI {dims['active_expert_multiplier']})" if dims["active_expert_multiplier"] > 1 else ""
         summary.append(detail("MoE", f"{num_experts} experts / active {effective_top_k}{cli_note}"))
 
@@ -2388,7 +2486,12 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         if kv_per_1k is not None:
             summary.append(detail("KV cache", f"{kv_per_1k:.1f} MiB / 1K tokens / batch"))
 
-        metric_label = "Decode FLOPs" if dims["has_output_head"] else "Encoder FLOPs"
+        if dims["has_output_head"]:
+            metric_label = "Decode FLOPs"
+        elif dims["encoder_only"]:
+            metric_label = "Encoder FLOPs"
+        else:
+            metric_label = "Embedding FLOPs"
         summary.append(detail(metric_label, f"{metrics['gflops_per_token']:.1f} GFLOPs / token @ seq {seq_len}"))
 
     precision = str(query.get("precision", [default_precision])[0] or default_precision)
@@ -2401,11 +2504,12 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         {"name": "precision", "label": "权重精度", "type": "select", "value": precision, "options": list(PRECISION_BYTES.keys()), "help": "用于显存/成本与吞吐估算"},
     ]
 
-    headline = (
-        f"Decoder-only 语言模型，隐藏维度 {hidden_size or '?'}，共 {num_layers or '?'} 层。"
-        if dims["has_output_head"]
-        else f"Encoder-only 表征模型，隐藏维度 {hidden_size or '?'}，共 {num_layers or '?'} 层。"
-    )
+    if dims["has_output_head"]:
+        headline = f"Decoder-only 语言模型，隐藏维度 {hidden_size or '?'}，共 {num_layers or '?'} 层。"
+    elif dims["encoder_only"]:
+        headline = f"Encoder-only 表征模型，隐藏维度 {hidden_size or '?'}，共 {num_layers or '?'} 层。"
+    else:
+        headline = f"Decoder-only 表征模型，隐藏维度 {hidden_size or '?'}，共 {num_layers or '?'} 层。"
     payload = base_model_payload(
         model_id,
         "llm",
@@ -2854,9 +2958,9 @@ def build_sam_video_payload(model_dir: Path, model_id: str, query: dict[str, lis
     mask_width = scalar_int(first_defined(mask_size_config.get("width"), config.get("low_res_mask_size")), mask_height)
 
     batch = clamp_int(query.get("batch", [1])[0], 1, maximum=8)
-    frames = clamp_int(query.get("frames", [video_processor.get("num_frames") or 8])[0], video_processor.get("num_frames") or 8, maximum=1024)
-    image_height = clamp_int(query.get("image_height", [default_height])[0], default_height, maximum=4096)
-    image_width = clamp_int(query.get("image_width", [default_width])[0], default_width, maximum=4096)
+    frames = clamp_int(query.get("frames", [video_processor.get("num_frames") or 8])[0], video_processor.get("num_frames") or 8, minimum=1, maximum=1024)
+    image_height = clamp_int(query.get("image_height", [default_height])[0], default_height, minimum=patch_size, maximum=4096)
+    image_width = clamp_int(query.get("image_width", [default_width])[0], default_width, minimum=patch_size, maximum=4096)
     object_count = clamp_int(query.get("objects", [1])[0], 1, maximum=256)
     prompt_tokens = clamp_int(query.get("prompt_tokens", [16])[0], 16, maximum=512)
     patch_rows = ceil_div(image_height, patch_size)
@@ -3366,11 +3470,11 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     requested_modality = str(query.get("modality", [modality_options[0]])[0])
     modality = requested_modality if requested_modality in modality_options else modality_options[0]
 
-    batch = clamp_int(query.get("batch", [1])[0], 1)
+    batch = clamp_int(query.get("batch", [1])[0], 1, maximum=8)
     seq_len = clamp_int(query.get("seq_len", [min(max_position, 1024)])[0], min(max_position, 1024), maximum=max_position)
-    image_height = clamp_int(query.get("image_height", [default_height])[0], default_height)
-    image_width = clamp_int(query.get("image_width", [default_width])[0], default_width)
-    frames = clamp_int(query.get("frames", [max(temporal_patch, 8)])[0], max(temporal_patch, 8))
+    image_height = clamp_int(query.get("image_height", [default_height])[0], default_height, minimum=patch_size, maximum=8192)
+    image_width = clamp_int(query.get("image_width", [default_width])[0], default_width, minimum=patch_size, maximum=8192)
+    frames = clamp_int(query.get("frames", [max(temporal_patch, 8)])[0], max(temporal_patch, 8), minimum=temporal_patch, maximum=1024)
     audio_ms_per_token = scalar_int(processor_config.get("audio_ms_per_token"), 40)
     max_audio_tokens = scalar_int(processor_config.get("audio_seq_length"), 0)
     max_audio_seconds = max(ceil_div(max_audio_tokens * audio_ms_per_token, 1000), 1) if max_audio_tokens else 60
@@ -4099,13 +4203,13 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     text_nested = text_component_config.get("text_config") if isinstance(text_component_config.get("text_config"), dict) else {}
     max_position = int(first_defined(text_nested.get("max_position_embeddings"), text_component_config.get("max_position_embeddings"), transformer_config.get("model_max_length"), transformer_config.get("text_len"), 4096) or 4096)
     prompt_tokens = clamp_int(query.get("seq_len", [min(max_position, 256)])[0], min(max_position, 256), maximum=max_position)
-    batch = clamp_int(query.get("batch", [1])[0], 1)
+    batch = clamp_int(query.get("batch", [1])[0], 1, maximum=8)
 
     sample_size = first_defined(vae_config.get("sample_size"), 1024)
     default_height, default_width = spatial_pair(sample_size, 1024)
-    image_height = clamp_int(query.get("image_height", [default_height])[0], default_height)
-    image_width = clamp_int(query.get("image_width", [default_width])[0], default_width)
-    steps = clamp_int(query.get("steps", [28 if model_index.get("is_distilled") else 40])[0], 28 if model_index.get("is_distilled") else 40)
+    image_height = clamp_int(query.get("image_height", [default_height])[0], default_height, minimum=64, maximum=4096)
+    image_width = clamp_int(query.get("image_width", [default_width])[0], default_width, minimum=64, maximum=4096)
+    steps = clamp_int(query.get("steps", [28 if model_index.get("is_distilled") else 40])[0], 28 if model_index.get("is_distilled") else 40, maximum=200)
 
     transformer_class = str(transformer_config.get("_class_name") or "")
     metadata_config = direct_primary_config(model_dir)
@@ -4113,7 +4217,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     transformer_model_type = str(transformer_config.get("model_type") or "").lower()
     is_video = "video" in video_hint or "transformer3d" in video_hint or transformer_model_type in {"t2v", "i2v", "ti2v"}
     default_frames = int(first_defined(transformer_config.get("sample_frames"), model_index.get("num_frames"), 81) or 81)
-    frames = clamp_int(query.get("frames", [default_frames if is_video else 1])[0], default_frames if is_video else 1)
+    frames = clamp_int(query.get("frames", [default_frames if is_video else 1])[0], default_frames if is_video else 1, minimum=1, maximum=1024)
 
     vae_scale_height, vae_scale_width = derive_vae_spatial_scales(vae_config)
     if is_video:

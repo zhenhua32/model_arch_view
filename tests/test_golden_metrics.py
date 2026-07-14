@@ -19,12 +19,12 @@ import pytest
 #   gflops : inference GFLOPs per token (rounded to .1)
 GOLDEN = {
     # --- MLA + MoE (GLM/LongCat/Hy3 family) ---
-    "ZhipuAI__GLM-5.2-FP8": dict(total=743061061632, active=39982989312, kv=87.8, gflops=80.0),
-    "ZhipuAI__GLM-5.2": dict(total=743061061632, active=39982989312, kv=87.8, gflops=80.0),
+    "ZhipuAI__GLM-5.2-FP8": dict(total=752927506432, active=39982989312, kv=87.8, gflops=80.0),
+    "ZhipuAI__GLM-5.2": dict(total=752927506432, active=39982989312, kv=87.8, gflops=80.0),
     # --- Compressed MQA + MoE (q/grouped-o low rank, CSA/HCA cache) ---
-    "deepseek-ai__DeepSeek-V4-Pro": dict(total=1572828279902, active=48683480158, kv=17.2, gflops=97.4),
+    "deepseek-ai__DeepSeek-V4-Pro": dict(total=1598581967145, active=48683480158, kv=17.2, gflops=97.4),
     "meituan-longcat__LongCat-2.0-FP8": dict(total=1592105893888, active=51488227328, kv=42.8, gflops=103.0),
-    "Tencent-Hunyuan__Hy3": dict(total=294970720256, active=20117979136, kv=320.0, gflops=40.2),
+    "Tencent-Hunyuan__Hy3": dict(total=298688970752, active=20117979136, kv=320.0, gflops=40.2),
     # --- Standard GQA MoE (num_local_experts alias) ---
     "MiniMax__MiniMax-M2.7": dict(total=239643918336, active=10366353408, kv=248.0, gflops=20.7),
     # --- Dense GQA (bf16, exact vs checkpoint) ---
@@ -44,9 +44,7 @@ def test_golden_metrics(serve, project_root, model_id):
     model_dir = project_root / "model_configs" / model_id
     assert model_dir.exists(), f"missing anchor model {model_id}"
 
-    cfg = serve.primary_config(model_dir)
-    params_cfg = serve.read_json_file(model_dir / "params.json") or {}
-    m = serve.estimate_llm_metrics(serve.parse_llm_dims(cfg, params_cfg))
+    m = serve.estimate_llm_metrics(serve.parse_model_llm_dims(model_dir))
     assert m is not None
 
     assert m["total_params"] == expected["total"], (
@@ -72,6 +70,5 @@ def test_active_less_than_total_for_moe(serve, project_root):
         "meituan-longcat__LongCat-2.0-FP8",
     ]:
         model_dir = project_root / "model_configs" / model_id
-        cfg = serve.primary_config(model_dir)
-        m = serve.estimate_llm_metrics(serve.parse_llm_dims(cfg))
+        m = serve.estimate_llm_metrics(serve.parse_model_llm_dims(model_dir))
         assert m["active_params"] < m["total_params"] * 0.5, model_id

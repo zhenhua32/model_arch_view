@@ -13,6 +13,12 @@ import pytest
 import serve_model_arch as s
 
 
+def test_read_json_file_rejects_non_mapping_roots(tmp_path):
+    path = tmp_path / "list.json"
+    path.write_text("[]", encoding="utf-8")
+    assert s.read_json_file(path) == {}
+
+
 # --------------------------------------------------------------------------- #
 # scalar_int -- video patch_size may be a list [t, h, w]
 # --------------------------------------------------------------------------- #
@@ -198,6 +204,64 @@ def test_longcat_style_aliases():
     assert dims["moe_ffn_hidden"] == 1024
     m = s.estimate_llm_metrics(dims)
     assert m is not None and m["total_params"] > 0
+
+
+def test_attention_layer_types_are_exclusive_and_missing_entries_are_full():
+    counts = s._attention_layer_counts(["linear_full", "sliding_attention"], 3, True)
+    assert counts == (1, 1, 1)
+
+
+def test_sparse_layers_take_precedence_over_overlapping_sliding_layers():
+    dims = s.parse_llm_dims(
+        {
+            "num_hidden_layers": 4,
+            "dsa_layers": [0, 1],
+            "swa_layers": [1, 2],
+            "index_topk": 128,
+        }
+    )
+    assert dims["sparse_attention_layers"] == 2
+    assert dims["sliding_attention_layers"] == 1
+    assert dims["full_attention_layers"] == 1
+
+
+def test_deepseek_v4_compression_ratios_are_padded_to_layer_count():
+    dims = s.parse_llm_dims(
+        {
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 4,
+            "compress_ratios": [4],
+        }
+    )
+    assert dims["compress_ratios"] == [4, 0, 0, 0]
+
+
+def test_deepseek_v4_context_keeps_compressed_tokens_without_index_topk():
+    metrics = {
+        "is_deepseek_v4": True,
+        "compress_ratios": [4],
+        "sliding_window": 0,
+        "head_dim": 128,
+        "index_topk": 0,
+    }
+    assert s._context_layer_tokens(metrics, 16) == 20
+
+
+def test_active_expert_count_cannot_exceed_total_experts():
+    cfg = {
+        "hidden_size": 1024,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 8,
+        "head_dim": 128,
+        "moe_intermediate_size": 512,
+        "num_experts": 2,
+        "num_experts_per_tok": 4,
+        "cli_factor": 2,
+        "vocab_size": 10000,
+    }
+    metrics = s.estimate_llm_metrics(s.parse_llm_dims(cfg))
+    assert metrics["effective_experts_per_tok"] == 2
+    assert metrics["ffn_active"] <= metrics["ffn_total"]
 
 
 # --------------------------------------------------------------------------- #

@@ -109,12 +109,28 @@ function getHierarchyModeLabel(mode, payload = state.payload) {
 }
 
 const HIERARCHY_TYPES = new Set(["llm", "diffusers", "multimodal"]);
+const HIERARCHY_MODES = ["summary", "block", "repeat"];
+
+function getAvailableHierarchyModes(payload = state.payload) {
+  if (!HIERARCHY_TYPES.has(payload?.model?.type)) {
+    return new Set(["all"]);
+  }
+  const nodes = payload?.graph?.nodes || [];
+  return new Set(HIERARCHY_MODES.filter((mode) => nodes.some((node) => isVisibleInHierarchy(node, mode))));
+}
 
 function getHierarchyMode(payload = state.payload) {
   if (!HIERARCHY_TYPES.has(payload?.model?.type)) {
     return "all";
   }
-  return state.llmHierarchyMode;
+  const availableModes = getAvailableHierarchyModes(payload);
+  if (availableModes.has(state.llmHierarchyMode)) {
+    return state.llmHierarchyMode;
+  }
+  if (availableModes.has("summary")) {
+    return "summary";
+  }
+  return availableModes.values().next().value || "all";
 }
 
 function isVisibleInHierarchy(item, mode) {
@@ -182,17 +198,22 @@ function syncSelectedNode(payload = state.payload) {
 
 function renderHierarchyToolbar() {
   const modelType = state.payload?.model?.type;
-  const hasHierarchy = HIERARCHY_TYPES.has(modelType);
+  const availableModes = getAvailableHierarchyModes();
+  const hasHierarchy = HIERARCHY_TYPES.has(modelType) && availableModes.size > 1;
   ui.hierarchyToolbar.hidden = !hasHierarchy;
   if (!hasHierarchy) {
     return;
   }
 
+  const activeMode = getHierarchyMode();
   const blockLabel = modelType === "diffusers" ? "Transformer 内部" : modelType === "multimodal" ? "编码器内部" : "Q/K/V/Causal";
   const repeatLabel = modelType === "diffusers" ? "重复 N 步" : "重复 N 层";
 
   ui.hierarchyToolbar.querySelectorAll("[data-hierarchy-mode]").forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.hierarchyMode === state.llmHierarchyMode);
+    const supported = availableModes.has(button.dataset.hierarchyMode);
+    button.hidden = !supported;
+    button.disabled = !supported;
+    button.classList.toggle("is-active", button.dataset.hierarchyMode === activeMode);
     if (button.dataset.hierarchyMode === "block") {
       button.textContent = blockLabel;
     }
@@ -914,18 +935,32 @@ function renderControls() {
   const controls = payload.controls || [];
   if (!controls.length) {
     ui.controlsForm.innerHTML = '<div class="empty-state">当前模型无需额外运行参数。</div>';
+    delete ui.controlsForm.dataset.structure;
     return;
   }
 
   const existingFields = Array.from(ui.controlsForm.querySelectorAll("[name]"));
   const existingNames = existingFields.map((el) => el.name);
   const newNames = controls.map((c) => c.name);
-  const sameStructure = existingNames.length === newNames.length && existingNames.every((name, i) => name === newNames[i]);
+  const structureSignature = JSON.stringify(
+    controls.map((control) => [
+      control.name,
+      control.type || "number",
+      control.label || "",
+      control.help || "",
+      control.options || [],
+    ])
+  );
+  const sameStructure =
+    ui.controlsForm.dataset.structure === structureSignature &&
+    existingNames.length === newNames.length &&
+    existingNames.every((name, i) => name === newNames[i]);
 
   if (sameStructure) {
     controls.forEach((control) => {
       const input = ui.controlsForm.querySelector(`input[name="${control.name}"]`);
       if (input) {
+        input.value = String(control.value ?? "");
         input.min = control.min ?? "";
         input.max = control.max ?? "";
         input.step = control.step ?? 1;
@@ -966,6 +1001,7 @@ function renderControls() {
       `;
     })
     .join("");
+  ui.controlsForm.dataset.structure = structureSignature;
 }
 
 function renderWarnings() {
@@ -1077,7 +1113,10 @@ function renderGraph() {
     })
     .join("");
 
-  requestAnimationFrame(drawEdges);
+  requestAnimationFrame(() => {
+    drawEdges();
+    applyNodeSearch();
+  });
 }
 
 function applyZoom() {
@@ -1594,6 +1633,9 @@ ui.compareClear.addEventListener("click", () => {
 ui.hierarchyToolbar.addEventListener("click", (event) => {
   const button = event.target.closest("[data-hierarchy-mode]");
   if (!button || !state.payload || !HIERARCHY_TYPES.has(state.payload.model.type)) {
+    return;
+  }
+  if (!getAvailableHierarchyModes().has(button.dataset.hierarchyMode)) {
     return;
   }
   clearTimeout(state.refreshTimer);

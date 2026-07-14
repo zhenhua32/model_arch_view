@@ -11,9 +11,7 @@ from conftest import all_model_dirs
 
 
 def _metrics_for(model_dir):
-    cfg = s.primary_config(model_dir)
-    pc = s.read_json_file(model_dir / "params.json") or {}
-    return s.estimate_llm_metrics(s.parse_llm_dims(cfg, pc))
+    return s.estimate_llm_metrics(s.parse_model_llm_dims(model_dir))
 
 
 def _llm_dirs_with_metrics():

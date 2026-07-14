@@ -30,19 +30,12 @@
 import argparse
 import json
 import os
-import sys
+import re
 import time
-import traceback
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
-
-try:
-    from modelscope.hub.snapshot_download import snapshot_download
-except ImportError:  # 兼容旧版导入路径
-    from modelscope import snapshot_download
-
 
 # ---------------------------------------------------------------------------
 # 常量定义
@@ -91,6 +84,39 @@ TASK_MAP = {
     "ocr": "ocr-recognition",
     "feature-extraction": "feature-extraction",
 }
+
+_INVALID_MODEL_ID_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+
+
+def get_snapshot_download():
+    try:
+        from modelscope.hub.snapshot_download import snapshot_download
+    except ImportError:
+        try:
+            from modelscope import snapshot_download
+        except ImportError as exc:
+            raise RuntimeError("缺少 modelscope 依赖，请先运行: pip install modelscope") from exc
+    return snapshot_download
+
+
+def normalize_model_id(model_id: str) -> str:
+    normalized = str(model_id).strip().replace("\\", "/")
+    parts = [part.strip() for part in normalized.split("/")]
+    if len(parts) < 2 or any(not part or part in {".", ".."} for part in parts):
+        raise ValueError(f"无效模型 ID: {model_id!r}")
+    if any(part.endswith((".", " ")) or _INVALID_MODEL_ID_CHARS.search(part) for part in parts):
+        raise ValueError(f"模型 ID 含非法路径字符: {model_id!r}")
+    return "/".join(parts)
+
+
+def model_id_from_record(model: Dict) -> str:
+    path = str(model.get("Path") or "").strip()
+    name = str(model.get("Name") or "").strip()
+    return normalize_model_id(f"{path}/{name}" if path else name)
+
+
+def safe_model_dir_name(model_id: str) -> str:
+    return normalize_model_id(model_id).replace("/", "__")
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +180,8 @@ def get_hot_models(
 
     model_data = data.get("Data", {}).get("Model", {})
     models = model_data.get("Models", [])
+    if not isinstance(models, list):
+        raise RuntimeError("ModelScope API 返回了无效的模型列表")
     total = model_data.get("TotalCount", "?")
 
     # 如果 limit 大于单页，继续翻页
@@ -164,8 +192,13 @@ def get_hot_models(
         payload["PageSize"] = min(limit - len(all_models), 50)
         resp = session.put(MODELSCOPE_API, json=payload, timeout=timeout)
         resp.raise_for_status()
-        d = resp.json().get("Data", {}).get("Model", {})
+        page_data = resp.json()
+        if not page_data.get("Success"):
+            raise RuntimeError(f"ModelScope API 翻页失败: {page_data.get('Message', page_data)}")
+        d = page_data.get("Data", {}).get("Model", {})
         models = d.get("Models", [])
+        if not isinstance(models, list):
+            raise RuntimeError("ModelScope API 翻页返回了无效的模型列表")
         if not models:
             break
         all_models.extend(models)
@@ -199,9 +232,11 @@ def download_model_config(
     Returns:
         下载结果字典 {model_id, status, path, files, error}
     """
-    result = {"model_id": model_id, "status": "pending", "path": "", "files": [], "downloaded_files": [], "error": ""}
+    result: Dict[str, Any] = {"model_id": model_id, "status": "pending", "path": "", "files": [], "downloaded_files": [], "error": ""}
     t0 = time.time()
     try:
+        model_id = normalize_model_id(model_id)
+        result["model_id"] = model_id
         before: Dict[str, tuple[int, int]] = {}
         if os.path.isdir(local_dir):
             for root, _dirs, files in os.walk(local_dir):
@@ -210,7 +245,7 @@ def download_model_config(
                     stat = os.stat(path)
                     before[os.path.relpath(path, local_dir)] = (stat.st_size, stat.st_mtime_ns)
 
-        kwargs = dict(
+        kwargs: Dict[str, Any] = dict(
             model_id=model_id,
             local_dir=local_dir,
             allow_patterns=allow_patterns,
@@ -219,23 +254,25 @@ def download_model_config(
         if token:
             kwargs["token"] = token
 
-        model_dir = snapshot_download(**kwargs)
+        model_dir = get_snapshot_download()(**kwargs)
+        resolved_model_dir = model_dir or local_dir
+        if not os.path.isdir(resolved_model_dir):
+            raise RuntimeError("下载器未返回有效的模型目录")
         # 收集实际下载的文件
-        downloaded_files = []
-        changed_files = []
-        if model_dir and os.path.isdir(model_dir):
-            for root, _dirs, files in os.walk(model_dir):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    rel = os.path.relpath(fp, model_dir)
-                    stat = os.stat(fp)
-                    entry = {"file": rel, "size": stat.st_size}
-                    downloaded_files.append(entry)
-                    if before.get(rel) != (stat.st_size, stat.st_mtime_ns):
-                        changed_files.append(entry)
+        downloaded_files: List[Dict[str, Any]] = []
+        changed_files: List[Dict[str, Any]] = []
+        for root, _dirs, files in os.walk(resolved_model_dir):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                relative_path = os.path.relpath(file_path, resolved_model_dir)
+                stat = os.stat(file_path)
+                entry = {"file": relative_path, "size": stat.st_size}
+                downloaded_files.append(entry)
+                if before.get(relative_path) != (stat.st_size, stat.st_mtime_ns):
+                    changed_files.append(entry)
 
         result["status"] = "success"
-        result["path"] = model_dir or local_dir
+        result["path"] = resolved_model_dir
         result["files"] = downloaded_files
         result["downloaded_files"] = changed_files
         result["elapsed"] = round(time.time() - t0, 1)
@@ -252,13 +289,14 @@ def download_model_config(
 # 主流程
 # ---------------------------------------------------------------------------
 
-def format_size(n: int) -> str:
+def format_size(n: int | float) -> str:
     """把字节数格式化为人类可读字符串。"""
+    size = float(n)
     for unit in ["B", "KB", "MB", "GB"]:
-        if n < 1024:
-            return f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}TB"
+        if size < 1024:
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TB"
 
 
 def main():
@@ -281,7 +319,7 @@ def main():
                         help="ModelScope access token（也可设置环境变量 MODELSCOPE_API_TOKEN）")
     parser.add_argument("--list-only", action="store_true",
                         help="只列出热门模型，不下载")
-    parser.add_argument("--models", nargs="*", default=None,
+    parser.add_argument("--models", nargs="+", default=None,
                         help="直接指定模型 ID 列表，跳过热门获取（如 Qwen/Qwen2.5-7B）")
     parser.add_argument("--revision", default="master",
                         help="模型版本/分支（默认 master）")
@@ -310,11 +348,25 @@ def main():
 
     # ---- 获取模型列表 ----
     if args.models:
-        models = [{"Path": m.split("/")[0], "Name": "/".join(m.split("/")[1:])}
-                  for m in args.models]
+        models = [{"Path": "", "Name": model_id} for model_id in args.models]
         print(f"[INFO] 使用手动指定的 {len(models)} 个模型")
     else:
         models = get_hot_models(limit=args.limit, task=args.task, token=token)
+
+    normalized_models = []
+    seen_model_ids = set()
+    for model in models:
+        try:
+            model_id = model_id_from_record(model)
+        except ValueError as exc:
+            print(f"[WARN] 跳过无效模型记录: {exc}")
+            continue
+        if model_id in seen_model_ids:
+            print(f"[WARN] 跳过重复模型: {model_id}")
+            continue
+        seen_model_ids.add(model_id)
+        normalized_models.append({**model, "_model_id": model_id})
+    models = normalized_models
 
     if not models:
         print("[WARN] 未获取到任何模型，退出。")
@@ -324,9 +376,8 @@ def main():
     print(f"\n{'序号':>4}  {'下载量':>10}  {'收藏':>6}  模型ID")
     print("-" * 70)
     for i, m in enumerate(models, 1):
-        path = m.get("Path", "")
         name = m.get("Name", "")
-        model_id = f"{path}/{name}" if path else name
+        model_id = m["_model_id"]
         dl = m.get("Downloads", 0) or 0
         star = m.get("Stars", 0) or 0
         cn = m.get("ChineseName", "")
@@ -345,13 +396,11 @@ def main():
     results = []
     success_count = 0
     for i, m in enumerate(models, 1):
-        path = m.get("Path", "")
-        name = m.get("Name", "")
-        model_id = f"{path}/{name}" if path else name
+        model_id = m["_model_id"]
         dl = m.get("Downloads", 0) or 0
 
         # 每个模型一个子目录
-        safe_name = model_id.replace("/", "__")
+        safe_name = safe_model_dir_name(model_id)
         model_local_dir = str(output_dir / safe_name)
 
         print(f"\n[{i}/{len(models)}] {model_id}  (下载量: {dl:,})")

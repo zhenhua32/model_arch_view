@@ -17,16 +17,7 @@ from conftest import all_model_dirs, is_quantized, read_total_size
 # Default tolerance for the bf16 byte proxy.
 DEFAULT_TOL = 0.05
 
-# Documented, architecture-driven exceptions (still bounded, just looser). The
-# reason explains why the checkpoint bytes legitimately differ from 2*params.
-KNOWN_EXCEPTIONS = {
-    # Embedding model: the generative lm_head is stripped from the checkpoint,
-    # so on-disk bytes are smaller than the parameter estimate.
-    "Qwen__Qwen3-Embedding-8B": (0.12, "embedding model, lm_head removed from checkpoint"),
-    # Checkpoint ships extra MTP / multi-token-prediction layers that are not part
-    # of the headline num_hidden_layers count.
-    "openpangu__openPangu-2.0-Flash": (0.12, "checkpoint includes extra MTP layers"),
-}
+KNOWN_EXCEPTIONS = {}
 
 
 def _candidates():
@@ -54,9 +45,7 @@ def test_have_ground_truth_models():
 
 @pytest.mark.parametrize("model_dir", CANDIDATES, ids=CANDIDATE_IDS)
 def test_param_count_matches_checkpoint(serve, model_dir):
-    cfg = serve.primary_config(model_dir)
-    params_cfg = serve.read_json_file(model_dir / "params.json") or {}
-    metrics = serve.estimate_llm_metrics(serve.parse_llm_dims(cfg, params_cfg))
+    metrics = serve.estimate_llm_metrics(serve.parse_model_llm_dims(model_dir))
     assert metrics is not None, f"{model_dir.name}: no estimate produced"
 
     total_size = read_total_size(model_dir)

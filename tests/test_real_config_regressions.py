@@ -11,10 +11,10 @@ def _summary(payload):
 def test_hy3_shared_expert_matches_model_card_scale():
     payload = s.build_model_payload("Tencent-Hunyuan__Hy3", {})
     metrics = payload["metrics"]
-    assert metrics["total_params"] == 294_970_720_256
+    assert metrics["total_params"] == 298_688_970_752
     assert metrics["active_params"] == 20_117_979_136
     assert metrics["breakdown"]["shared_experts"] > 0
-    assert 294 <= metrics["total_params"] / 1e9 <= 296
+    assert 298 <= metrics["total_params"] / 1e9 <= 299
     assert 20 <= metrics["active_params"] / 1e9 <= 21
 
 
@@ -43,6 +43,24 @@ def test_bge_is_encoder_without_causal_or_decode_metrics():
     assert payload["metrics"]["kv_cache_mb_per_1k"] is None
     assert payload["metrics"]["throughput"] == []
     assert "Encoder-only" in payload["model"]["headline"]
+
+
+def test_qwen_embedding_keeps_causal_decoder_but_removes_generation_head():
+    payload = s.build_model_payload("Qwen__Qwen3-Embedding-8B", {})
+    metrics = payload["metrics"]
+    node_labels = {node["label"] for node in payload["graph"]["nodes"]}
+    checkpoint_bytes = s.read_json_file(
+        s.MODEL_CONFIGS_DIR / "Qwen__Qwen3-Embedding-8B" / "model.safetensors.index.json"
+    )["metadata"]["total_size"]
+
+    assert payload["model"]["headline"].startswith("Decoder-only 表征模型")
+    assert metrics["causal_attention"] is True
+    assert metrics["output_head_params"] == 0
+    assert metrics["kv_cache_mb_per_1k"] is None
+    assert metrics["throughput"] == []
+    assert abs(metrics["total_params"] * 2 - checkpoint_bytes) / checkpoint_bytes < 0.001
+    assert "Embedding Pooling" in node_labels
+    assert "LM Head" not in node_labels
 
 
 def test_real_sliding_window_caps_mellum_kv_but_disabled_qwen_does_not():
@@ -283,13 +301,22 @@ def test_inherited_lora_and_gguf_payloads_use_base_shapes():
     assert any("base_model=Qwen/Qwen3.6-35B-A3B" in warning for warning in gguf["warnings"])
 
 
+def test_inherited_fp8_config_keeps_base_dimensions_and_local_quantization():
+    model_dir = s.MODEL_CONFIGS_DIR / "Qwen__Qwen3.6-27B-FP8"
+    base_dir = s.local_base_model_dir(model_dir)
+    config = s.primary_config(model_dir)
+    assert base_dir is not None
+    assert config["text_config"]["hidden_size"] == s.primary_config(base_dir)["text_config"]["hidden_size"]
+    assert config["quantization_config"]["quant_method"] == "fp8"
+
+
 def test_deepseek_v4_uses_compressed_mqa_and_mixed_precision_profile():
     flash = s.build_model_payload(
         "deepseek-ai__DeepSeek-V4-Flash",
         {"seq_len": ["1048576"]},
     )
     metrics = flash["metrics"]
-    assert 284e9 <= metrics["total_params"] <= 285e9
+    assert 290e9 <= metrics["total_params"] <= 291e9
     assert 13e9 <= metrics["active_params"] <= 13.5e9
     assert metrics["is_deepseek_v4"] is True
     assert metrics["compress_ratios"].count(4) == 21
@@ -308,7 +335,7 @@ def test_deepseek_v4_uses_compressed_mqa_and_mixed_precision_profile():
     assert bf16["weight_format"] == "BF16"
 
     pro = s.build_model_payload("deepseek-ai__DeepSeek-V4-Pro", {})["metrics"]
-    assert 1.56e12 <= pro["total_params"] <= 1.59e12
+    assert 1.59e12 <= pro["total_params"] <= 1.61e12
     assert 48e9 <= pro["active_params"] <= 50e9
 
 
@@ -322,6 +349,7 @@ def test_openpangu_sparse_attention_and_minimax_mtp_are_accounted():
     assert pangu["sparse_topk"] == 2048
     assert 8 * 1024**3 <= pangu["memory"]["kv_bytes"] <= 10 * 1024**3
     assert 60 <= pangu["gflops_per_token"] <= 70
+    assert pangu["mtp_included"] == pangu["mtp_params"] > 0
 
     minimax = s.build_model_payload("MiniMax__MiniMax-M2.7", {})["metrics"]
     assert minimax["mtp_layers"] == 3
