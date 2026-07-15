@@ -37,7 +37,12 @@ python serve_model_arch.py --port 8123
 - 中间查看架构图与数据流向，并在选中节点后高亮其上下游路径
 - 对 LLM 支持三种 Decoder Stack 视图：汇总、单层 Block（含 Q/K/V、RoPE、QK Score、Causal Mask、Sliding Window Mask、Softmax、Weighted V、Output Projection）、重复 N 层摘要；repeat 视图会额外给出首层 / 中层 / 末层的 mask 摘要
 - 右侧查看节点的关键配置字段、输入 shape、输出 shape、推导公式和上下游跳转
+- “部署估算”页按 Decode、Prefill 或全量训练场景展示指定 GPU 集群的显存构成、容量下界、并行策略和理论吞吐
+- “专项分析”页汇总 LLM 的注意力类型、GQA / MLA、MoE 路由、激活参数和输出头；其他模型展示泳道、节点类型与主计算路径
 - “计算审计”页展示可信度、配置继承、字段来源、结构化诊断、公式输入与 checkpoint 真值对比
+- “A/B 对比”页按结构、计算容量和当前部署场景分组比较，并标记两端运行参数是否被模型边界校正
+- 架构图支持节点固定、父级折叠、缩略图导航，并按模型保存层级、缩放、选择和折叠状态
+- “复制链接”会编码模型、运行参数、当前页签和图状态，打开链接可还原同一分析现场
 - 支持导出当前模型视图的 JSON 数据、SVG 图和 Markdown 审计报告
 
 ## 计算审计
@@ -67,6 +72,8 @@ python serve_model_arch.py --port 8123
 - 原生混合精度模型会分别计算 FP4 路由专家与 FP8 主干的激活权重读取；显存优先采用 safetensors index 的实际 checkpoint 字节数。
 - 显存中的激活项按可复用的单层 inference workspace 粗估，不按层数重复累计。
 - GPU 卡数仍只是容量下界；真实部署还受并行切分、通信和框架常驻显存影响。
+- 多卡场景先聚合理想算力与带宽，再乘按卡数和并行策略估计的效率；该值不替代真实拓扑 benchmark。
+- 全量训练显存包含 BF16 权重与梯度、FP32 master weight、Adam FP32 m/v 和按层累计的激活粗估，暂不建模 ZeRO、FSDP、重计算与 offload。
 - Diffusers 视频模型的 token 数包含 VAE 时间压缩与 3D transformer patch。
 - 多码本 delay-pattern TTS 会计算码本错位后的解码步；单码流 TTS 不再虚构 RVQ 并行头，只有配置明确给出帧率、mel 比例和 hop 时才换算波形样本数。
 - HY-World 同时计算 HY-Pano 的 MoE 参数、VAE latent 与环形融合宽度，以及 WorldMirror 的多视图 patch token 和过滤前 Gaussian 数量。

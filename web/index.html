@@ -50,12 +50,15 @@
             <button id="export-audit-button" class="ghost-button action-btn" type="button" disabled>审计 MD</button>
             <button id="export-json-button" class="ghost-button action-btn" type="button" disabled>JSON</button>
             <button id="export-svg-button" class="ghost-button action-btn" type="button" disabled>SVG</button>
+            <button id="share-view-button" class="ghost-button action-btn" type="button" disabled>复制链接</button>
           </div>
         </header>
 
         <div class="view-tabs" role="tablist" aria-label="中心视图">
           <button class="view-tab is-active" type="button" data-view="graph" role="tab" aria-selected="true">架构图</button>
           <button class="view-tab" type="button" data-view="details" role="tab" aria-selected="false">模型详情</button>
+          <button class="view-tab" type="button" data-view="scenario" role="tab" aria-selected="false">部署估算</button>
+          <button class="view-tab" type="button" data-view="insights" role="tab" aria-selected="false">专项分析</button>
           <button class="view-tab" type="button" data-view="audit" role="tab" aria-selected="false">计算审计</button>
           <button class="view-tab" type="button" data-view="compare" role="tab" aria-selected="false">A/B 对比</button>
         </div>
@@ -68,6 +71,10 @@
                 <div id="graph-board" class="graph-board"></div>
               </div>
             </div>
+            <div id="graph-minimap" class="graph-minimap" hidden>
+              <div id="minimap-content" class="minimap-content"></div>
+              <div id="minimap-viewport" class="minimap-viewport"></div>
+            </div>
             <div id="zoom-controls" class="zoom-controls">
               <button id="zoom-out" class="zoom-btn" type="button" title="缩小" aria-label="缩小">−</button>
               <span id="zoom-level" class="zoom-level">100%</span>
@@ -78,6 +85,14 @@
 
           <div id="details-view" class="view-pane" hidden>
             <section id="model-summary" class="summary-panel center-summary"></section>
+          </div>
+
+          <div id="scenario-view" class="view-pane" hidden>
+            <section id="scenario-panel" class="scenario-panel center-scenario"></section>
+          </div>
+
+          <div id="insights-view" class="view-pane" hidden>
+            <section id="insights-panel" class="insights-panel center-insights"></section>
           </div>
 
           <div id="audit-view" class="view-pane" hidden>

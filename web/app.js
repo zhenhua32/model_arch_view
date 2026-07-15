@@ -1,6 +1,11 @@
+const initialUrlParams = new URLSearchParams(window.location.search);
+const URL_STATE_KEYS = new Set(["model", "view", "hierarchy", "node", "lanes", "parents", "pins", "zoom", "scroll_x", "scroll_y", "compare"]);
+const CENTER_VIEWS = new Set(["graph", "details", "scenario", "insights", "audit", "compare"]);
+
 const state = {
   models: [],
   activeModelId: null,
+  loadedModelId: null,
   payload: null,
   compareModelId: null,
   comparePayload: null,
@@ -13,7 +18,10 @@ const state = {
   pan: { dragging: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0 },
   collapsedParents: new Set(),
   collapsedLanes: new Set(),
+  pinnedNodes: new Set(),
   centerView: "graph",
+  urlStateApplied: false,
+  pendingScroll: null,
 };
 
 const ui = {
@@ -26,6 +34,7 @@ const ui = {
   exportAuditButton: document.getElementById("export-audit-button"),
   exportJsonButton: document.getElementById("export-json-button"),
   exportSvgButton: document.getElementById("export-svg-button"),
+  shareViewButton: document.getElementById("share-view-button"),
   statusBar: document.getElementById("status-bar"),
   summaryPanel: document.getElementById("model-summary"),
   compareSection: document.getElementById("compare-section"),
@@ -37,6 +46,9 @@ const ui = {
   graphCanvas: document.getElementById("graph-canvas"),
   graphBoard: document.getElementById("graph-board"),
   edgeLayer: document.getElementById("edge-layer"),
+  graphMinimap: document.getElementById("graph-minimap"),
+  minimapContent: document.getElementById("minimap-content"),
+  minimapViewport: document.getElementById("minimap-viewport"),
   detailPanel: document.getElementById("detail-panel"),
   zoomIn: document.getElementById("zoom-in"),
   zoomOut: document.getElementById("zoom-out"),
@@ -46,6 +58,10 @@ const ui = {
   viewTabs: document.querySelector(".view-tabs"),
   graphView: document.getElementById("graph-view"),
   detailsView: document.getElementById("details-view"),
+  scenarioView: document.getElementById("scenario-view"),
+  scenarioPanel: document.getElementById("scenario-panel"),
+  insightsView: document.getElementById("insights-view"),
+  insightsPanel: document.getElementById("insights-panel"),
   auditView: document.getElementById("audit-view"),
   auditPanel: document.getElementById("audit-panel"),
   compareView: document.getElementById("compare-view"),
@@ -80,6 +96,7 @@ function updateExportButtons() {
   ui.exportAuditButton.disabled = disabled;
   ui.exportJsonButton.disabled = disabled;
   ui.exportSvgButton.disabled = disabled;
+  ui.shareViewButton.disabled = disabled;
 }
 
 function extractRepeatCount(payload = state.payload) {
@@ -150,13 +167,30 @@ function isVisibleInHierarchy(item, mode) {
 function getVisibleGraph(payload = state.payload) {
   const graph = payload?.graph || { nodes: [], edges: [], lanes: [] };
   const mode = getHierarchyMode(payload);
-  let nodes = (graph.nodes || []).filter((node) => isVisibleInHierarchy(node, mode));
-  nodes = nodes.filter((node) => {
+  const allNodes = graph.nodes || [];
+  const nodeById = new Map(allNodes.map((node) => [node.id, node]));
+  const hierarchyNodes = allNodes.filter((node) => isVisibleInHierarchy(node, mode));
+  let nodes = hierarchyNodes.filter((node) => {
     if (!node.parentId) return true;
     return !state.collapsedParents.has(node.parentId);
   });
+  for (const parentId of state.collapsedParents) {
+    const parent = nodeById.get(parentId);
+    const replacesVisibleChildren = hierarchyNodes.some((node) => node.parentId === parentId);
+    if (parent && replacesVisibleChildren && !nodes.some((node) => node.id === parentId)) {
+      nodes.push(parent);
+    }
+  }
   const visibleIds = new Set(nodes.map((node) => node.id));
-  const edges = (graph.edges || []).filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target) && isVisibleInHierarchy(edge, mode));
+  const resolveEndpoint = (nodeId) => {
+    if (visibleIds.has(nodeId)) return nodeId;
+    const parentId = nodeById.get(nodeId)?.parentId;
+    return parentId && state.collapsedParents.has(parentId) && visibleIds.has(parentId) ? parentId : null;
+  };
+  const edges = (graph.edges || [])
+    .filter((edge) => isVisibleInHierarchy(edge, mode))
+    .map((edge) => ({ ...edge, source: resolveEndpoint(edge.source), target: resolveEndpoint(edge.target) }))
+    .filter((edge) => edge.source && edge.target && edge.source !== edge.target);
   return {
     lanes: graph.lanes || [],
     nodes,
@@ -235,7 +269,91 @@ function buildQueryFromControls() {
       params.set(key, String(value));
     }
   }
+  if (!params.size && !state.urlStateApplied) {
+    initialUrlParams.forEach((value, key) => {
+      if (!URL_STATE_KEYS.has(key) && String(value).trim() !== "") {
+        params.set(key, value);
+      }
+    });
+  }
   return params.toString();
+}
+
+function graphStateKey(modelId = state.activeModelId) {
+  return `model-arch-view:graph:${modelId || "unknown"}`;
+}
+
+function parseStateSet(value) {
+  return new Set(String(value || "").split(",").map((item) => item.trim()).filter(Boolean));
+}
+
+function restoreGraphState(modelId) {
+  state.selectedNodeId = null;
+  state.llmHierarchyMode = "summary";
+  state.collapsedParents = new Set();
+  state.collapsedLanes = new Set();
+  state.pinnedNodes = new Set();
+  state.zoom = { scale: 1, x: 0, y: 0 };
+  state.pendingScroll = { left: 0, top: 0 };
+  try {
+    const saved = JSON.parse(localStorage.getItem(graphStateKey(modelId)) || "null");
+    if (!saved || saved.version !== 1) return;
+    state.selectedNodeId = saved.selectedNodeId || null;
+    state.llmHierarchyMode = HIERARCHY_MODES.includes(saved.hierarchyMode) ? saved.hierarchyMode : "summary";
+    state.collapsedParents = new Set(Array.isArray(saved.collapsedParents) ? saved.collapsedParents : []);
+    state.collapsedLanes = new Set(Array.isArray(saved.collapsedLanes) ? saved.collapsedLanes : []);
+    state.pinnedNodes = new Set(Array.isArray(saved.pinnedNodes) ? saved.pinnedNodes : []);
+    const scale = Number(saved.zoom?.scale);
+    state.zoom = { scale: Number.isFinite(scale) ? Math.max(0.3, Math.min(3, scale)) : 1, x: 0, y: 0 };
+    state.pendingScroll = {
+      left: Math.max(0, Number(saved.scrollLeft) || 0),
+      top: Math.max(0, Number(saved.scrollTop) || 0),
+    };
+    if (CENTER_VIEWS.has(saved.centerView)) state.centerView = saved.centerView;
+  } catch (error) {
+    console.warn("无法恢复图状态", error);
+  }
+}
+
+function applyInitialUrlState() {
+  if (state.urlStateApplied) return;
+  const view = initialUrlParams.get("view");
+  const hierarchy = initialUrlParams.get("hierarchy");
+  const scale = Number(initialUrlParams.get("zoom"));
+  if (CENTER_VIEWS.has(view)) state.centerView = view;
+  if (HIERARCHY_MODES.includes(hierarchy)) state.llmHierarchyMode = hierarchy;
+  if (initialUrlParams.has("node")) state.selectedNodeId = initialUrlParams.get("node");
+  if (initialUrlParams.has("lanes")) state.collapsedLanes = parseStateSet(initialUrlParams.get("lanes"));
+  if (initialUrlParams.has("parents")) state.collapsedParents = parseStateSet(initialUrlParams.get("parents"));
+  if (initialUrlParams.has("pins")) state.pinnedNodes = parseStateSet(initialUrlParams.get("pins"));
+  if (Number.isFinite(scale)) state.zoom.scale = Math.max(0.3, Math.min(3, scale));
+  state.pendingScroll = {
+    left: Math.max(0, Number(initialUrlParams.get("scroll_x")) || state.pendingScroll?.left || 0),
+    top: Math.max(0, Number(initialUrlParams.get("scroll_y")) || state.pendingScroll?.top || 0),
+  };
+  const compare = initialUrlParams.get("compare");
+  if (compare) state.compareModelId = compare;
+  state.urlStateApplied = true;
+}
+
+function persistGraphState() {
+  if (!state.activeModelId || !state.payload) return;
+  try {
+    localStorage.setItem(graphStateKey(), JSON.stringify({
+      version: 1,
+      selectedNodeId: state.selectedNodeId,
+      hierarchyMode: state.llmHierarchyMode,
+      collapsedParents: [...state.collapsedParents],
+      collapsedLanes: [...state.collapsedLanes],
+      pinnedNodes: [...state.pinnedNodes],
+      zoom: { scale: state.zoom.scale },
+      scrollLeft: ui.graphScroll.scrollLeft,
+      scrollTop: ui.graphScroll.scrollTop,
+      centerView: state.centerView,
+    }));
+  } catch (error) {
+    console.warn("无法保存图状态", error);
+  }
 }
 
 function buildGraphIndex(graph) {
@@ -421,27 +539,35 @@ async function loadModels() {
   setStatus("正在读取 model_configs 目录...");
   const data = await fetchJson("/api/models");
   state.models = data.models || [];
-  renderModelList();
 
   if (!state.models.length) {
     setStatus("未找到模型目录。", true);
     state.payload = null;
     updateExportButtons();
     ui.summaryPanel.innerHTML = '<div class="empty-state">当前没有可展示的模型目录。</div>';
+    ui.scenarioPanel.innerHTML = '<div class="empty-state">当前没有可估算的模型目录。</div>';
+    ui.insightsPanel.innerHTML = '<div class="empty-state">当前没有可分析的模型目录。</div>';
     ui.auditPanel.innerHTML = '<div class="empty-state">当前没有可审计的模型目录。</div>';
     return;
   }
 
   const currentExists = state.models.some((model) => model.id === state.activeModelId);
   if (!currentExists) {
-    state.activeModelId = state.models[0].id;
+    const requestedModel = initialUrlParams.get("model");
+    state.activeModelId = state.models.some((model) => model.id === requestedModel) ? requestedModel : state.models[0].id;
   }
+  renderModelList();
   await loadModelPayload();
 }
 
 async function loadModelPayload() {
   if (!state.activeModelId) {
     return;
+  }
+
+  const modelChanged = state.loadedModelId !== state.activeModelId;
+  if (modelChanged) {
+    restoreGraphState(state.activeModelId);
   }
 
   if (state.fetchController) {
@@ -457,12 +583,21 @@ async function loadModelPayload() {
     const previousSelected = state.selectedNodeId;
     const payload = await fetchJson(`/api/models/${encodeURIComponent(state.activeModelId)}${suffix}`, state.fetchController.signal);
     state.payload = payload;
-    state.selectedNodeId = (payload.graph?.nodes || []).some((node) => node.id === previousSelected) ? previousSelected : payload.selectedNodeId;
+    state.loadedModelId = state.activeModelId;
+    applyInitialUrlState();
+    const graphNodeIds = new Set((payload.graph?.nodes || []).map((node) => node.id));
+    const graphLaneIds = new Set((payload.graph?.lanes || []).map((lane) => lane.id));
+    state.selectedNodeId = graphNodeIds.has(state.selectedNodeId) ? state.selectedNodeId : graphNodeIds.has(previousSelected) ? previousSelected : payload.selectedNodeId;
+    state.collapsedParents = new Set([...state.collapsedParents].filter((nodeId) => graphNodeIds.has(nodeId)));
+    state.pinnedNodes = new Set([...state.pinnedNodes].filter((nodeId) => graphNodeIds.has(nodeId)));
+    state.collapsedLanes = new Set([...state.collapsedLanes].filter((laneId) => graphLaneIds.has(laneId)));
     syncSelectedNode(payload);
     updateExportButtons();
     renderHierarchyToolbar();
     renderModelList();
     renderSummary();
+    renderScenario();
+    renderInsights();
     renderAudit();
     renderControls();
     renderWarnings();
@@ -470,6 +605,17 @@ async function loadModelPayload() {
     renderDetails();
     renderCompareSelect();
     loadComparePayload();
+    setCenterView(state.centerView);
+    applyZoom();
+    requestAnimationFrame(() => {
+      if (state.pendingScroll) {
+        ui.graphScroll.scrollLeft = state.pendingScroll.left;
+        ui.graphScroll.scrollTop = state.pendingScroll.top;
+        state.pendingScroll = null;
+      }
+      updateMinimapViewport();
+      persistGraphState();
+    });
     setStatus(`已加载 ${payload.model.name}，当前展示 ${payload.model.type} 图结构。`);
   } catch (error) {
     if (error.name === "AbortError") {
@@ -483,6 +629,8 @@ async function loadModelPayload() {
     ui.controlsForm.innerHTML = '<div class="empty-state">无法加载运行参数。</div>';
     setStatus(`加载失败：${error.message}`, true);
     ui.summaryPanel.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+    ui.scenarioPanel.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+    ui.insightsPanel.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
     ui.auditPanel.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
     ui.graphBoard.innerHTML = "";
     ui.edgeLayer.innerHTML = "";
@@ -733,6 +881,220 @@ function renderAnalysisSections(payload) {
   return renderBreakdownSection(metrics) + renderMemorySection(metrics) + renderThroughputSection(metrics);
 }
 
+const SCENARIO_MEMORY_META = [
+  { key: "weights_bytes", label: "权重", color: "#378ADD" },
+  { key: "kv_bytes", label: "KV cache", color: "#1D9E75" },
+  { key: "activation_bytes", label: "激活", color: "#EF9F27" },
+  { key: "gradients_bytes", label: "梯度", color: "#7F77DD" },
+  { key: "master_weights_bytes", label: "Master weights", color: "#D4537E" },
+  { key: "optimizer_bytes", label: "优化器", color: "#D97706" },
+];
+
+const WORKLOAD_LABELS = { decode: "Decode 推理", prefill: "Prefill 推理", training: "全量训练" };
+const PARALLEL_LABELS = { single: "单卡", tensor: "张量并行", pipeline: "流水并行", expert: "专家并行", auto: "自动" };
+
+function renderScenario() {
+  const payload = state.payload;
+  const scenario = payload?.metrics?.scenario;
+  if (!scenario) {
+    ui.scenarioPanel.innerHTML = '<div class="empty-state">当前模型暂无部署场景估算。</div>';
+    return;
+  }
+
+  const memory = scenario.memory || {};
+  const performance = scenario.performance || {};
+  const gpu = scenario.gpu || {};
+  const memoryItems = SCENARIO_MEMORY_META.map((item) => ({ ...item, value: Number(memory[item.key]) || 0 }));
+  const memoryLegend = memoryItems
+    .filter((item) => item.value > 0)
+    .map((item) => `
+      <div class="scenario-memory-row">
+        <span class="legend-dot" style="background:${item.color}"></span>
+        <span>${escapeHtml(item.label)}</span>
+        <strong>${formatGB(item.value)}</strong>
+        <small>${memory.total_bytes ? `${(item.value / memory.total_bytes * 100).toFixed(1)}%` : "—"}</small>
+      </div>`)
+    .join("");
+  const resolvedParallel = PARALLEL_LABELS[scenario.parallelism] || scenario.parallelism;
+  const requestedParallel = PARALLEL_LABELS[scenario.requested_parallelism] || scenario.requested_parallelism;
+  const fallbackNote = scenario.parallelism !== scenario.requested_parallelism && scenario.requested_parallelism !== "auto"
+    ? `<span class="scenario-warning">请求 ${escapeHtml(requestedParallel)}，按结构回退为 ${escapeHtml(resolvedParallel)}</span>`
+    : "";
+  const performanceRows = [
+    ["Decode", performance.decode_tps, "tok/s", formatTps],
+    ["Prefill", performance.prefill_tps, "tok/s", formatTps],
+    ["训练", performance.training_tps, "tok/s", formatTps],
+    ["首 token", performance.ttft_ms, "ms", (value) => Number(value).toFixed(1)],
+    ["训练 step", performance.training_step_ms, "ms", (value) => Number(value).toFixed(1)],
+  ].filter(([, value]) => Number.isFinite(Number(value)) && Number(value) > 0);
+  const assumptions = (scenario.assumptions || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const activeFormula = scenario.formula?.[scenario.workload] || "—";
+
+  ui.scenarioPanel.innerHTML = `
+    <div class="analysis-title-row">
+      <div>
+        <span class="analysis-eyebrow">Deployment scenario</span>
+        <h2>${escapeHtml(payload.model.name)}</h2>
+        <p>${escapeHtml(WORKLOAD_LABELS[scenario.workload] || scenario.workload)} · batch ${escapeHtml(payload.parameters?.batch || 1)} · seq ${escapeHtml(payload.parameters?.seq_len || "—")}</p>
+      </div>
+      <span class="fit-badge ${memory.fits ? "fits" : "overflow"}">${memory.fits ? "显存可容纳" : "显存不足"}</span>
+    </div>
+    <div class="scenario-hero-grid">
+      <article class="scenario-primary-card">
+        <span>${escapeHtml(performance.primary_label || "场景吞吐")}</span>
+        <strong>${formatTps(Number(performance.primary_value) || 0)}</strong>
+        <small>${escapeHtml(performance.primary_unit || "")}</small>
+        <div class="scenario-bound">${escapeHtml(performance.bound || "未知")}瓶颈 · 并行效率 ${(Number(scenario.parallel_efficiency || 0) * 100).toFixed(0)}%</div>
+      </article>
+      <article class="scenario-config-card">
+        <div><span>GPU</span><strong>${escapeHtml(gpu.name || "—")} ×${escapeHtml(scenario.gpu_count || 1)}</strong></div>
+        <div><span>并行策略</span><strong>${escapeHtml(resolvedParallel)}</strong></div>
+        <div><span>单卡规格</span><strong>${escapeHtml(gpu.mem_gb || "—")} GB · ${escapeHtml(gpu.bw_gbs || "—")} GB/s</strong></div>
+        ${scenario.workload === "training" ? `<div><span>训练计算</span><strong>${escapeHtml(String(performance.training_compute_precision || "bf16").toUpperCase())}</strong></div>` : ""}
+        ${fallbackNote}
+      </article>
+    </div>
+    <div class="scenario-section-grid">
+      <section class="analysis-card">
+        <div class="analysis-card-head"><h3>显存预算</h3><code>${Number(memory.total_gb || 0).toFixed(1)} GiB</code></div>
+        ${renderStackedBar(memoryItems, Number(memory.total_bytes) || 0)}
+        <div class="scenario-memory-list">${memoryLegend}</div>
+        <div class="capacity-grid">
+          <div><span>每卡负载</span><strong>${Number(memory.per_gpu_gb || 0).toFixed(1)} GiB</strong></div>
+          <div><span>集群可用</span><strong>${Number(memory.capacity_gb || 0).toFixed(1)} GiB</strong></div>
+          <div><span>容量下界</span><strong>${escapeHtml(memory.minimum_gpu_count || 1)} 卡</strong></div>
+        </div>
+      </section>
+      <section class="analysis-card">
+        <div class="analysis-card-head"><h3>性能分解</h3><code>${escapeHtml(performance.bound || "—")}</code></div>
+        <div class="scenario-performance-grid">
+          ${performanceRows.map(([label, value, unit, formatter]) => `<div><span>${escapeHtml(label)}</span><strong>${formatter(Number(value))}</strong><small>${escapeHtml(unit)}</small></div>`).join("")}
+        </div>
+        <div class="scenario-formula"><span>当前公式</span><code>${escapeHtml(activeFormula)}</code></div>
+      </section>
+    </div>
+    <section class="analysis-card scenario-assumptions">
+      <div class="analysis-card-head"><h3>边界与假设</h3><code>${escapeHtml(scenario.formula?.memory || "")}</code></div>
+      <ul>${assumptions || "<li>暂无额外假设。</li>"}</ul>
+    </section>`;
+}
+
+function renderInsightBar(items, total) {
+  if (!total) return '<div class="insight-empty-bar"></div>';
+  return `<div class="insight-bar">${items
+    .filter((item) => item.value > 0)
+    .map((item) => `<span style="width:${(item.value / total * 100).toFixed(2)}%;background:${item.color}" title="${escapeHtml(item.label)} ${item.value}"></span>`)
+    .join("")}</div>`;
+}
+
+function renderLlmInsights(payload) {
+  const metrics = payload.metrics || {};
+  const terms = metrics.formula_terms || {};
+  const layers = Number(metrics.num_layers || terms.num_layers || 0);
+  const heads = Number(terms.num_heads || 0);
+  const kvHeads = Number(terms.num_kv_heads || heads || 0);
+  const attentionItems = [
+    { label: "Full", value: Number(metrics.full_attention_layers || 0), color: "#378ADD" },
+    { label: "Sliding", value: Number(metrics.sliding_attention_layers || 0), color: "#1D9E75" },
+    { label: "Linear", value: Number(metrics.linear_attention_layers || 0), color: "#EF9F27" },
+    { label: "Sparse", value: Number(metrics.sparse_attention_layers || 0), color: "#D4537E" },
+  ];
+  const classifiedLayers = attentionItems.reduce((sum, item) => sum + item.value, 0);
+  if (!classifiedLayers && layers) attentionItems[0].value = layers;
+  const activeRatio = metrics.total_params ? metrics.active_params / metrics.total_params : 1;
+  const featureTags = [
+    terms.is_mla ? "MLA" : null,
+    terms.is_deepseek_v4 || metrics.is_deepseek_v4 ? "DeepSeek V4 压缩注意力" : null,
+    metrics.causal_attention ? "Causal" : "双向注意力",
+    metrics.sliding_window ? `窗口 ${metrics.sliding_window}` : null,
+    metrics.sparse_topk ? `Sparse top-${metrics.sparse_topk}` : null,
+    metrics.compress_ratios?.length ? `${metrics.compress_ratios.length} 组压缩率` : null,
+  ].filter(Boolean);
+  const moeMarkup = metrics.is_moe ? `
+    <div class="insight-kpi"><span>专家总数</span><strong>${formatCount(terms.num_experts)}</strong></div>
+    <div class="insight-kpi"><span>每 token 激活</span><strong>${formatCount(terms.effective_experts_per_tok || terms.experts_per_tok)}</strong></div>
+    <div class="insight-kpi"><span>MoE / Dense 层</span><strong>${formatCount(metrics.n_moe_layers)} / ${formatCount(metrics.n_dense_layers)}</strong></div>
+    <div class="insight-kpi"><span>共享专家</span><strong>${formatCount(terms.n_shared_experts)}</strong></div>` : `
+    <div class="insight-kpi wide"><span>前馈结构</span><strong>Dense FFN · ${formatCount(terms.ffn_projection_count || 2)} projections</strong></div>`;
+  const attentionLegend = attentionItems.filter((item) => item.value > 0).map((item) => `<span><i style="background:${item.color}"></i>${escapeHtml(item.label)} <strong>${item.value}</strong></span>`).join("");
+
+  return `
+    <div class="analysis-title-row">
+      <div><span class="analysis-eyebrow">Architecture insights</span><h2>${escapeHtml(payload.model.name)}</h2><p>从配置和计算项提取的结构专项视图。</p></div>
+      <span class="insight-ratio">激活 ${(activeRatio * 100).toFixed(1)}%</span>
+    </div>
+    <div class="insight-card-grid">
+      <section class="analysis-card insight-span-two">
+        <div class="analysis-card-head"><h3>注意力拓扑</h3><code>GQA ${kvHeads ? (heads / kvHeads).toFixed(1) : "—"}:1</code></div>
+        ${renderInsightBar(attentionItems, attentionItems.reduce((sum, item) => sum + item.value, 0))}
+        <div class="insight-legend">${attentionLegend}</div>
+        <div class="insight-tag-row">${featureTags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>
+      </section>
+      <section class="analysis-card">
+        <div class="analysis-card-head"><h3>主干维度</h3><code>${formatCount(layers)} layers</code></div>
+        <div class="insight-kpi-grid">
+          <div class="insight-kpi"><span>Hidden</span><strong>${formatCount(metrics.hidden_size || terms.hidden_size)}</strong></div>
+          <div class="insight-kpi"><span>Heads / KV</span><strong>${formatCount(heads)} / ${formatCount(kvHeads)}</strong></div>
+          <div class="insight-kpi"><span>Head dim</span><strong>${formatCount(metrics.head_dim || terms.head_dim)}</strong></div>
+          <div class="insight-kpi"><span>FFN dim</span><strong>${formatCount(terms.ffn_hidden || terms.moe_ffn_hidden)}</strong></div>
+        </div>
+      </section>
+      <section class="analysis-card">
+        <div class="analysis-card-head"><h3>${metrics.is_moe ? "专家路由" : "前馈网络"}</h3><code>${metrics.is_moe ? "MoE" : "Dense"}</code></div>
+        <div class="insight-kpi-grid">${moeMarkup}</div>
+      </section>
+      <section class="analysis-card insight-span-two">
+        <div class="analysis-card-head"><h3>参数与输出头</h3><code>${formatB(metrics.total_params || 0)}</code></div>
+        <div class="parameter-ratio-track"><span style="width:${Math.max(1, activeRatio * 100).toFixed(2)}%"></span></div>
+        <div class="insight-kpi-grid parameter-kpis">
+          <div class="insight-kpi"><span>总参数</span><strong>${formatB(metrics.total_params || 0)}</strong></div>
+          <div class="insight-kpi"><span>激活参数</span><strong>${formatB(metrics.active_params || 0)}</strong></div>
+          <div class="insight-kpi"><span>词嵌入</span><strong>${formatB(metrics.embed_params || 0)}</strong></div>
+          <div class="insight-kpi"><span>输出头</span><strong>${terms.has_output_head ? (terms.tie_word_embeddings ? "共享权重" : formatB(metrics.output_head_params || 0)) : "无"}</strong></div>
+        </div>
+      </section>
+    </div>`;
+}
+
+function renderGenericInsights(payload) {
+  const graph = payload.graph || { nodes: [], edges: [], lanes: [] };
+  const laneCounts = (graph.lanes || []).map((lane) => ({
+    label: lane.label,
+    value: (graph.nodes || []).filter((node) => node.lane === lane.id).length,
+  }));
+  const maxLaneCount = Math.max(1, ...laneCounts.map((item) => item.value));
+  const accentCounts = new Map();
+  (graph.nodes || []).forEach((node) => accentCounts.set(node.accent || "core", (accentCounts.get(node.accent || "core") || 0) + 1));
+  const primaryPath = computePrimaryPath(graph);
+  return `
+    <div class="analysis-title-row">
+      <div><span class="analysis-eyebrow">Architecture insights</span><h2>${escapeHtml(payload.model.name)}</h2><p>${escapeHtml(payload.model.type)} 图结构的模态、泳道与主路径摘要。</p></div>
+      <span class="insight-ratio">${graph.nodes?.length || 0} nodes</span>
+    </div>
+    <div class="insight-card-grid">
+      <section class="analysis-card">
+        <div class="analysis-card-head"><h3>泳道分布</h3><code>${graph.lanes?.length || 0} lanes</code></div>
+        <div class="lane-insight-list">${laneCounts.map((item) => `<div><span>${escapeHtml(item.label)}</span><i><b style="width:${(item.value / maxLaneCount * 100).toFixed(1)}%"></b></i><strong>${item.value}</strong></div>`).join("")}</div>
+      </section>
+      <section class="analysis-card">
+        <div class="analysis-card-head"><h3>节点类型</h3><code>${accentCounts.size} accents</code></div>
+        <div class="insight-tag-row large">${[...accentCounts.entries()].map(([accent, count]) => `<span>${escapeHtml(accent)} <strong>${count}</strong></span>`).join("")}</div>
+      </section>
+      <section class="analysis-card insight-span-two">
+        <div class="analysis-card-head"><h3>主计算路径</h3><code>${primaryPath.length} hops</code></div>
+        <div class="primary-path-list">${primaryPath.map((node, index) => `<span>${index ? "→ " : ""}${escapeHtml(node.label)}</span>`).join("") || "<span>暂无可提取路径</span>"}</div>
+      </section>
+    </div>`;
+}
+
+function renderInsights() {
+  const payload = state.payload;
+  if (!payload) return;
+  ui.insightsPanel.innerHTML = payload.model.type === "llm" && payload.metrics
+    ? renderLlmInsights(payload)
+    : renderGenericInsights(payload);
+}
+
 // ---- A/B comparison ----
 
 function metricsHaveData(payload) {
@@ -745,25 +1107,53 @@ function pickThroughput(metrics, gpuName) {
   return hit || null;
 }
 
-const COMPARE_ROWS = [
-  { label: "总参数量", get: (m) => m.total_params, fmt: formatB, lowerBetter: true },
-  { label: "激活参数", get: (m) => m.active_params, fmt: formatB, lowerBetter: true },
-  { label: "每 token FLOPs", get: (m) => m.gflops_per_token * 1e9, fmt: (v) => `${(v / 1e9).toFixed(2)} G`, lowerBetter: true },
-  { label: "KV / 1k tok", get: (m) => m.kv_cache_mb_per_1k, fmt: (v) => `${v.toFixed(1)} MiB`, lowerBetter: true },
-  { label: "显存需求", get: (m) => (m.memory ? m.memory.total_gb : 0), fmt: (v) => `${v.toFixed(1)} GiB`, lowerBetter: true },
+const COMPARE_GROUPS = [
   {
-    label: "H100 decode",
-    get: (m) => { const t = pickThroughput(m, "H100 80G"); return t ? t.decode_tps : 0; },
-    fmt: (v) => `${formatTps(v)} tok/s`,
-    lowerBetter: false,
+    label: "结构规模",
+    rows: [
+      { label: "Hidden size", get: (p) => p.metrics.hidden_size, fmt: formatCount },
+      { label: "层数", get: (p) => p.metrics.num_layers, fmt: formatCount },
+      { label: "Attention heads", get: (p) => p.metrics.formula_terms?.num_heads, fmt: formatCount },
+      { label: "KV heads", get: (p) => p.metrics.formula_terms?.num_kv_heads, fmt: formatCount },
+      { label: "Head dim", get: (p) => p.metrics.head_dim, fmt: formatCount },
+      { label: "专家 / 激活专家", get: (p) => p.metrics.formula_terms?.num_experts, fmt: (value, p) => `${formatCount(value)} / ${formatCount(p.metrics.formula_terms?.effective_experts_per_tok || 0)}` },
+    ],
+  },
+  {
+    label: "计算与容量",
+    rows: [
+      { label: "总参数量", get: (p) => p.metrics.total_params, fmt: formatB, lowerBetter: true },
+      { label: "激活参数", get: (p) => p.metrics.active_params, fmt: formatB, lowerBetter: true },
+      { label: "激活比例", get: (p) => p.metrics.active_params / p.metrics.total_params, fmt: (value) => `${(value * 100).toFixed(1)}%`, lowerBetter: true },
+      { label: "每 token FLOPs", get: (p) => p.metrics.gflops_per_token, fmt: (value) => `${Number(value).toFixed(2)} G`, lowerBetter: true },
+      { label: "KV / 1k tok", get: (p) => p.metrics.kv_cache_mb_per_1k, fmt: (value) => `${Number(value).toFixed(1)} MiB`, lowerBetter: true },
+    ],
+  },
+  {
+    label: "当前部署场景",
+    rows: [
+      { label: "总显存", get: (p) => p.metrics.scenario?.memory?.total_gb, fmt: (value) => `${Number(value).toFixed(1)} GiB`, lowerBetter: true },
+      { label: "每卡显存", get: (p) => p.metrics.scenario?.memory?.per_gpu_gb, fmt: (value) => `${Number(value).toFixed(1)} GiB`, lowerBetter: true },
+      { label: "容量下界", get: (p) => p.metrics.scenario?.memory?.minimum_gpu_count, fmt: (value) => `${formatCount(value)} 卡`, lowerBetter: true },
+      {
+        label: "场景主指标",
+        get: (p) => p.metrics.scenario?.performance?.primary_value,
+        fmt: (value, p) => `${p.metrics.scenario?.performance?.primary_label || "场景"} ${formatTps(Number(value))} ${p.metrics.scenario?.performance?.primary_unit || ""}`,
+        lowerBetter: false,
+        comparable: (a, b) => a.metrics.scenario?.workload === b.metrics.scenario?.workload,
+      },
+    ],
   },
 ];
 
 function renderDeltaBadge(base, other, lowerBetter) {
-  if (!base || !other) return `<span class="cmp-delta same">—</span>`;
+  if (!Number.isFinite(Number(base)) || !Number.isFinite(Number(other)) || Number(base) === 0) return `<span class="cmp-delta same">—</span>`;
   const ratio = (other - base) / base;
   if (Math.abs(ratio) < 0.005) return `<span class="cmp-delta same">≈</span>`;
   const up = other > base;
+  if (lowerBetter === undefined) {
+    return `<span class="cmp-delta neutral">${up ? "▲" : "▼"} ${up ? "+" : ""}${(ratio * 100).toFixed(0)}%</span>`;
+  }
   const good = lowerBetter ? !up : up;
   const arrow = up ? "▲" : "▼";
   const pct = `${up ? "+" : ""}${(ratio * 100).toFixed(0)}%`;
@@ -777,19 +1167,35 @@ function renderCompareTable() {
     ui.compareBody.innerHTML = "";
     return;
   }
-  const ma = base.metrics;
-  const mb = other.metrics;
-  const rows = COMPARE_ROWS.map((row) => {
-    const va = row.get(ma) || 0;
-    const vb = row.get(mb) || 0;
-    return `
-      <div class="cmp-row">
-        <span class="cmp-metric">${escapeHtml(row.label)}</span>
-        <span class="cmp-a">${row.fmt(va)}</span>
-        <span class="cmp-b">${row.fmt(vb)} ${renderDeltaBadge(va, vb, row.lowerBetter)}</span>
-      </div>`;
+  const rows = COMPARE_GROUPS.map((group) => `
+    <div class="cmp-group-title">${escapeHtml(group.label)}</div>
+    ${group.rows.map((row) => {
+      const va = Number(row.get(base)) || 0;
+      const vb = Number(row.get(other)) || 0;
+      const delta = row.comparable && !row.comparable(base, other)
+        ? '<span class="cmp-delta same">口径不同</span>'
+        : renderDeltaBadge(va, vb, row.lowerBetter);
+      return `
+        <div class="cmp-row">
+          <span class="cmp-metric">${escapeHtml(row.label)}</span>
+          <span class="cmp-a">${escapeHtml(row.fmt(va, base))}</span>
+          <span class="cmp-b">${escapeHtml(row.fmt(vb, other))} ${delta}</span>
+        </div>`;
+    }).join("")}`).join("");
+  const parameterLabels = { batch: "Batch", seq_len: "Token 长度", precision: "权重精度", workload: "工作负载", gpu: "GPU", gpu_count: "GPU 数量", parallelism: "并行策略" };
+  const parameterKeys = Object.keys(parameterLabels).filter((key) => key in (base.parameters || {}) || key in (other.parameters || {}));
+  const parameterRows = parameterKeys.map((key) => {
+    const valueA = base.parameters?.[key] ?? "—";
+    const valueB = other.parameters?.[key] ?? "—";
+    const synchronized = String(valueA) === String(valueB);
+    return `<div class="cmp-param-row ${synchronized ? "synced" : "adjusted"}"><span>${escapeHtml(parameterLabels[key])}</span><code>${escapeHtml(valueA)}</code><code>${escapeHtml(valueB)}</code><b>${synchronized ? "同步" : "已校正"}</b></div>`;
   }).join("");
   ui.compareBody.innerHTML = `
+    <section class="cmp-parameter-sync">
+      <div class="cmp-subhead"><h3>运行参数同步</h3><span>同一组查询参数分别由模型边界校正</span></div>
+      <div class="cmp-param-head"><span>参数</span><span>A</span><span>B</span><span>状态</span></div>
+      ${parameterRows}
+    </section>
     <div class="cmp-table">
       <div class="cmp-head">
         <span class="cmp-metric">指标</span>
@@ -797,7 +1203,7 @@ function renderCompareTable() {
         <span class="cmp-b" title="${escapeHtml(other.model.name)}">B · ${escapeHtml(truncateText(other.model.name, 14))}</span>
       </div>
       ${rows}
-      <p class="cmp-note">B 列箭头相对 A 变化，绿色=更优（资源更省或吞吐更高）。</p>
+      <p class="cmp-note">B 列箭头相对 A 变化；结构指标为中性，资源更省或吞吐更高时标记为绿色。</p>
     </div>`;
 }
 
@@ -1263,6 +1669,12 @@ function renderGraph() {
           if (node.id === state.selectedNodeId) {
             classes.push("active");
           }
+          if (state.pinnedNodes.has(node.id)) {
+            classes.push("pinned");
+          }
+          if (state.collapsedParents.has(node.id)) {
+            classes.push("children-collapsed");
+          }
           const incomingCount = relations.index.incomingNeighbors.get(node.id)?.length || 0;
           const outgoingCount = relations.index.outgoingNeighbors.get(node.id)?.length || 0;
           return `
@@ -1297,6 +1709,7 @@ function renderGraph() {
   requestAnimationFrame(() => {
     drawEdges();
     applyNodeSearch();
+    renderMinimap();
   });
 }
 
@@ -1304,12 +1717,16 @@ function applyZoom() {
   const { scale, x, y } = state.zoom;
   ui.graphCanvas.style.transform = `scale(${scale}) translate(${x}px, ${y}px)`;
   ui.zoomLevel.textContent = `${Math.round(scale * 100)}%`;
-  requestAnimationFrame(drawEdges);
+  requestAnimationFrame(() => {
+    drawEdges();
+    renderMinimap();
+  });
 }
 
 function resetZoom() {
   state.zoom = { scale: 1, x: 0, y: 0 };
   applyZoom();
+  persistGraphState();
 }
 
 function zoomBy(delta, centerX, centerY) {
@@ -1327,6 +1744,7 @@ function zoomBy(delta, centerX, centerY) {
   }
   state.zoom.scale = newScale;
   applyZoom();
+  persistGraphState();
 }
 
 function getNodeOffset(element, container) {
@@ -1483,6 +1901,56 @@ function drawEdges() {
   ui.edgeLayer.innerHTML = markup;
 }
 
+function renderMinimap() {
+  if (!state.payload || state.centerView !== "graph") {
+    ui.graphMinimap.hidden = true;
+    return;
+  }
+  const nodes = [...ui.graphBoard.querySelectorAll(".graph-node")].filter(isMeasurableElement);
+  if (!nodes.length) {
+    ui.graphMinimap.hidden = true;
+    return;
+  }
+  const boardWidth = Math.max(1, ui.graphBoard.scrollWidth);
+  const boardHeight = Math.max(1, ui.graphBoard.scrollHeight);
+  const laneMarkup = [...ui.graphBoard.querySelectorAll(".lane")]
+    .filter(isMeasurableElement)
+    .map((lane) => {
+      const rect = getNodeOffset(lane, ui.graphBoard);
+      return `<span class="minimap-lane" style="left:${(rect.left / boardWidth * 100).toFixed(3)}%;top:${(rect.top / boardHeight * 100).toFixed(3)}%;width:${(rect.width / boardWidth * 100).toFixed(3)}%;height:${(rect.height / boardHeight * 100).toFixed(3)}%"></span>`;
+    }).join("");
+  const nodeMarkup = nodes.map((node) => {
+    const rect = getNodeOffset(node, ui.graphBoard);
+    const pinned = state.pinnedNodes.has(node.dataset.nodeId) ? " pinned" : "";
+    const selected = node.dataset.nodeId === state.selectedNodeId ? " selected" : "";
+    return `<span class="minimap-node${pinned}${selected}" style="left:${(rect.left / boardWidth * 100).toFixed(3)}%;top:${(rect.top / boardHeight * 100).toFixed(3)}%;width:${Math.max(1.5, rect.width / boardWidth * 100).toFixed(3)}%;height:${Math.max(2, rect.height / boardHeight * 100).toFixed(3)}%"></span>`;
+  }).join("");
+  ui.minimapContent.innerHTML = laneMarkup + nodeMarkup;
+  ui.graphMinimap.hidden = false;
+  updateMinimapViewport();
+}
+
+function updateMinimapViewport() {
+  if (ui.graphMinimap.hidden || !state.payload) return;
+  const mapWidth = ui.graphMinimap.clientWidth;
+  const mapHeight = ui.graphMinimap.clientHeight;
+  if (!mapWidth || !mapHeight) return;
+  const contentWidth = Math.max(ui.graphScroll.clientWidth, ui.graphBoard.scrollWidth * state.zoom.scale);
+  const contentHeight = Math.max(ui.graphScroll.clientHeight, ui.graphBoard.scrollHeight * state.zoom.scale);
+  const viewportWidth = Math.min(mapWidth, Math.max(12, ui.graphScroll.clientWidth / contentWidth * mapWidth));
+  const viewportHeight = Math.min(mapHeight, Math.max(10, ui.graphScroll.clientHeight / contentHeight * mapHeight));
+  const maxScrollLeft = Math.max(1, contentWidth - ui.graphScroll.clientWidth);
+  const maxScrollTop = Math.max(1, contentHeight - ui.graphScroll.clientHeight);
+  const left = Math.min(mapWidth - viewportWidth, ui.graphScroll.scrollLeft / maxScrollLeft * (mapWidth - viewportWidth));
+  const top = Math.min(mapHeight - viewportHeight, ui.graphScroll.scrollTop / maxScrollTop * (mapHeight - viewportHeight));
+  Object.assign(ui.minimapViewport.style, {
+    left: `${Math.max(0, left)}px`,
+    top: `${Math.max(0, top)}px`,
+    width: `${viewportWidth}px`,
+    height: `${viewportHeight}px`,
+  });
+}
+
 function findSelectedNode() {
   const visibleGraph = getVisibleGraph(state.payload);
   return (visibleGraph.nodes || []).find((node) => node.id === state.selectedNodeId) || visibleGraph.nodes?.[0] || null;
@@ -1542,6 +2010,10 @@ function renderDetails() {
 
   const directIncoming = relations.index.incomingNeighbors.get(node.id) || [];
   const directOutgoing = relations.index.outgoingNeighbors.get(node.id) || [];
+  const hasChildren = (payload.graph.nodes || []).some((candidate) => candidate.parentId === node.id);
+  const parentNode = node.parentId ? (payload.graph.nodes || []).find((candidate) => candidate.id === node.parentId) : null;
+  const isPinned = state.pinnedNodes.has(node.id);
+  const childrenCollapsed = state.collapsedParents.has(node.id);
 
   ui.detailPanel.innerHTML = `
     <div class="tag-row">
@@ -1550,6 +2022,11 @@ function renderDetails() {
       <span class="tag">${escapeHtml(laneLabel)}</span>
     </div>
     <h2 class="detail-title">${escapeHtml(node.label)}</h2>
+    <div class="detail-actions">
+      <button class="ghost-button ${isPinned ? "is-active" : ""}" type="button" data-pin-node="${escapeHtml(node.id)}">${isPinned ? "取消固定" : "固定节点"}</button>
+      ${hasChildren ? `<button class="ghost-button" type="button" data-toggle-parent-id="${escapeHtml(node.id)}">${childrenCollapsed ? "展开子节点" : "折叠子节点"}</button>` : ""}
+      ${parentNode && !state.collapsedParents.has(parentNode.id) ? `<button class="ghost-button" type="button" data-toggle-parent-id="${escapeHtml(parentNode.id)}">折叠到 ${escapeHtml(parentNode.label)}</button>` : ""}
+    </div>
     <p class="detail-intro">${escapeHtml(node.description || "")}</p>
     <section class="detail-section">
       <h3>Shape</h3>
@@ -1610,6 +2087,49 @@ function downloadBlob(filename, content, mimeType) {
 
 function sanitizeFileName(value) {
   return String(value).replace(/[\\/:*?"<>|]+/g, "-");
+}
+
+function buildShareUrl() {
+  const url = new URL(window.location.href);
+  url.search = "";
+  url.searchParams.set("model", state.activeModelId);
+  url.searchParams.set("view", state.centerView);
+  if (HIERARCHY_TYPES.has(state.payload?.model?.type)) url.searchParams.set("hierarchy", state.llmHierarchyMode);
+  if (state.selectedNodeId) url.searchParams.set("node", state.selectedNodeId);
+  url.searchParams.set("lanes", [...state.collapsedLanes].join(","));
+  url.searchParams.set("parents", [...state.collapsedParents].join(","));
+  url.searchParams.set("pins", [...state.pinnedNodes].join(","));
+  url.searchParams.set("zoom", state.zoom.scale.toFixed(2));
+  url.searchParams.set("scroll_x", String(Math.round(ui.graphScroll.scrollLeft)));
+  url.searchParams.set("scroll_y", String(Math.round(ui.graphScroll.scrollTop)));
+  if (state.compareModelId) url.searchParams.set("compare", state.compareModelId);
+  Object.entries(state.payload?.parameters || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+  });
+  return url.toString();
+}
+
+async function copyShareLink() {
+  if (!state.payload) return;
+  const url = buildShareUrl();
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(url);
+    } else {
+      const textArea = document.createElement("textarea");
+      textArea.value = url;
+      textArea.style.position = "fixed";
+      textArea.style.opacity = "0";
+      document.body.append(textArea);
+      textArea.select();
+      document.execCommand("copy");
+      textArea.remove();
+    }
+    setStatus("已复制包含模型、参数和图状态的分享链接。");
+  } catch (error) {
+    console.error(error);
+    setStatus(`复制链接失败：${error.message}`, true);
+  }
 }
 
 function truncateText(value, maxLength = 46) {
@@ -1841,24 +2361,29 @@ function exportCurrentSvg() {
 }
 
 function setCenterView(view) {
-  state.centerView = view;
+  const normalizedView = CENTER_VIEWS.has(view) ? view : "graph";
+  state.centerView = normalizedView;
   ui.viewTabs.querySelectorAll(".view-tab").forEach((tab) => {
-    const active = tab.dataset.view === view;
+    const active = tab.dataset.view === normalizedView;
     tab.classList.toggle("is-active", active);
     tab.setAttribute("aria-selected", active ? "true" : "false");
   });
-  const graphOnly = view === "graph";
+  const graphOnly = normalizedView === "graph";
   ui.graphView.hidden = !graphOnly;
-  ui.detailsView.hidden = view !== "details";
-  ui.auditView.hidden = view !== "audit";
-  ui.compareView.hidden = view !== "compare";
+  ui.detailsView.hidden = normalizedView !== "details";
+  ui.scenarioView.hidden = normalizedView !== "scenario";
+  ui.insightsView.hidden = normalizedView !== "insights";
+  ui.auditView.hidden = normalizedView !== "audit";
+  ui.compareView.hidden = normalizedView !== "compare";
   ui.nodeSearch.hidden = !graphOnly;
   if (graphOnly) {
     renderHierarchyToolbar();
     if (state.payload) renderGraph();
   } else {
     ui.hierarchyToolbar.hidden = true;
+    ui.graphMinimap.hidden = true;
   }
+  persistGraphState();
 }
 
 ui.viewTabs.addEventListener("click", (event) => {
@@ -1874,6 +2399,7 @@ ui.modelList.addEventListener("click", (event) => {
   if (!button) {
     return;
   }
+  persistGraphState();
   state.activeModelId = button.dataset.modelId;
   loadModelPayload();
 });
@@ -1909,11 +2435,13 @@ ui.hierarchyToolbar.addEventListener("click", (event) => {
   renderSummary();
   renderGraph();
   renderDetails();
+  persistGraphState();
   setStatus(`已切换为 ${getHierarchyModeLabel(state.llmHierarchyMode)} 层级视图。`);
 });
 ui.exportAuditButton.addEventListener("click", exportAuditReport);
 ui.exportJsonButton.addEventListener("click", exportCurrentPayload);
 ui.exportSvgButton.addEventListener("click", exportCurrentSvg);
+ui.shareViewButton.addEventListener("click", copyShareLink);
 
 ui.graphBoard.addEventListener("click", (event) => {
   const laneToggle = event.target.closest("[data-toggle-lane]");
@@ -1925,6 +2453,7 @@ ui.graphBoard.addEventListener("click", (event) => {
       state.collapsedLanes.add(laneId);
     }
     renderGraph();
+    persistGraphState();
     return;
   }
 
@@ -1935,9 +2464,41 @@ ui.graphBoard.addEventListener("click", (event) => {
   state.selectedNodeId = nodeElement.dataset.nodeId;
   updateNodeSelection();
   renderDetails();
+  persistGraphState();
 });
 
 ui.detailPanel.addEventListener("click", (event) => {
+  const pinButton = event.target.closest("[data-pin-node]");
+  if (pinButton) {
+    const nodeId = pinButton.dataset.pinNode;
+    if (state.pinnedNodes.has(nodeId)) {
+      state.pinnedNodes.delete(nodeId);
+    } else {
+      state.pinnedNodes.add(nodeId);
+    }
+    renderGraph();
+    renderDetails();
+    persistGraphState();
+    setStatus(state.pinnedNodes.has(nodeId) ? "已固定节点，状态会随模型保存。" : "已取消固定节点。");
+    return;
+  }
+
+  const parentButton = event.target.closest("[data-toggle-parent-id]");
+  if (parentButton) {
+    const parentId = parentButton.dataset.toggleParentId;
+    if (state.collapsedParents.has(parentId)) {
+      state.collapsedParents.delete(parentId);
+    } else {
+      state.collapsedParents.add(parentId);
+    }
+    state.selectedNodeId = parentId;
+    syncSelectedNode(state.payload);
+    renderGraph();
+    renderDetails();
+    persistGraphState();
+    return;
+  }
+
   const jumpButton = event.target.closest("[data-jump-node]");
   if (!jumpButton) {
     return;
@@ -1945,6 +2506,7 @@ ui.detailPanel.addEventListener("click", (event) => {
   state.selectedNodeId = jumpButton.dataset.jumpNode;
   updateNodeSelection();
   renderDetails();
+  persistGraphState();
   const targetElement = ui.graphBoard.querySelector(`[data-node-id="${state.selectedNodeId}"]`);
   if (targetElement) {
     targetElement.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
@@ -1958,8 +2520,29 @@ window.addEventListener("resize", () => {
   }
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
-    requestAnimationFrame(drawEdges);
+    requestAnimationFrame(() => {
+      drawEdges();
+      renderMinimap();
+    });
   }, 150);
+});
+
+let graphScrollTimer = null;
+ui.graphScroll.addEventListener("scroll", () => {
+  updateMinimapViewport();
+  clearTimeout(graphScrollTimer);
+  graphScrollTimer = setTimeout(persistGraphState, 180);
+});
+
+ui.graphMinimap.addEventListener("click", (event) => {
+  const rect = ui.graphMinimap.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const xRatio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  const yRatio = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+  const contentWidth = Math.max(ui.graphScroll.clientWidth, ui.graphBoard.scrollWidth * state.zoom.scale);
+  const contentHeight = Math.max(ui.graphScroll.clientHeight, ui.graphBoard.scrollHeight * state.zoom.scale);
+  ui.graphScroll.scrollLeft = Math.max(0, xRatio * contentWidth - ui.graphScroll.clientWidth / 2);
+  ui.graphScroll.scrollTop = Math.max(0, yRatio * contentHeight - ui.graphScroll.clientHeight / 2);
 });
 
 // --- Node Search ---

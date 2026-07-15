@@ -12,7 +12,7 @@ from functools import lru_cache
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlparse
 
 
@@ -1240,6 +1240,8 @@ GPU_REFERENCE = [
 
 # Bytes per stored parameter for each weight precision.
 PRECISION_BYTES = {"bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.0, "int4": 0.5}
+WORKLOAD_OPTIONS = ("decode", "prefill", "training")
+PARALLELISM_OPTIONS = ("auto", "tensor", "pipeline", "expert")
 
 # Fraction of usable VRAM (framework/fragmentation overhead) and model FLOPs
 # utilisation used for the theoretical throughput ceiling.
@@ -1248,6 +1250,7 @@ _MFU = 0.40
 # Coarse single-layer prefill workspace factor. Intermediate buffers are reused
 # between layers during inference, so this deliberately does not multiply by L.
 _ACT_FACTOR = 8
+_TRAIN_ACT_FACTOR = 6
 
 
 def infer_weight_precision(config: dict[str, Any], params_config: dict[str, Any] | None = None) -> str:
@@ -1472,6 +1475,172 @@ def estimate_throughput(
             "batch": batch,
         })
     return rows
+
+
+def estimate_runtime_scenario(
+    metrics: dict[str, Any],
+    precision: str = "bf16",
+    batch: int = 1,
+    seq_len: int = 2048,
+    workload: str = "decode",
+    gpu_name: str = "H100 80G",
+    gpu_count: int = 1,
+    parallelism: str = "auto",
+) -> dict[str, Any]:
+    """Estimate deployment memory and aggregate throughput for one scenario."""
+    precision = precision if precision in PRECISION_BYTES else "bf16"
+    workload = workload if workload in WORKLOAD_OPTIONS else "decode"
+    batch = max(int(batch or 1), 1)
+    seq_len = max(int(seq_len or 1), 1)
+    gpu_count = min(max(int(gpu_count or 1), 1), 128)
+    gpu_entry = next((item for item in GPU_REFERENCE if item["name"] == gpu_name), None)
+    if gpu_entry is None:
+        gpu_entry = next(item for item in GPU_REFERENCE if item["name"] == "H100 80G")
+    gpu = cast(dict[str, Any], gpu_entry)
+    requested_parallelism = parallelism if parallelism in PARALLELISM_OPTIONS else "auto"
+    is_moe = int(metrics.get("routed_experts_active", 0) or 0) > 0
+    num_layers = int(metrics.get("num_layers", 0) or 0)
+    if gpu_count == 1:
+        resolved_parallelism = "single"
+    elif requested_parallelism == "expert" and not is_moe:
+        resolved_parallelism = "tensor"
+    elif requested_parallelism == "pipeline" and (num_layers <= 0 or gpu_count > num_layers):
+        resolved_parallelism = "tensor"
+    elif requested_parallelism != "auto":
+        resolved_parallelism = requested_parallelism
+    elif is_moe and gpu_count >= 4:
+        resolved_parallelism = "expert"
+    elif gpu_count >= 8 and num_layers >= gpu_count:
+        resolved_parallelism = "pipeline"
+    else:
+        resolved_parallelism = "tensor"
+
+    base_efficiency = {"single": 1.0, "tensor": 0.94, "pipeline": 0.88, "expert": 0.92}[resolved_parallelism]
+    scale_penalty = 0.0 if gpu_count == 1 else 0.025 * math.log2(gpu_count)
+    parallel_efficiency = max(base_efficiency - scale_penalty, 0.60)
+    inference_memory = estimate_memory_footprint(metrics, precision, batch, seq_len)
+    total_params = int(metrics.get("total_params", 0) or 0)
+    hidden_size = int(metrics.get("hidden_size", 0) or 0)
+    training_weight_bpp = max(PRECISION_BYTES[precision], 2.0)
+    training_weights = total_params * training_weight_bpp
+    gradients_bytes = total_params * 2
+    master_weights_bytes = total_params * 4
+    optimizer_bytes = total_params * 8
+    training_activation_bytes = batch * seq_len * hidden_size * max(num_layers, 1) * _TRAIN_ACT_FACTOR * 2
+
+    if workload == "training":
+        memory_parts = {
+            "weights_bytes": training_weights,
+            "kv_bytes": 0,
+            "activation_bytes": training_activation_bytes,
+            "gradients_bytes": gradients_bytes,
+            "master_weights_bytes": master_weights_bytes,
+            "optimizer_bytes": optimizer_bytes,
+        }
+    else:
+        memory_parts = {
+            "weights_bytes": inference_memory["weights_bytes"],
+            "kv_bytes": inference_memory["kv_bytes"],
+            "activation_bytes": inference_memory["activation_bytes"],
+            "gradients_bytes": 0,
+            "master_weights_bytes": 0,
+            "optimizer_bytes": 0,
+        }
+    total_bytes = sum(memory_parts.values())
+    gib = 1024 ** 3
+    usable_per_gpu_bytes = gpu["mem_gb"] * _VRAM_USABLE * gib
+    capacity_bytes = usable_per_gpu_bytes * gpu_count
+    minimum_gpu_count = math.ceil(total_bytes / usable_per_gpu_bytes) if usable_per_gpu_bytes else 0
+
+    throughput_rows = estimate_throughput(
+        metrics,
+        precision,
+        seq_len,
+        batch,
+        {gpu["name"]: gpu_count},
+    )
+    selected_throughput = next((item for item in throughput_rows if item["name"] == gpu["name"]), None)
+    decode_tps = float(selected_throughput["decode_tps"] * parallel_efficiency) if selected_throughput else 0.0
+    ttft_ms = float(selected_throughput["ttft_ms"] / parallel_efficiency) if selected_throughput else 0.0
+    prefill_tps = batch * seq_len / (ttft_ms / 1000) if ttft_ms > 0 else 0.0
+    linear_flops = int(metrics.get("linear_flops_per_token", 2 * int(metrics.get("active_params", 0) or 0)) or 0)
+    prefill_attention_flops = _prefill_attention_flops(metrics, seq_len)
+    forward_flops_per_token = linear_flops + prefill_attention_flops / seq_len
+    training_flops_per_token = 3 * forward_flops_per_token
+    training_compute_precision = precision if precision in {"bf16", "fp16"} else "bf16"
+    training_peak_flops = _gpu_compute_tops(gpu, training_compute_precision) * 1e12 * _MFU * gpu_count * parallel_efficiency
+    training_tps = training_peak_flops / training_flops_per_token if training_flops_per_token > 0 else 0.0
+    training_step_ms = batch * seq_len / training_tps * 1000 if training_tps > 0 else 0.0
+
+    if workload == "training":
+        primary_value = training_tps
+        primary_label = "训练吞吐"
+        bound = "算力"
+    elif workload == "prefill":
+        primary_value = prefill_tps
+        primary_label = "Prefill 吞吐"
+        bound = "算力"
+    else:
+        primary_value = decode_tps
+        primary_label = "Decode 吞吐"
+        bound = selected_throughput["bound"] if selected_throughput else "未知"
+
+    assumptions = [
+        "多卡吞吐按理想聚合后乘并行效率，不包含具体拓扑、通信库和 kernel 差异。",
+        "多卡显存按模型与运行状态均匀切分估算，不包含切分约束、复制状态和通信 buffer。",
+        "GPU 可用显存按标称容量的 90% 计算。",
+    ]
+    if workload == "training":
+        assumptions.append("训练状态按权重、BF16 梯度、FP32 master weight 与 Adam FP32 m/v 估算。")
+        assumptions.append("训练激活按 batch × seq × hidden × layers × 6 × 2B 粗估，未建模 ZeRO/FSDP offload。")
+    if precision not in {"bf16", "fp16"} and workload == "training":
+        assumptions.append("低比特训练权重至少按 2 B/参数保留可训练副本，训练算力按 BF16 峰值估算。")
+
+    return {
+        "workload": workload,
+        "gpu": {
+            "name": gpu["name"],
+            "mem_gb": gpu["mem_gb"],
+            "bw_gbs": gpu["bw_gbs"],
+            "compute_tops": _gpu_compute_tops(gpu, training_compute_precision if workload == "training" else precision),
+        },
+        "gpu_count": gpu_count,
+        "requested_parallelism": requested_parallelism,
+        "parallelism": resolved_parallelism,
+        "parallel_efficiency": parallel_efficiency,
+        "memory": {
+            **memory_parts,
+            "total_bytes": total_bytes,
+            "total_gb": total_bytes / gib,
+            "per_gpu_bytes": total_bytes / gpu_count,
+            "per_gpu_gb": total_bytes / gpu_count / gib,
+            "capacity_bytes": capacity_bytes,
+            "capacity_gb": capacity_bytes / gib,
+            "fits": total_bytes <= capacity_bytes,
+            "minimum_gpu_count": minimum_gpu_count,
+            "usable_fraction": _VRAM_USABLE,
+        },
+        "performance": {
+            "primary_label": primary_label,
+            "primary_value": primary_value,
+            "primary_unit": "tok/s",
+            "decode_tps": decode_tps,
+            "prefill_tps": prefill_tps,
+            "training_tps": training_tps,
+            "ttft_ms": ttft_ms,
+            "training_step_ms": training_step_ms,
+            "training_compute_precision": training_compute_precision,
+            "bound": bound,
+        },
+        "formula": {
+            "memory": "weights + KV + activations + optional gradients/master/optimizer",
+            "decode": "min(compute ceiling, bandwidth ceiling) × parallel efficiency",
+            "prefill": "batch × seq_len / TTFT",
+            "training": "aggregate effective FLOPs / (3 × forward FLOPs per token)",
+            "training_flops_per_token": training_flops_per_token,
+        },
+        "assumptions": assumptions,
+    }
 
 
 def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -2497,11 +2666,36 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     precision = str(query.get("precision", [default_precision])[0] or default_precision)
     if precision not in PRECISION_BYTES:
         precision = "bf16"
+    workload_options = list(WORKLOAD_OPTIONS if dims["has_output_head"] else ("prefill", "training"))
+    default_workload = "decode" if dims["has_output_head"] else "prefill"
+    workload = str(query.get("workload", [default_workload])[0] or default_workload)
+    if workload not in workload_options:
+        workload = default_workload
+    gpu_options = [item["name"] for item in GPU_REFERENCE]
+    gpu_name = str(query.get("gpu", ["H100 80G"])[0] or "H100 80G")
+    if gpu_name not in gpu_options:
+        gpu_name = "H100 80G"
+    gpu_count = clamp_int(query.get("gpu_count", [1])[0], 1, maximum=128)
+    parallelism = str(query.get("parallelism", ["auto"])[0] or "auto")
+    if parallelism not in PARALLELISM_OPTIONS:
+        parallelism = "auto"
+    scenario = (
+        estimate_runtime_scenario(metrics, precision, batch, seq_len, workload, gpu_name, gpu_count, parallelism)
+        if metrics is not None
+        else None
+    )
+    if scenario is not None:
+        fit_label = "可容纳" if scenario["memory"]["fits"] else f"至少 {scenario['memory']['minimum_gpu_count']} 卡"
+        summary.append(detail("部署场景", f"{workload} / {gpu_count}×{gpu_name} / {fit_label}"))
 
     controls = [
         {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 16, "step": 1, "help": "并行样本数"},
         {"name": "seq_len", "label": "Token 长度", "type": "number", "value": seq_len, "min": 1, "max": max_position, "step": 1, "help": "输入 token 数"},
         {"name": "precision", "label": "权重精度", "type": "select", "value": precision, "options": list(PRECISION_BYTES.keys()), "help": "用于显存/成本与吞吐估算"},
+        {"name": "workload", "label": "工作负载", "type": "select", "value": workload, "options": workload_options, "help": "Decode、Prefill 或全量训练场景"},
+        {"name": "gpu", "label": "GPU 型号", "type": "select", "value": gpu_name, "options": gpu_options, "help": "场景估算使用的单卡规格"},
+        {"name": "gpu_count", "label": "GPU 数量", "type": "number", "value": gpu_count, "min": 1, "max": 128, "step": 1, "help": "参与该任务的 GPU 总数"},
+        {"name": "parallelism", "label": "并行策略", "type": "select", "value": parallelism, "options": list(PARALLELISM_OPTIONS), "help": "auto 会按模型结构和卡数推荐策略"},
     ]
 
     if dims["has_output_head"]:
@@ -2517,7 +2711,15 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         headline,
         summary,
         controls,
-        {"batch": batch, "seq_len": seq_len, "precision": precision},
+        {
+            "batch": batch,
+            "seq_len": seq_len,
+            "precision": precision,
+            "workload": workload,
+            "gpu": gpu_name,
+            "gpu_count": gpu_count,
+            "parallelism": parallelism,
+        },
         build_graph(lanes, nodes, edges),
         warnings,
         sources,
@@ -2566,6 +2768,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
             },
             "memory": memory,
             "throughput": estimate_throughput(metrics, precision, seq_len, batch, gpu_counts) if dims["has_output_head"] else [],
+            "scenario": scenario,
             "gpu_reference": GPU_REFERENCE,
             "throughput_terms": {
                 "active_params": active_params,
@@ -5198,6 +5401,32 @@ def _audit_calculation_evidence(
                     {"name": "precision", "value": memory.get("precision"), "source": "runtime control", "origin": "runtime", "rawValue": memory.get("precision")},
                 ],
                 "assumptions": ["GPU 可用显存按标称容量的 90% 计算；不包含通信 buffer 和碎片化细节。"],
+                "sourceFiles": sources,
+            }
+        )
+    raw_scenario = metrics.get("scenario")
+    scenario: dict[str, Any] = raw_scenario if isinstance(raw_scenario, dict) else {}
+    raw_performance = scenario.get("performance")
+    performance: dict[str, Any] = raw_performance if isinstance(raw_performance, dict) else {}
+    raw_scenario_memory = scenario.get("memory")
+    scenario_memory: dict[str, Any] = raw_scenario_memory if isinstance(raw_scenario_memory, dict) else {}
+    if scenario and performance:
+        evidence.append(
+            {
+                "id": "deployment-scenario",
+                "category": "deployment",
+                "label": performance.get("primary_label") or "部署场景",
+                "formula": scenario.get("formula", {}).get(scenario.get("workload"), "aggregate GPU ceiling × parallel efficiency"),
+                "result": performance.get("primary_value"),
+                "unit": performance.get("primary_unit") or "tok/s",
+                "quality": "estimated",
+                "inputs": [
+                    {"name": "workload", "value": scenario.get("workload"), "source": "runtime control", "origin": "runtime", "rawValue": scenario.get("workload")},
+                    {"name": "gpu", "value": scenario.get("gpu", {}).get("name"), "source": "runtime control", "origin": "runtime", "rawValue": scenario.get("gpu", {}).get("name")},
+                    {"name": "gpu_count", "value": scenario.get("gpu_count"), "source": "runtime control", "origin": "runtime", "rawValue": scenario.get("gpu_count")},
+                    {"name": "parallelism", "value": scenario.get("parallelism"), "source": "derived", "origin": "derived", "rawValue": scenario.get("requested_parallelism")},
+                ],
+                "assumptions": list(scenario.get("assumptions") or []) + [f"场景总显存 {scenario_memory.get('total_gb', 0):.2f} GiB。"],
                 "sourceFiles": sources,
             }
         )
