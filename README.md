@@ -37,7 +37,16 @@ python serve_model_arch.py --port 8123
 - 中间查看架构图与数据流向，并在选中节点后高亮其上下游路径
 - 对 LLM 支持三种 Decoder Stack 视图：汇总、单层 Block（含 Q/K/V、RoPE、QK Score、Causal Mask、Sliding Window Mask、Softmax、Weighted V、Output Projection）、重复 N 层摘要；repeat 视图会额外给出首层 / 中层 / 末层的 mask 摘要
 - 右侧查看节点的关键配置字段、输入 shape、输出 shape、推导公式和上下游跳转
-- 支持导出当前模型视图的 JSON 数据和 SVG 图
+- “计算审计”页展示可信度、配置继承、字段来源、结构化诊断、公式输入与 checkpoint 真值对比
+- 支持导出当前模型视图的 JSON 数据、SVG 图和 Markdown 审计报告
+
+## 计算审计
+
+- 每个模型 payload 都包含版本化的 `audit` 数据，覆盖置信度、诊断、证据链、配置来源和 checkpoint 对比。
+- LLM 核心字段会标记为直接读取、基础模型继承、公式推导或运行参数，并保留具体文件与字段路径。
+- BF16 / FP16 safetensors index 可作为参数量代理真值；量化或混合精度 checkpoint 只比较存储体积，不伪装成精确参数数目。
+- 参数分解、激活参数、KV cache、FLOPs 和显存分别记录公式、输入、结果及假设边界。
+- 未适配架构、关键字段缺失、别名冲突、层型长度不一致和参数分解不闭合会生成带稳定代码的诊断项。
 
 ## Shape 说明
 

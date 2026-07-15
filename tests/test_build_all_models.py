@@ -42,6 +42,14 @@ def test_model_builds_payload(serve, model_dir):
     assert isinstance(model.get("summary"), list) and model["summary"], f"{model_id}: empty summary"
     assert isinstance(payload.get("graph"), dict), f"{model_id}: missing graph"
     assert isinstance(payload.get("warnings"), list)
+    audit = payload.get("audit")
+    assert isinstance(audit, dict), f"{model_id}: missing audit"
+    assert audit.get("schemaVersion") == 1
+    assert 0 <= audit.get("confidence", {}).get("score", -1) <= 100
+    assert audit.get("confidence", {}).get("level") in {"high", "medium", "low"}
+    assert isinstance(audit.get("diagnostics"), list)
+    assert isinstance(audit.get("evidence"), list)
+    assert isinstance(audit.get("config"), dict)
 
     graph = payload["graph"]
     lanes = graph.get("lanes") or []

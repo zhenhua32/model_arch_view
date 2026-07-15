@@ -23,6 +23,7 @@ const ui = {
   controlsForm: document.getElementById("controls-form"),
   refreshButton: document.getElementById("refresh-button"),
   hierarchyToolbar: document.getElementById("hierarchy-toolbar"),
+  exportAuditButton: document.getElementById("export-audit-button"),
   exportJsonButton: document.getElementById("export-json-button"),
   exportSvgButton: document.getElementById("export-svg-button"),
   statusBar: document.getElementById("status-bar"),
@@ -45,6 +46,8 @@ const ui = {
   viewTabs: document.querySelector(".view-tabs"),
   graphView: document.getElementById("graph-view"),
   detailsView: document.getElementById("details-view"),
+  auditView: document.getElementById("audit-view"),
+  auditPanel: document.getElementById("audit-panel"),
   compareView: document.getElementById("compare-view"),
   viewStage: document.getElementById("view-stage"),
 };
@@ -74,6 +77,7 @@ async function fetchJson(url, signal) {
 
 function updateExportButtons() {
   const disabled = !state.payload;
+  ui.exportAuditButton.disabled = disabled;
   ui.exportJsonButton.disabled = disabled;
   ui.exportSvgButton.disabled = disabled;
 }
@@ -199,7 +203,7 @@ function syncSelectedNode(payload = state.payload) {
 function renderHierarchyToolbar() {
   const modelType = state.payload?.model?.type;
   const availableModes = getAvailableHierarchyModes();
-  const hasHierarchy = HIERARCHY_TYPES.has(modelType) && availableModes.size > 1;
+  const hasHierarchy = state.centerView === "graph" && HIERARCHY_TYPES.has(modelType) && availableModes.size > 1;
   ui.hierarchyToolbar.hidden = !hasHierarchy;
   if (!hasHierarchy) {
     return;
@@ -424,6 +428,7 @@ async function loadModels() {
     state.payload = null;
     updateExportButtons();
     ui.summaryPanel.innerHTML = '<div class="empty-state">当前没有可展示的模型目录。</div>';
+    ui.auditPanel.innerHTML = '<div class="empty-state">当前没有可审计的模型目录。</div>';
     return;
   }
 
@@ -458,6 +463,7 @@ async function loadModelPayload() {
     renderHierarchyToolbar();
     renderModelList();
     renderSummary();
+    renderAudit();
     renderControls();
     renderWarnings();
     renderGraph();
@@ -477,6 +483,7 @@ async function loadModelPayload() {
     ui.controlsForm.innerHTML = '<div class="empty-state">无法加载运行参数。</div>';
     setStatus(`加载失败：${error.message}`, true);
     ui.summaryPanel.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+    ui.auditPanel.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
     ui.graphBoard.innerHTML = "";
     ui.edgeLayer.innerHTML = "";
     ui.detailPanel.innerHTML = '<div class="empty-state">无法读取模型详情。</div>';
@@ -923,6 +930,180 @@ function renderSummary() {
       <h3>来源配置</h3>
       <div class="source-list">${sources || '<span class="subtle">未检测到配置文件。</span>'}</div>
     </div>
+  `;
+}
+
+function auditConfidenceLabel(level) {
+  if (level === "high") return "高可信";
+  if (level === "medium") return "中等可信";
+  return "低可信";
+}
+
+function auditCheckpointLabel(status) {
+  const labels = {
+    matched: "高度吻合",
+    close: "基本吻合",
+    divergent: "偏差较大",
+    informational: "仅供参考",
+    unavailable: "无真值",
+  };
+  return labels[status] || status || "未知";
+}
+
+function auditSeverityLabel(severity) {
+  if (severity === "error") return "错误";
+  if (severity === "warning") return "警告";
+  return "信息";
+}
+
+function formatAuditResult(value, unit) {
+  if (value === undefined || value === null || value === "") return "—";
+  const numeric = Number(value);
+  if (unit === "parameters" && Number.isFinite(numeric)) return formatB(numeric);
+  if (unit === "bytes" && Number.isFinite(numeric)) return formatGB(numeric);
+  if (unit === "GFLOPs/token" && Number.isFinite(numeric)) return `${numeric.toFixed(2)} GFLOPs/token`;
+  return String(value);
+}
+
+function renderAuditInputs(inputs) {
+  if (!inputs?.length) return '<div class="audit-empty-inline">该证据不依赖统一配置字段。</div>';
+  const originLabels = { direct: "直接", inherited: "继承", derived: "推导", runtime: "运行参数" };
+  return `
+    <div class="audit-input-table">
+      <div class="audit-input-head"><span>字段</span><span>值</span><span>来源</span></div>
+      ${inputs
+        .map(
+          (input) => `
+            <div class="audit-input-row">
+              <code>${escapeHtml(input.name)}</code>
+              <code>${escapeHtml(input.value ?? "—")}</code>
+              <span><span class="origin-badge origin-${escapeHtml(input.origin || "derived")}">${escapeHtml(originLabels[input.origin] || input.origin || "推导")}</span> ${escapeHtml(input.source || "derived")}</span>
+            </div>`
+        )
+        .join("")}
+    </div>`;
+}
+
+function renderAuditEvidence(evidence, index) {
+  const result = formatAuditResult(evidence.result, evidence.unit);
+  const assumptions = (evidence.assumptions || [])
+    .filter(Boolean)
+    .map((item) => `<li>${escapeHtml(item)}</li>`)
+    .join("");
+  const sources = (evidence.sourceFiles || [])
+    .map((source) => `<span class="source-chip">${escapeHtml(source)}</span>`)
+    .join("");
+  return `
+    <details class="audit-evidence"${index === 0 ? " open" : ""}>
+      <summary>
+        <span><span class="audit-category">${escapeHtml(evidence.category || "calculation")}</span>${escapeHtml(evidence.label)}</span>
+        <strong>${escapeHtml(result)}</strong>
+      </summary>
+      <div class="audit-evidence-body">
+        <div class="audit-formula"><span>公式</span><code>${escapeHtml(evidence.formula || "—")}</code></div>
+        ${renderAuditInputs(evidence.inputs || [])}
+        ${assumptions ? `<div class="audit-assumptions"><h4>假设与边界</h4><ul>${assumptions}</ul></div>` : ""}
+        ${sources ? `<div class="source-list">${sources}</div>` : ""}
+      </div>
+    </details>`;
+}
+
+function renderAudit() {
+  const payload = state.payload;
+  const audit = payload?.audit;
+  if (!audit) {
+    ui.auditPanel.innerHTML = '<div class="empty-state">当前 payload 没有审计数据。</div>';
+    return;
+  }
+
+  const confidence = audit.confidence || {};
+  const checkpoint = audit.checkpoint || {};
+  const diagnostics = audit.diagnostics || [];
+  const config = audit.config || {};
+  const evidence = audit.evidence || [];
+  const diagnosticCounts = diagnostics.reduce(
+    (counts, item) => ({ ...counts, [item.severity]: (counts[item.severity] || 0) + 1 }),
+    { error: 0, warning: 0, info: 0 }
+  );
+  const confidenceReasons = (confidence.reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("");
+  const checkpointError = checkpoint.relativeError == null ? "—" : `${(checkpoint.relativeError * 100).toFixed(3)}%`;
+  const checkpointActual = checkpoint.bytes ? formatGB(checkpoint.bytes) : "—";
+  const checkpointExpected = checkpoint.estimatedBytes ? formatGB(checkpoint.estimatedBytes) : "—";
+  const checkpointParams = checkpoint.estimatedParameters ? formatB(checkpoint.estimatedParameters) : "—";
+  const lineage = (config.lineage || [])
+    .map(
+      (item) => `<span class="lineage-chip"><strong>${escapeHtml(item.role)}</strong>${escapeHtml(item.modelId)}${item.configFile ? ` · ${escapeHtml(item.configFile)}` : ""}</span>`
+    )
+    .join("");
+  const diagnosticMarkup = diagnostics.length
+    ? diagnostics
+        .map(
+          (item) => `
+            <article class="diagnostic-card diagnostic-${escapeHtml(item.severity)}">
+              <div class="diagnostic-head"><span>${escapeHtml(auditSeverityLabel(item.severity))}</span><code>${escapeHtml(item.code)}</code></div>
+              <h4>${escapeHtml(item.title)}</h4>
+              <p>${escapeHtml(item.message)}</p>
+              ${(item.fields || []).length ? `<div class="diagnostic-fields">${item.fields.map((field) => `<code>${escapeHtml(field)}</code>`).join("")}</div>` : ""}
+            </article>`
+        )
+        .join("")
+    : '<div class="audit-ok-state">未发现配置冲突或计算不变量异常。</div>';
+  const evidenceMarkup = evidence.length
+    ? evidence.map(renderAuditEvidence).join("")
+    : '<div class="empty-state">当前模型没有可展示的计算证据。</div>';
+
+  ui.auditPanel.innerHTML = `
+    <div class="audit-title-row">
+      <div>
+        <div class="tag-row"><span class="tag">Audit Schema v${escapeHtml(audit.schemaVersion || 1)}</span><span class="tag">${escapeHtml(payload.model.type)}</span></div>
+        <h2>计算审计 · ${escapeHtml(payload.model.name)}</h2>
+        <p>追踪配置字段、公式、估算假设与 checkpoint 校验结果。</p>
+      </div>
+      <div class="audit-score audit-score-${escapeHtml(confidence.level || "low")}">
+        <strong>${escapeHtml(confidence.score ?? 0)}</strong>
+        <span>${escapeHtml(auditConfidenceLabel(confidence.level))}</span>
+      </div>
+    </div>
+    <div class="audit-confidence-track"><span style="width:${Math.max(0, Math.min(100, confidence.score || 0))}%"></span></div>
+    ${confidenceReasons ? `<ul class="audit-reasons">${confidenceReasons}</ul>` : ""}
+
+    <div class="audit-overview-grid">
+      <section class="audit-card">
+        <div class="audit-card-head"><h3>Checkpoint 校验</h3><span class="checkpoint-status checkpoint-${escapeHtml(checkpoint.status || "unavailable")}">${escapeHtml(auditCheckpointLabel(checkpoint.status))}</span></div>
+        <div class="audit-kv-grid">
+          <span>实际体积</span><code>${escapeHtml(checkpointActual)}</code>
+          <span>公式估算</span><code>${escapeHtml(checkpointExpected)}</code>
+          <span>相对偏差</span><code>${escapeHtml(checkpointError)}</code>
+          <span>真值参数代理</span><code>${escapeHtml(checkpointParams)}</code>
+          <span>权重条目</span><code>${escapeHtml(checkpoint.weightMapEntries || 0)}</code>
+          <span>精度</span><code>${escapeHtml(checkpoint.precision || "—")}</code>
+        </div>
+        <p class="audit-note">${escapeHtml(checkpoint.method || "—")}</p>
+      </section>
+      <section class="audit-card">
+        <div class="audit-card-head"><h3>配置诊断</h3><span class="diagnostic-counts">${diagnosticCounts.error} 错误 · ${diagnosticCounts.warning} 警告 · ${diagnosticCounts.info} 信息</span></div>
+        <div class="lineage-list">${lineage || '<span class="subtle">无配置继承链。</span>'}</div>
+        <div class="audit-kv-grid compact">
+          <span>架构目录</span><code>${escapeHtml(config.resolvedArchitectureDir || "—")}</code>
+          <span>本地配置</span><code>${escapeHtml(config.directConfigFile || "—")}</code>
+          <span>基础模型</span><code>${escapeHtml(config.baseReference || "—")}</code>
+        </div>
+      </section>
+    </div>
+
+    <section class="audit-section">
+      <div class="audit-section-head"><h3>诊断项</h3><span>${diagnostics.length}</span></div>
+      <div class="diagnostic-list">${diagnosticMarkup}</div>
+    </section>
+    <section class="audit-section">
+      <div class="audit-section-head"><h3>计算证据链</h3><span>${evidence.length}</span></div>
+      <div class="audit-evidence-list">${evidenceMarkup}</div>
+    </section>
+    <section class="audit-section">
+      <div class="audit-section-head"><h3>核心字段来源</h3><span>${(config.fields || []).length}</span></div>
+      ${renderAuditInputs(config.fields || [])}
+      <div class="source-list">${(config.sourceFiles || []).map((source) => `<span class="source-chip">${escapeHtml(source)}</span>`).join("")}</div>
+    </section>
   `;
 }
 
@@ -1465,6 +1646,88 @@ function relationColor(kind) {
   return "#cbd5e1";
 }
 
+function markdownCell(value) {
+  return String(value ?? "—").replaceAll("|", "\\|").replace(/[\r\n]+/g, " ");
+}
+
+function buildAuditMarkdown(payload) {
+  const audit = payload.audit || {};
+  const confidence = audit.confidence || {};
+  const checkpoint = audit.checkpoint || {};
+  const config = audit.config || {};
+  const diagnostics = audit.diagnostics || [];
+  const evidence = audit.evidence || [];
+  const lines = [
+    `# 模型计算审计：${payload.model.name}`,
+    "",
+    `- 模型 ID：\`${payload.model.id}\``,
+    `- 架构：\`${payload.model.architecture}\``,
+    `- 类型：\`${payload.model.type}\``,
+    `- 可信度：**${confidence.score ?? 0}/100 · ${auditConfidenceLabel(confidence.level)}**`,
+    `- 报告生成：${new Date().toISOString()}`,
+    "",
+    "## 可信度依据",
+    "",
+    ...(confidence.reasons || []).map((reason) => `- ${reason}`),
+    "",
+    "## Checkpoint 校验",
+    "",
+    "| 项目 | 结果 |",
+    "|---|---:|",
+    `| 状态 | ${auditCheckpointLabel(checkpoint.status)} |`,
+    `| 实际体积 | ${checkpoint.bytes ? formatGB(checkpoint.bytes) : "—"} |`,
+    `| 公式估算 | ${checkpoint.estimatedBytes ? formatGB(checkpoint.estimatedBytes) : "—"} |`,
+    `| 相对偏差 | ${checkpoint.relativeError == null ? "—" : `${(checkpoint.relativeError * 100).toFixed(3)}%`} |`,
+    `| 精度 | ${checkpoint.precision || "—"} |`,
+    `| 权重条目 | ${checkpoint.weightMapEntries || 0} |`,
+    "",
+    checkpoint.method || "未提供校验说明。",
+    "",
+    "## 配置诊断",
+    "",
+  ];
+  if (diagnostics.length) {
+    diagnostics.forEach((item) => {
+      lines.push(`- **[${auditSeverityLabel(item.severity)}] ${item.title}**（\`${item.code}\`）：${item.message}`);
+    });
+  } else {
+    lines.push("- 未发现配置冲突或计算不变量异常。");
+  }
+  lines.push("", "## 配置继承", "");
+  (config.lineage || []).forEach((item) => {
+    lines.push(`- ${item.role}: \`${item.modelId}\`${item.configFile ? ` · \`${item.configFile}\`` : ""}`);
+  });
+  lines.push("", "## 核心字段来源", "", "| 字段 | 值 | 来源 | 类型 |", "|---|---:|---|---|");
+  (config.fields || []).forEach((input) => {
+    lines.push(`| \`${markdownCell(input.name)}\` | ${markdownCell(input.value)} | \`${markdownCell(input.source)}\` | ${markdownCell(input.origin)} |`);
+  });
+  lines.push("", "## 计算证据链", "");
+  evidence.forEach((item, index) => {
+    lines.push(`### ${index + 1}. ${item.label}`, "");
+    lines.push(`- 结果：**${formatAuditResult(item.result, item.unit)}**`);
+    lines.push(`- 公式：\`${String(item.formula || "—").replaceAll("`", "'")}\``);
+    if (item.inputs?.length) {
+      lines.push("- 输入：");
+      item.inputs.forEach((input) => {
+        lines.push(`  - \`${input.name}\` = \`${markdownCell(input.value)}\`，来源 \`${markdownCell(input.source)}\`（${input.origin}）`);
+      });
+    }
+    if (item.assumptions?.length) {
+      lines.push("- 假设：");
+      item.assumptions.forEach((assumption) => lines.push(`  - ${assumption}`));
+    }
+    lines.push("");
+  });
+  lines.push("## 当前运行参数", "", "```json", JSON.stringify(payload.parameters || {}, null, 2), "```", "");
+  return `${lines.join("\n")}\n`;
+}
+
+function exportAuditReport() {
+  if (!state.payload) return;
+  const filename = `${sanitizeFileName(state.payload.model.id)}-audit.md`;
+  downloadBlob(filename, buildAuditMarkdown(state.payload), "text/markdown;charset=utf-8");
+}
+
 function exportCurrentPayload() {
   if (!state.payload) {
     return;
@@ -1587,6 +1850,7 @@ function setCenterView(view) {
   const graphOnly = view === "graph";
   ui.graphView.hidden = !graphOnly;
   ui.detailsView.hidden = view !== "details";
+  ui.auditView.hidden = view !== "audit";
   ui.compareView.hidden = view !== "compare";
   ui.nodeSearch.hidden = !graphOnly;
   if (graphOnly) {
@@ -1647,6 +1911,7 @@ ui.hierarchyToolbar.addEventListener("click", (event) => {
   renderDetails();
   setStatus(`已切换为 ${getHierarchyModeLabel(state.llmHierarchyMode)} 层级视图。`);
 });
+ui.exportAuditButton.addEventListener("click", exportAuditReport);
 ui.exportJsonButton.addEventListener("click", exportCurrentPayload);
 ui.exportSvgButton.addEventListener("click", exportCurrentSvg);
 

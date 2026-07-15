@@ -4836,28 +4836,549 @@ def build_fallback_payload(model_dir: Path, model_id: str, query: dict[str, list
     )
 
 
+_AUDIT_FIELD_SPECS: dict[str, list[tuple[str, str]]] = {
+    "hidden_size": [("config", "hidden_size"), ("params", "dim")],
+    "num_layers": [("config", "num_hidden_layers"), ("config", "num_layers"), ("params", "n_layers")],
+    "num_heads": [("config", "num_attention_heads"), ("params", "n_heads")],
+    "num_kv_heads": [("config", "num_key_value_heads"), ("params", "n_kv_heads")],
+    "head_dim": [("config", "head_dim"), ("params", "head_dim")],
+    "ffn_hidden": [("config", "intermediate_size"), ("params", "hidden_dim"), ("config", "moe_intermediate_size")],
+    "vocab_size": [("config", "vocab_size"), ("params", "vocab_size")],
+    "num_experts": [
+        ("config", "n_routed_experts"),
+        ("config", "num_experts"),
+        ("config", "num_local_experts"),
+        ("params", "moe.num_experts"),
+    ],
+    "experts_per_tok": [
+        ("config", "num_experts_per_tok"),
+        ("config", "moe_topk"),
+        ("params", "moe.num_experts_per_tok"),
+        ("params", "moe.moe_topk"),
+    ],
+    "moe_ffn_hidden": [
+        ("config", "moe_intermediate_size"),
+        ("config", "expert_ffn_hidden_size"),
+        ("params", "moe.moe_intermediate_size"),
+    ],
+    "n_shared_experts": [
+        ("config", "n_shared_experts"),
+        ("config", "num_shared_experts"),
+        ("config", "num_shared_expert"),
+        ("params", "moe.n_shared_experts"),
+        ("params", "moe.num_shared_experts"),
+    ],
+    "shared_ffn_hidden": [
+        ("config", "shared_expert_intermediate_size"),
+        ("config", "moe_shared_expert_intermediate_size"),
+        ("params", "moe.shared_expert_intermediate_size"),
+        ("params", "moe.moe_shared_expert_intermediate_size"),
+    ],
+    "first_k_dense": [("config", "first_k_dense_replace"), ("config", "n_dense_layers")],
+    "tie_word_embeddings": [("config", "tie_word_embeddings"), ("params", "tie_word_embeddings")],
+    "mtp_layers": [
+        ("config", "mtp_num_layers"),
+        ("config", "num_nextn_predict_layers"),
+        ("config", "num_mtp_modules"),
+    ],
+}
+
+
+_AUDIT_CONFLICT_FIELDS = {
+    "hidden_size": "隐藏维度",
+    "num_layers": "层数",
+    "num_heads": "注意力头数",
+    "num_kv_heads": "KV 头数",
+    "vocab_size": "词表大小",
+}
+
+
+def _audit_config_chain(model_dir: Path) -> list[Path]:
+    chain: list[Path] = []
+    current = model_dir
+    seen: set[Path] = set()
+    for _ in range(5):
+        resolved = current.resolve()
+        if resolved in seen:
+            break
+        seen.add(resolved)
+        chain.append(current)
+        base_dir = local_base_model_dir(current)
+        if not base_dir:
+            break
+        current = base_dir
+    return chain
+
+
+def _audit_direct_config(model_dir: Path) -> tuple[str | None, dict[str, Any]]:
+    for name in ("config.json", "configuration.json"):
+        path = model_dir / name
+        if path.exists():
+            data = read_json_file(path)
+            if data:
+                return name, data
+    return None, {}
+
+
+def _audit_nested_value(mapping: dict[str, Any], dotted_path: str) -> Any:
+    value: Any = mapping
+    for key in dotted_path.split("."):
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value
+
+
+def _audit_value_is_defined(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (str, list, dict)) and not value:
+        return False
+    return True
+
+
+def _audit_source_label(model_dir: Path, source_dir: Path, filename: str, dotted_path: str) -> tuple[str, str]:
+    inherited = source_dir.resolve() != model_dir.resolve()
+    prefix = f"{source_dir.name}/" if inherited else ""
+    return f"{prefix}{filename}:{dotted_path}", "inherited" if inherited else "direct"
+
+
+def _audit_resolve_field(
+    model_dir: Path,
+    aliases: list[tuple[str, str]],
+    rendered_value: Any,
+) -> dict[str, Any]:
+    config = primary_config(model_dir)
+    params_dir = architecture_config_dir(model_dir)
+    params = read_json_file(params_dir / "params.json")
+    chain = _audit_config_chain(model_dir)
+    for scope, dotted_path in aliases:
+        mapping = config if scope == "config" else params
+        raw_value = _audit_nested_value(mapping, dotted_path)
+        if not _audit_value_is_defined(raw_value):
+            continue
+        if scope == "config":
+            for source_dir in chain:
+                filename, direct = _audit_direct_config(source_dir)
+                source_value = _audit_nested_value(direct, dotted_path)
+                if filename and _audit_value_is_defined(source_value):
+                    source, origin = _audit_source_label(model_dir, source_dir, filename, dotted_path)
+                    return {
+                        "value": rendered_value,
+                        "rawValue": raw_value,
+                        "source": source,
+                        "origin": origin,
+                    }
+        if scope == "params" and (params_dir / "params.json").exists():
+            source, origin = _audit_source_label(model_dir, params_dir, "params.json", dotted_path)
+            return {
+                "value": rendered_value,
+                "rawValue": raw_value,
+                "source": source,
+                "origin": origin,
+            }
+    return {
+        "value": rendered_value,
+        "rawValue": None,
+        "source": "derived",
+        "origin": "derived",
+    }
+
+
+def _audit_formula_inputs(model_dir: Path, metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_terms = metrics.get("formula_terms")
+    terms: dict[str, Any] = raw_terms if isinstance(raw_terms, dict) else {}
+    inputs: list[dict[str, Any]] = []
+    for field_name, aliases in _AUDIT_FIELD_SPECS.items():
+        if field_name not in terms:
+            continue
+        resolved = _audit_resolve_field(model_dir, aliases, terms[field_name])
+        inputs.append({"name": field_name, **resolved})
+    for field_name in ("effective_experts_per_tok", "ffn_projection_count", "attn_per_layer", "expert_per", "dense_ffn_per"):
+        if field_name in terms:
+            inputs.append(
+                {
+                    "name": field_name,
+                    "value": terms[field_name],
+                    "rawValue": None,
+                    "source": "derived",
+                    "origin": "derived",
+                }
+            )
+    return inputs
+
+
+def _audit_diagnostic(
+    severity: str,
+    code: str,
+    title: str,
+    message: str,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "severity": severity,
+        "code": code,
+        "title": title,
+        "message": message,
+        "fields": fields or [],
+    }
+
+
+def _audit_alias_observations(model_dir: Path, aliases: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    config = primary_config(model_dir)
+    params_dir = architecture_config_dir(model_dir)
+    params = read_json_file(params_dir / "params.json")
+    observations: list[dict[str, Any]] = []
+    for scope, dotted_path in aliases:
+        mapping = config if scope == "config" else params
+        value = _audit_nested_value(mapping, dotted_path)
+        if not _audit_value_is_defined(value):
+            continue
+        source = _audit_resolve_field(model_dir, [(scope, dotted_path)], value)
+        observations.append({"path": source["source"], "value": value})
+    return observations
+
+
+def _audit_checkpoint(model_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    index_path = model_dir / "model.safetensors.index.json"
+    index = read_json_file(index_path)
+    raw_metadata = index.get("metadata")
+    metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+    raw_size = metadata.get("total_size")
+    checkpoint_bytes = int(raw_size) if isinstance(raw_size, (int, float)) and raw_size > 0 else 0
+    raw_weight_map = index.get("weight_map")
+    weight_map: dict[str, Any] = raw_weight_map if isinstance(raw_weight_map, dict) else {}
+    raw_metrics = payload.get("metrics")
+    metrics: dict[str, Any] = raw_metrics if isinstance(raw_metrics, dict) else {}
+    total_params = int(metrics.get("total_params", 0) or 0)
+    precision = str(metrics.get("checkpoint_precision") or "")
+    bytes_per_param = PRECISION_BYTES.get(precision)
+    expected_bytes = int(total_params * bytes_per_param) if total_params and bytes_per_param else None
+    relative_error = abs(expected_bytes - checkpoint_bytes) / checkpoint_bytes if expected_bytes and checkpoint_bytes else None
+    comparable = bool(checkpoint_bytes and expected_bytes and precision in {"bf16", "fp16"})
+    if not checkpoint_bytes:
+        status = "unavailable"
+    elif not comparable:
+        status = "informational"
+    elif relative_error is not None and relative_error <= 0.01:
+        status = "matched"
+    elif relative_error is not None and relative_error <= 0.05:
+        status = "close"
+    else:
+        status = "divergent"
+    if comparable and bytes_per_param is not None:
+        method = f"checkpoint bytes / {bytes_per_param:g} B per parameter"
+    elif checkpoint_bytes:
+        method = "量化或混合精度 checkpoint 仅比较存储体积，不反推精确参数量"
+    else:
+        method = "未发现带 metadata.total_size 的 safetensors index"
+    return {
+        "available": checkpoint_bytes > 0,
+        "source": "model.safetensors.index.json" if index_path.exists() else None,
+        "bytes": checkpoint_bytes or None,
+        "weightMapEntries": len(weight_map),
+        "precision": precision or None,
+        "bytesPerParameter": bytes_per_param,
+        "estimatedBytes": expected_bytes,
+        "estimatedParameters": checkpoint_bytes / bytes_per_param if comparable and bytes_per_param is not None else None,
+        "relativeError": relative_error,
+        "comparable": comparable,
+        "status": status,
+        "method": method,
+    }
+
+
+def _audit_graph_evidence(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    markers = ("推导", "公式", "计算", "估算", "缓存窗口")
+    sources = list(payload.get("model", {}).get("sources") or [])
+    for node in payload.get("graph", {}).get("nodes", []):
+        for section_index, node_section in enumerate(node.get("sections") or []):
+            title = str(node_section.get("title") or "")
+            items = node_section.get("items") if isinstance(node_section.get("items"), list) else []
+            if not items or not any(marker in title for marker in markers):
+                continue
+            expression = "; ".join(f"{item.get('label')}: {item.get('value')}" for item in items)
+            evidence.append(
+                {
+                    "id": f"node-{node.get('id')}-{section_index}",
+                    "category": "shape",
+                    "label": f"{node.get('label')} · {title}",
+                    "formula": expression,
+                    "result": node.get("outputShape") or "-",
+                    "unit": "shape",
+                    "quality": "derived",
+                    "inputs": [],
+                    "assumptions": [node.get("description")] if node.get("description") else [],
+                    "sourceFiles": sources,
+                }
+            )
+            if len(evidence) >= 20:
+                return evidence
+    return evidence
+
+
+def _audit_calculation_evidence(
+    model_dir: Path,
+    payload: dict[str, Any],
+    inputs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+    if not metrics:
+        return _audit_graph_evidence(payload)
+    sources = sorted({entry["source"].split(":", 1)[0] for entry in inputs if entry.get("source") != "derived"})
+    assumptions = [
+        "矩阵权重按公开配置估算，未逐项计入 norm、bias、rotary buffer 等小型参数。",
+        "Shape 与运行成本来自静态配置和当前控制参数，不代表真实框架 profiler 结果。",
+    ]
+    evidence = [
+        {
+            "id": "total-parameters",
+            "category": "parameters",
+            "label": "总参数量",
+            "formula": "attention + routed_experts + shared_experts + dense_ffn + embedding/output_head + mtp",
+            "result": metrics.get("total_params"),
+            "unit": "parameters",
+            "quality": "estimated",
+            "inputs": inputs,
+            "assumptions": assumptions,
+            "sourceFiles": sources,
+        },
+        {
+            "id": "active-parameters",
+            "category": "parameters",
+            "label": "每 Token 激活参数",
+            "formula": "non_expert_active + routed_experts_active + shared_experts_active + dense_ffn_active",
+            "result": metrics.get("active_params"),
+            "unit": "parameters",
+            "quality": "estimated",
+            "inputs": [entry for entry in inputs if entry["name"] in {"num_experts", "experts_per_tok", "effective_experts_per_tok", "n_shared_experts", "first_k_dense"}],
+            "assumptions": assumptions,
+            "sourceFiles": sources,
+        },
+        {
+            "id": "kv-cache",
+            "category": "runtime",
+            "label": "KV Cache",
+            "formula": "KV width × cached token-layer count × 2 bytes × batch；full/sliding/sparse/compressed 层分别计数",
+            "result": metrics.get("memory", {}).get("kv_bytes") if isinstance(metrics.get("memory"), dict) else None,
+            "unit": "bytes",
+            "quality": "estimated",
+            "inputs": [entry for entry in inputs if entry["name"] in {"num_layers", "num_kv_heads", "head_dim"}],
+            "assumptions": ["KV cache 按 BF16 存储；线性注意力固定状态未计入。"],
+            "sourceFiles": sources,
+        },
+        {
+            "id": "token-flops",
+            "category": "runtime",
+            "label": "每 Token FLOPs",
+            "formula": "2 × active linear parameters + context-dependent QK/AV FLOPs + optional indexer FLOPs",
+            "result": metrics.get("gflops_per_token"),
+            "unit": "GFLOPs/token",
+            "quality": "estimated",
+            "inputs": [entry for entry in inputs if entry["name"] in {"hidden_size", "num_layers", "num_heads", "head_dim", "effective_experts_per_tok"}],
+            "assumptions": ["不包含采样、通信、kernel launch 和框架调度开销。"],
+            "sourceFiles": sources,
+        },
+    ]
+    memory = metrics.get("memory") if isinstance(metrics.get("memory"), dict) else {}
+    if memory:
+        evidence.append(
+            {
+                "id": "memory-footprint",
+                "category": "runtime",
+                "label": "推理显存",
+                "formula": "weights + KV cache + reusable single-layer activation workspace",
+                "result": memory.get("total_bytes"),
+                "unit": "bytes",
+                "quality": "estimated",
+                "inputs": [
+                    {"name": "batch", "value": memory.get("batch"), "source": "runtime control", "origin": "runtime", "rawValue": memory.get("batch")},
+                    {"name": "seq_len", "value": memory.get("seq_len"), "source": "runtime control", "origin": "runtime", "rawValue": memory.get("seq_len")},
+                    {"name": "precision", "value": memory.get("precision"), "source": "runtime control", "origin": "runtime", "rawValue": memory.get("precision")},
+                ],
+                "assumptions": ["GPU 可用显存按标称容量的 90% 计算；不包含通信 buffer 和碎片化细节。"],
+                "sourceFiles": sources,
+            }
+        )
+    return evidence
+
+
+def build_model_audit(model_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    model_type = str(payload.get("model", {}).get("type") or "unknown")
+    raw_metrics = payload.get("metrics")
+    metrics: dict[str, Any] = raw_metrics if isinstance(raw_metrics, dict) else {}
+    inputs = _audit_formula_inputs(model_dir, metrics) if metrics else []
+    checkpoint = _audit_checkpoint(model_dir, payload)
+    diagnostics: list[dict[str, Any]] = []
+    chain = _audit_config_chain(model_dir)
+    lineage = []
+    for index, config_dir in enumerate(chain):
+        filename, _config = _audit_direct_config(config_dir)
+        lineage.append(
+            {
+                "modelId": config_dir.name,
+                "role": "local" if index == 0 else "base",
+                "configFile": filename,
+            }
+        )
+    direct_filename, direct_config = _audit_direct_config(model_dir)
+    config = primary_config(model_dir)
+    if len(chain) > 1:
+        diagnostics.append(
+            _audit_diagnostic(
+                "info",
+                "CONFIG_INHERITED",
+                "使用基础模型配置",
+                f"本地配置与 {chain[-1].name} 的架构配置进行了深度合并。",
+            )
+        )
+    if not direct_filename and not config and not payload.get("model", {}).get("sources"):
+        diagnostics.append(
+            _audit_diagnostic("warning", "CONFIG_MISSING", "缺少配置来源", "未找到可用于结构提取的配置文件。")
+        )
+    if model_type == "unknown":
+        diagnostics.append(
+            _audit_diagnostic("error", "PARSER_UNSUPPORTED", "尚未适配该架构", "当前仅能展示原始配置摘要，计算结果不完整。")
+        )
+    if model_type == "llm":
+        if not metrics:
+            diagnostics.append(
+                _audit_diagnostic("error", "METRICS_UNAVAILABLE", "无法生成核心指标", "隐藏维度或层数缺失，参数量与运行成本不可计算。")
+            )
+        raw_terms = metrics.get("formula_terms")
+        terms: dict[str, Any] = raw_terms if isinstance(raw_terms, dict) else {}
+        for field_name in ("hidden_size", "num_layers", "num_heads"):
+            if not terms.get(field_name):
+                diagnostics.append(
+                    _audit_diagnostic(
+                        "error",
+                        "REQUIRED_FIELD_MISSING",
+                        "缺少关键维度",
+                        f"{field_name} 未提供，相关公式只能保留符号结果。",
+                        [field_name],
+                    )
+                )
+        for field_name, label in _AUDIT_CONFLICT_FIELDS.items():
+            observations = _audit_alias_observations(model_dir, _AUDIT_FIELD_SPECS[field_name])
+            distinct = {json.dumps(item["value"], ensure_ascii=False, sort_keys=True) for item in observations}
+            if len(distinct) > 1:
+                rendered = "; ".join(f"{item['path']}={format_value(item['value'])}" for item in observations)
+                diagnostics.append(
+                    _audit_diagnostic(
+                        "warning",
+                        "CONFIG_ALIAS_CONFLICT",
+                        f"{label}存在冲突",
+                        f"解析器按别名优先级取第一项：{rendered}",
+                        [item["path"] for item in observations],
+                    )
+                )
+        layer_types = config.get("layer_types")
+        num_layers = int(terms.get("num_layers", 0) or 0)
+        if isinstance(layer_types, list) and num_layers and len(layer_types) != num_layers:
+            diagnostics.append(
+                _audit_diagnostic(
+                    "warning",
+                    "LAYER_PATTERN_LENGTH",
+                    "层型列表长度不一致",
+                    f"layer_types={len(layer_types)}，num_layers={num_layers}；缺失位置按 full attention 处理。",
+                    ["layer_types", "num_layers"],
+                )
+            )
+        raw_breakdown = metrics.get("breakdown")
+        breakdown: dict[str, Any] = raw_breakdown if isinstance(raw_breakdown, dict) else {}
+        if breakdown and sum(breakdown.values()) != metrics.get("total_params"):
+            diagnostics.append(
+                _audit_diagnostic("error", "BREAKDOWN_MISMATCH", "参数分解不闭合", "各组件之和不等于总参数量。")
+            )
+        if metrics.get("active_params", 0) > metrics.get("total_params", 0):
+            diagnostics.append(
+                _audit_diagnostic("error", "ACTIVE_EXCEEDS_TOTAL", "激活参数异常", "激活参数超过总参数量。")
+            )
+    if checkpoint["status"] == "divergent":
+        diagnostics.append(
+            _audit_diagnostic(
+                "warning",
+                "CHECKPOINT_DEVIATION",
+                "Checkpoint 偏差较大",
+                f"估算权重字节与 checkpoint 相差 {checkpoint['relativeError']:.2%}。",
+            )
+        )
+    elif not checkpoint["available"]:
+        diagnostics.append(
+            _audit_diagnostic("info", "CHECKPOINT_UNAVAILABLE", "缺少权重真值", "未发现可用于字节校验的 safetensors index。")
+        )
+    base_score = 95 if model_type == "llm" and metrics else 88 if model_type != "unknown" else 45
+    score = base_score
+    score -= 25 * sum(item["severity"] == "error" for item in diagnostics)
+    score -= 7 * sum(item["severity"] == "warning" for item in diagnostics)
+    if checkpoint["status"] == "matched":
+        score += 3
+    elif checkpoint["status"] == "close":
+        score += 1
+    score = max(0, min(100, score))
+    level = "high" if score >= 85 else "medium" if score >= 65 else "low"
+    reasons = [
+        "已使用专用架构解析器" if model_type != "unknown" else "仅使用通用 fallback 解析器",
+        "核心参数公式可闭合" if metrics and metrics.get("breakdown") else "当前模型没有统一参数量公式",
+        "存在可比较的 checkpoint 真值" if checkpoint["comparable"] else "checkpoint 仅作存储参考或不可用",
+    ]
+    source_files = list(payload.get("model", {}).get("sources") or [])
+    if checkpoint["source"] and checkpoint["source"] not in source_files:
+        source_files.append(checkpoint["source"])
+    return {
+        "schemaVersion": 1,
+        "confidence": {
+            "score": score,
+            "level": level,
+            "reasons": reasons,
+        },
+        "checkpoint": checkpoint,
+        "diagnostics": diagnostics,
+        "evidence": _audit_calculation_evidence(model_dir, payload, inputs),
+        "config": {
+            "directConfigFile": direct_filename,
+            "directConfigKeys": sorted(direct_config.keys()),
+            "baseReference": model_card_base_reference(model_dir),
+            "resolvedArchitectureDir": architecture_config_dir(model_dir).name,
+            "lineage": lineage,
+            "fields": inputs,
+            "sourceFiles": source_files,
+        },
+        "assumptions": list(payload.get("warnings") or []),
+    }
+
+
+def attach_model_audit(model_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    payload["audit"] = build_model_audit(model_dir, payload)
+    return payload
+
+
 def build_model_payload(model_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
     model_dir = resolve_model_dir(model_id)
     model_type = classify_model_dir(model_dir)
     if is_hy_world_bundle(model_dir):
-        return build_hy_world_payload(model_dir, model_id, query)
-    if is_nemotron_streaming_asr(model_dir):
-        return build_nemotron_streaming_asr_payload(model_dir, model_id, query)
-    if model_type == "llm":
-        return build_llm_payload(model_dir, model_id, query)
-    if model_type == "multimodal":
+        payload = build_hy_world_payload(model_dir, model_id, query)
+    elif is_nemotron_streaming_asr(model_dir):
+        payload = build_nemotron_streaming_asr_payload(model_dir, model_id, query)
+    elif model_type == "llm":
+        payload = build_llm_payload(model_dir, model_id, query)
+    elif model_type == "multimodal":
         config = primary_config(model_dir)
         yaml_config = supplemental_yaml_config(model_dir)
         if is_asr_model_config(config, yaml_config):
-            return build_asr_payload(model_dir, model_id, query)
-        if is_sam_video_config(config):
-            return build_sam_video_payload(model_dir, model_id, query)
-        if is_tts_model_config(config):
-            return build_tts_payload(model_dir, model_id, query)
-        return build_multimodal_payload(model_dir, model_id, query)
-    if model_type == "diffusers":
-        return build_diffusers_payload(model_dir, model_id, query)
-    return build_fallback_payload(model_dir, model_id, query)
+            payload = build_asr_payload(model_dir, model_id, query)
+        elif is_sam_video_config(config):
+            payload = build_sam_video_payload(model_dir, model_id, query)
+        elif is_tts_model_config(config):
+            payload = build_tts_payload(model_dir, model_id, query)
+        else:
+            payload = build_multimodal_payload(model_dir, model_id, query)
+    elif model_type == "diffusers":
+        payload = build_diffusers_payload(model_dir, model_id, query)
+    else:
+        payload = build_fallback_payload(model_dir, model_id, query)
+    return attach_model_audit(model_dir, payload)
 
 
 class ModelArchRequestHandler(SimpleHTTPRequestHandler):
