@@ -1,6 +1,10 @@
 const initialUrlParams = new URLSearchParams(window.location.search);
 const URL_STATE_KEYS = new Set(["model", "view", "hierarchy", "node", "lanes", "parents", "pins", "zoom", "scroll_x", "scroll_y", "compare"]);
 const CENTER_VIEWS = new Set(["graph", "details", "scenario", "insights", "audit", "compare"]);
+const GRAPH_STATE_VERSION = 3;
+const ZOOM_STEP = 0.25;
+const MIN_ZOOM_SCALE = 0.25;
+const MAX_ZOOM_SCALE = 3;
 
 const state = {
   models: [],
@@ -284,6 +288,13 @@ function parseStateSet(value) {
   return new Set(String(value || "").split(",").map((item) => item.trim()).filter(Boolean));
 }
 
+function normalizeZoomScale(value, fallback = 1) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  const snapped = Math.round(numeric / ZOOM_STEP) * ZOOM_STEP;
+  return Math.max(MIN_ZOOM_SCALE, Math.min(MAX_ZOOM_SCALE, snapped));
+}
+
 function restoreGraphState(modelId) {
   state.selectedNodeId = null;
   state.llmHierarchyMode = "summary";
@@ -294,18 +305,19 @@ function restoreGraphState(modelId) {
   state.pendingScroll = { left: 0, top: 0 };
   try {
     const saved = JSON.parse(localStorage.getItem(graphStateKey(modelId)) || "null");
-    if (!saved || saved.version !== 1) return;
+    if (!saved || ![1, 2, GRAPH_STATE_VERSION].includes(saved.version)) return;
     state.selectedNodeId = saved.selectedNodeId || null;
     state.llmHierarchyMode = HIERARCHY_MODES.includes(saved.hierarchyMode) ? saved.hierarchyMode : "summary";
     state.collapsedParents = new Set(Array.isArray(saved.collapsedParents) ? saved.collapsedParents : []);
     state.collapsedLanes = new Set(Array.isArray(saved.collapsedLanes) ? saved.collapsedLanes : []);
     state.pinnedNodes = new Set(Array.isArray(saved.pinnedNodes) ? saved.pinnedNodes : []);
-    const scale = Number(saved.zoom?.scale);
-    state.zoom = { scale: Number.isFinite(scale) ? Math.max(0.3, Math.min(3, scale)) : 1, x: 0, y: 0 };
-    state.pendingScroll = {
-      left: Math.max(0, Number(saved.scrollLeft) || 0),
-      top: Math.max(0, Number(saved.scrollTop) || 0),
-    };
+    if (saved.version === GRAPH_STATE_VERSION) {
+      state.zoom = { scale: normalizeZoomScale(saved.zoom?.scale), x: 0, y: 0 };
+      state.pendingScroll = {
+        left: Math.max(0, Number(saved.scrollLeft) || 0),
+        top: Math.max(0, Number(saved.scrollTop) || 0),
+      };
+    }
     if (CENTER_VIEWS.has(saved.centerView)) state.centerView = saved.centerView;
   } catch (error) {
     console.warn("无法恢复图状态", error);
@@ -316,14 +328,15 @@ function applyInitialUrlState() {
   if (state.urlStateApplied) return;
   const view = initialUrlParams.get("view");
   const hierarchy = initialUrlParams.get("hierarchy");
-  const scale = Number(initialUrlParams.get("zoom"));
+  const zoomParam = initialUrlParams.get("zoom");
+  const scale = zoomParam === null || zoomParam.trim() === "" ? Number.NaN : Number(zoomParam);
   if (CENTER_VIEWS.has(view)) state.centerView = view;
   if (HIERARCHY_MODES.includes(hierarchy)) state.llmHierarchyMode = hierarchy;
   if (initialUrlParams.has("node")) state.selectedNodeId = initialUrlParams.get("node");
   if (initialUrlParams.has("lanes")) state.collapsedLanes = parseStateSet(initialUrlParams.get("lanes"));
   if (initialUrlParams.has("parents")) state.collapsedParents = parseStateSet(initialUrlParams.get("parents"));
   if (initialUrlParams.has("pins")) state.pinnedNodes = parseStateSet(initialUrlParams.get("pins"));
-  if (Number.isFinite(scale)) state.zoom.scale = Math.max(0.3, Math.min(3, scale));
+  if (Number.isFinite(scale)) state.zoom.scale = normalizeZoomScale(scale);
   state.pendingScroll = {
     left: Math.max(0, Number(initialUrlParams.get("scroll_x")) || state.pendingScroll?.left || 0),
     top: Math.max(0, Number(initialUrlParams.get("scroll_y")) || state.pendingScroll?.top || 0),
@@ -337,7 +350,7 @@ function persistGraphState() {
   if (!state.activeModelId || !state.payload) return;
   try {
     localStorage.setItem(graphStateKey(), JSON.stringify({
-      version: 1,
+      version: GRAPH_STATE_VERSION,
       selectedNodeId: state.selectedNodeId,
       hierarchyMode: state.llmHierarchyMode,
       collapsedParents: [...state.collapsedParents],
@@ -1723,9 +1736,9 @@ function resetZoom() {
   persistGraphState();
 }
 
-function zoomBy(delta, centerX, centerY) {
+function zoomBy(direction, centerX, centerY) {
   const oldScale = state.zoom.scale;
-  const newScale = Math.max(0.3, Math.min(3, oldScale * delta));
+  const newScale = normalizeZoomScale(oldScale + direction * ZOOM_STEP);
   if (newScale === oldScale) {
     return;
   }
@@ -2507,7 +2520,7 @@ function applyNodeSearch() {
 ui.graphScroll.addEventListener("wheel", (event) => {
   if (event.ctrlKey || event.metaKey) {
     event.preventDefault();
-    zoomBy(event.deltaY < 0 ? 1.1 : 0.9, event.clientX, event.clientY);
+    zoomBy(event.deltaY < 0 ? 1 : -1, event.clientX, event.clientY);
   }
 }, { passive: false });
 
@@ -2544,8 +2557,8 @@ window.addEventListener("mouseup", () => {
   }
 });
 
-ui.zoomIn.addEventListener("click", () => zoomBy(1.2));
-ui.zoomOut.addEventListener("click", () => zoomBy(0.83));
+ui.zoomIn.addEventListener("click", () => zoomBy(1));
+ui.zoomOut.addEventListener("click", () => zoomBy(-1));
 ui.zoomReset.addEventListener("click", resetZoom);
 
 updateExportButtons();
