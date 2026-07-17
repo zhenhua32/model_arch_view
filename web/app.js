@@ -46,9 +46,6 @@ const ui = {
   graphCanvas: document.getElementById("graph-canvas"),
   graphBoard: document.getElementById("graph-board"),
   edgeLayer: document.getElementById("edge-layer"),
-  graphMinimap: document.getElementById("graph-minimap"),
-  minimapContent: document.getElementById("minimap-content"),
-  minimapViewport: document.getElementById("minimap-viewport"),
   detailPanel: document.getElementById("detail-panel"),
   zoomIn: document.getElementById("zoom-in"),
   zoomOut: document.getElementById("zoom-out"),
@@ -613,7 +610,6 @@ async function loadModelPayload() {
         ui.graphScroll.scrollTop = state.pendingScroll.top;
         state.pendingScroll = null;
       }
-      updateMinimapViewport();
       persistGraphState();
     });
     setStatus(`已加载 ${payload.model.name}，当前展示 ${payload.model.type} 图结构。`);
@@ -1709,7 +1705,6 @@ function renderGraph() {
   requestAnimationFrame(() => {
     drawEdges();
     applyNodeSearch();
-    renderMinimap();
   });
 }
 
@@ -1719,7 +1714,6 @@ function applyZoom() {
   ui.zoomLevel.textContent = `${Math.round(scale * 100)}%`;
   requestAnimationFrame(() => {
     drawEdges();
-    renderMinimap();
   });
 }
 
@@ -1899,56 +1893,6 @@ function drawEdges() {
   });
 
   ui.edgeLayer.innerHTML = markup;
-}
-
-function renderMinimap() {
-  if (!state.payload || state.centerView !== "graph") {
-    ui.graphMinimap.hidden = true;
-    return;
-  }
-  const nodes = [...ui.graphBoard.querySelectorAll(".graph-node")].filter(isMeasurableElement);
-  if (!nodes.length) {
-    ui.graphMinimap.hidden = true;
-    return;
-  }
-  const boardWidth = Math.max(1, ui.graphBoard.scrollWidth);
-  const boardHeight = Math.max(1, ui.graphBoard.scrollHeight);
-  const laneMarkup = [...ui.graphBoard.querySelectorAll(".lane")]
-    .filter(isMeasurableElement)
-    .map((lane) => {
-      const rect = getNodeOffset(lane, ui.graphBoard);
-      return `<span class="minimap-lane" style="left:${(rect.left / boardWidth * 100).toFixed(3)}%;top:${(rect.top / boardHeight * 100).toFixed(3)}%;width:${(rect.width / boardWidth * 100).toFixed(3)}%;height:${(rect.height / boardHeight * 100).toFixed(3)}%"></span>`;
-    }).join("");
-  const nodeMarkup = nodes.map((node) => {
-    const rect = getNodeOffset(node, ui.graphBoard);
-    const pinned = state.pinnedNodes.has(node.dataset.nodeId) ? " pinned" : "";
-    const selected = node.dataset.nodeId === state.selectedNodeId ? " selected" : "";
-    return `<span class="minimap-node${pinned}${selected}" style="left:${(rect.left / boardWidth * 100).toFixed(3)}%;top:${(rect.top / boardHeight * 100).toFixed(3)}%;width:${Math.max(1.5, rect.width / boardWidth * 100).toFixed(3)}%;height:${Math.max(2, rect.height / boardHeight * 100).toFixed(3)}%"></span>`;
-  }).join("");
-  ui.minimapContent.innerHTML = laneMarkup + nodeMarkup;
-  ui.graphMinimap.hidden = false;
-  updateMinimapViewport();
-}
-
-function updateMinimapViewport() {
-  if (ui.graphMinimap.hidden || !state.payload) return;
-  const mapWidth = ui.graphMinimap.clientWidth;
-  const mapHeight = ui.graphMinimap.clientHeight;
-  if (!mapWidth || !mapHeight) return;
-  const contentWidth = Math.max(ui.graphScroll.clientWidth, ui.graphBoard.scrollWidth * state.zoom.scale);
-  const contentHeight = Math.max(ui.graphScroll.clientHeight, ui.graphBoard.scrollHeight * state.zoom.scale);
-  const viewportWidth = Math.min(mapWidth, Math.max(12, ui.graphScroll.clientWidth / contentWidth * mapWidth));
-  const viewportHeight = Math.min(mapHeight, Math.max(10, ui.graphScroll.clientHeight / contentHeight * mapHeight));
-  const maxScrollLeft = Math.max(1, contentWidth - ui.graphScroll.clientWidth);
-  const maxScrollTop = Math.max(1, contentHeight - ui.graphScroll.clientHeight);
-  const left = Math.min(mapWidth - viewportWidth, ui.graphScroll.scrollLeft / maxScrollLeft * (mapWidth - viewportWidth));
-  const top = Math.min(mapHeight - viewportHeight, ui.graphScroll.scrollTop / maxScrollTop * (mapHeight - viewportHeight));
-  Object.assign(ui.minimapViewport.style, {
-    left: `${Math.max(0, left)}px`,
-    top: `${Math.max(0, top)}px`,
-    width: `${viewportWidth}px`,
-    height: `${viewportHeight}px`,
-  });
 }
 
 function findSelectedNode() {
@@ -2381,7 +2325,6 @@ function setCenterView(view) {
     if (state.payload) renderGraph();
   } else {
     ui.hierarchyToolbar.hidden = true;
-    ui.graphMinimap.hidden = true;
   }
   persistGraphState();
 }
@@ -2522,27 +2465,14 @@ window.addEventListener("resize", () => {
   resizeTimer = setTimeout(() => {
     requestAnimationFrame(() => {
       drawEdges();
-      renderMinimap();
     });
   }, 150);
 });
 
 let graphScrollTimer = null;
 ui.graphScroll.addEventListener("scroll", () => {
-  updateMinimapViewport();
   clearTimeout(graphScrollTimer);
   graphScrollTimer = setTimeout(persistGraphState, 180);
-});
-
-ui.graphMinimap.addEventListener("click", (event) => {
-  const rect = ui.graphMinimap.getBoundingClientRect();
-  if (!rect.width || !rect.height) return;
-  const xRatio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-  const yRatio = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
-  const contentWidth = Math.max(ui.graphScroll.clientWidth, ui.graphBoard.scrollWidth * state.zoom.scale);
-  const contentHeight = Math.max(ui.graphScroll.clientHeight, ui.graphBoard.scrollHeight * state.zoom.scale);
-  ui.graphScroll.scrollLeft = Math.max(0, xRatio * contentWidth - ui.graphScroll.clientWidth / 2);
-  ui.graphScroll.scrollTop = Math.max(0, yRatio * contentHeight - ui.graphScroll.clientHeight / 2);
 });
 
 // --- Node Search ---

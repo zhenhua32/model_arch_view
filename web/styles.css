@@ -190,14 +190,6 @@ html, body {
 .zoom-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--ink); font: inherit; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 150ms ease; }
 .zoom-btn:hover { background: var(--panel-strong); border-color: var(--line); }
 .zoom-level { min-width: 42px; text-align: center; color: var(--muted); font-size: 0.75rem; font-family: var(--font-mono); font-weight: 500; }
-.graph-minimap { position: absolute; left: 16px; bottom: 16px; width: 190px; height: 118px; overflow: hidden; border: 1px solid rgba(100, 116, 139, 0.35); border-radius: var(--radius-md); background: rgba(255, 255, 255, 0.94); box-shadow: var(--shadow-lg); z-index: 20; cursor: crosshair; }
-.graph-minimap[hidden] { display: none; }
-.minimap-content { position: absolute; inset: 6px; }
-.minimap-lane { position: absolute; border: 1px solid rgba(148, 163, 184, 0.35); border-radius: 2px; background: rgba(241, 245, 249, 0.55); }
-.minimap-node { position: absolute; min-width: 2px; min-height: 2px; border-radius: 1px; background: rgba(79, 70, 229, 0.48); }
-.minimap-node.pinned { background: #0ea5e9; box-shadow: 0 0 0 1px #fff; }
-.minimap-node.selected { background: var(--rose); }
-.minimap-viewport { position: absolute; border: 2px solid var(--accent); border-radius: 3px; background: rgba(79, 70, 229, 0.05); pointer-events: none; }
 
 /* ---- center view tabs (graph / details / compare) ---- */
 .view-tabs { display: flex; align-items: center; gap: 4px; padding: 8px 24px; background: var(--panel); border-bottom: 1px solid var(--line); flex-shrink: 0; }
