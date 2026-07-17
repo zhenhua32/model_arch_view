@@ -79,9 +79,9 @@ def read_simple_yaml_file(path: Path) -> dict[str, Any]:
         parent = stack[-1][1]
         stripped_value = raw_value.strip()
         if stripped_value.startswith("!"):
-            child = {"_tag": stripped_value}
-            parent[key] = child
-            stack.append((indent, child))
+            tagged_child = {"_tag": stripped_value}
+            parent[key] = tagged_child
+            stack.append((indent, tagged_child))
             continue
         if stripped_value:
             parent[key] = _parse_simple_yaml_scalar(raw_value)
@@ -218,6 +218,14 @@ def first_defined(*values: Any) -> Any:
             continue
         return value
     return None
+
+
+def as_mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 def clamp_int(value: Any, default: int, minimum: int = 1, maximum: int | None = None) -> int:
@@ -445,7 +453,7 @@ def classify_model_dir(model_dir: Path) -> str:
     if is_asr_model_config(config, yaml_config) or is_tts_model_config(config) or is_sam_video_config(config):
         return "multimodal"
 
-    thinker_config = config.get("thinker_config") if isinstance(config.get("thinker_config"), dict) else {}
+    thinker_config = as_mapping(config.get("thinker_config"))
     if (
         config.get("vision_config")
         or config.get("audio_config")
@@ -611,7 +619,7 @@ def build_node(
     }
 
 
-def build_graph(lanes: list[tuple[str, str]], nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> dict[str, Any]:
+def build_graph(lanes: list[tuple[str, str]], nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "lanes": [{"id": lane_id, "label": label} for lane_id, label in lanes],
         "nodes": nodes,
@@ -730,7 +738,7 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     (Qwen/DeepSeek/GLM/LongCat/params.json-style) are resolved here.
     """
     params_config = params_config or {}
-    moe_config = params_config.get("moe") if isinstance(params_config.get("moe"), dict) else {}
+    moe_config = as_mapping(params_config.get("moe"))
     architecture = _first_architecture(config)
     model_type = str(config.get("model_type") or "").lower()
     is_deepseek_v4 = model_type == "deepseek_v4"
@@ -786,8 +794,8 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
     full_attention_layers, sliding_attention_layers, linear_attention_layers = _attention_layer_counts(
         layer_types, num_layers, use_sliding_window
     )
-    dsa_layers = config.get("dsa_layers") if isinstance(config.get("dsa_layers"), list) else []
-    swa_layers = config.get("swa_layers") if isinstance(config.get("swa_layers"), list) else []
+    dsa_layers = as_list(config.get("dsa_layers"))
+    swa_layers = as_list(config.get("swa_layers"))
     sparse_attention_layers = 0
     sparse_topk = 0
     if dsa_layers or swa_layers:
@@ -814,7 +822,7 @@ def parse_llm_dims(config: dict[str, Any], params_config: dict[str, Any] | None 
         0,
     ) or 0)
     v_head_dim = int(first_defined(config.get("v_head_dim"), head_dim) or 0)
-    raw_compress_ratios = config.get("compress_ratios") if isinstance(config.get("compress_ratios"), list) else []
+    raw_compress_ratios = as_list(config.get("compress_ratios"))
     compress_ratios = [int(value) if isinstance(value, (int, float)) else 0 for value in raw_compress_ratios[:num_layers]]
     if is_deepseek_v4 and len(compress_ratios) < num_layers:
         compress_ratios.extend([0] * (num_layers - len(compress_ratios)))
@@ -1219,7 +1227,7 @@ def estimate_llm_metrics(dims: dict[str, Any], seq_len: int = 0) -> dict[str, An
 # ---- Deployment estimation reference tables --------------------------------
 # Approximate spec sheet values; centralised so they are easy to tweak.
 # bf16_tflops = dense bf16 tensor-core peak; bw_gbs = HBM bandwidth (GB/s).
-GPU_REFERENCE = [
+GPU_REFERENCE: list[dict[str, Any]] = [
     {
         "name": "RTX 4090", "mem_gb": 24, "bf16_tflops": 165, "bw_gbs": 1008,
         "compute_tops": {"bf16": 165, "fp16": 165, "fp8": 330, "int8": 661, "int4": 1321},
@@ -1275,7 +1283,7 @@ def infer_weight_precision(config: dict[str, Any], params_config: dict[str, Any]
 
 
 def infer_native_weight_profile(config: dict[str, Any], metrics: dict[str, Any], precision: str) -> dict[str, Any]:
-    quantization = config.get("quantization_config") if isinstance(config.get("quantization_config"), dict) else {}
+    quantization = as_mapping(config.get("quantization_config"))
     quant_method = str(quantization.get("quant_method") or "").lower()
     store_dtype = str(quantization.get("store_dtype") or "").lower()
     checkpoint_bytes = int(metrics.get("checkpoint_bytes", 0) or 0)
@@ -1315,7 +1323,7 @@ def infer_native_weight_profile(config: dict[str, Any], metrics: dict[str, Any],
 
 
 def _gpu_compute_tops(gpu: dict[str, Any], precision: str) -> float:
-    compute_tops = gpu.get("compute_tops") if isinstance(gpu.get("compute_tops"), dict) else {}
+    compute_tops = as_mapping(gpu.get("compute_tops"))
     return float(compute_tops.get(precision, gpu["bf16_tflops"]))
 
 
@@ -2688,7 +2696,7 @@ def build_llm_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         fit_label = "可容纳" if scenario["memory"]["fits"] else f"至少 {scenario['memory']['minimum_gpu_count']} 卡"
         summary.append(detail("部署场景", f"{workload} / {gpu_count}×{gpu_name} / {fit_label}"))
 
-    controls = [
+    controls: list[dict[str, Any]] = [
         {"name": "batch", "label": "Batch", "type": "number", "value": batch, "min": 1, "max": 16, "step": 1, "help": "并行样本数"},
         {"name": "seq_len", "label": "Token 长度", "type": "number", "value": seq_len, "min": 1, "max": max_position, "step": 1, "help": "输入 token 数"},
         {"name": "precision", "label": "权重精度", "type": "select", "value": precision, "options": list(PRECISION_BYTES.keys()), "help": "用于显存/成本与吞吐估算"},
@@ -2824,7 +2832,7 @@ def build_nemotron_streaming_asr_payload(model_dir: Path, model_id: str, query: 
         build_node("rnnt_decoder", "decoder", 0, "RNN-T 解码器", "streaming transducer", "联合声学帧与预测网络状态，增量输出带标点和大小写的文本 token。", shape(batch, chunk_frames, "rnnt_joint_dim"), shape(batch, "emitted_tokens"), ["RNNT", "incremental"], [detail("encoder_frames", chunk_frames), detail("output_tokens", "data-dependent")], [section("输出", [detail("token stream", shape(batch, "emitted_tokens"))])], "head"),
         build_node("transcript", "output", 0, "多语言转录", "text + optional language tag", "输出文本，并按设置保留或移除自动语言标签。", shape(batch, "emitted_tokens"), shape(batch, "transcript"), ["40 language-locales", f"lang {language_mode}"], [detail("language_mode", language_mode), detail("punctuation", True), detail("capitalization", True)], [section("结果", [detail("transcript", shape(batch, "transcript"))])], "output"),
     ]
-    edges = [
+    edges: list[dict[str, Any]] = [
         build_edge("stream_audio", "stream_features", "new non-overlap chunk"),
         build_edge("stream_features", "cache_aware_encoder", "acoustic features"),
         build_edge("cache_aware_encoder", "prompt_fusion", "D=512 embeddings"),
@@ -2881,22 +2889,23 @@ def build_asr_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     preprocessor = read_json_file(model_dir / "preprocessor_config.json")
     architecture = infer_architecture_name(model_dir, "multimodal")
 
-    thinker_config = config.get("thinker_config") if isinstance(config.get("thinker_config"), dict) else {}
-    thinker_audio = thinker_config.get("audio_config") if isinstance(thinker_config.get("audio_config"), dict) else {}
-    config_audio = config.get("audio_config") if isinstance(config.get("audio_config"), dict) else {}
-    config_encoder = config.get("encoder") if isinstance(config.get("encoder"), dict) else {}
-    yaml_encoder = first_defined(yaml_config.get("audio_encoder_conf"), yaml_config.get("encoder_conf"), {}) or {}
-    encoder_config = first_defined(config_encoder, thinker_audio, config_audio, yaml_encoder, {}) or {}
+    thinker_config = as_mapping(config.get("thinker_config"))
+    thinker_audio = as_mapping(thinker_config.get("audio_config"))
+    config_audio = as_mapping(config.get("audio_config"))
+    config_encoder = as_mapping(config.get("encoder"))
+    yaml_encoder = as_mapping(first_defined(yaml_config.get("audio_encoder_conf"), yaml_config.get("encoder_conf")))
+    encoder_config = as_mapping(first_defined(config_encoder, thinker_audio, config_audio, yaml_encoder))
 
-    transformer_decoder = config.get("transf_decoder") if isinstance(config.get("transf_decoder"), dict) else {}
-    transformer_decoder_config = transformer_decoder.get("config_dict") if isinstance(transformer_decoder.get("config_dict"), dict) else {}
-    thinker_text = thinker_config.get("text_config") if isinstance(thinker_config.get("text_config"), dict) else {}
-    config_text = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
-    language_config = config.get("language_config") if isinstance(config.get("language_config"), dict) else {}
-    decoder_config = first_defined(thinker_text, config_text, language_config, transformer_decoder_config, {}) or {}
-    adaptor_config = yaml_config.get("audio_adaptor_conf") if isinstance(yaml_config.get("audio_adaptor_conf"), dict) else {}
-    frontend_config = yaml_config.get("frontend_conf") if isinstance(yaml_config.get("frontend_conf"), dict) else {}
-    dataset_config = yaml_config.get("dataset_conf") if isinstance(yaml_config.get("dataset_conf"), dict) else {}
+    transformer_decoder = as_mapping(config.get("transf_decoder"))
+    transformer_decoder_config = as_mapping(transformer_decoder.get("config_dict"))
+    thinker_text = as_mapping(thinker_config.get("text_config"))
+    config_text = as_mapping(config.get("text_config"))
+    language_config = as_mapping(config.get("language_config"))
+    decoder_config = as_mapping(first_defined(thinker_text, config_text, language_config, transformer_decoder_config))
+    adaptor_config = as_mapping(yaml_config.get("audio_adaptor_conf"))
+    frontend_config = as_mapping(yaml_config.get("frontend_conf"))
+    dataset_config = as_mapping(yaml_config.get("dataset_conf"))
+    head_config = as_mapping(config.get("head"))
 
     encoder_hidden = scalar_int(
         first_defined(encoder_config.get("d_model"), encoder_config.get("hidden_size"), encoder_config.get("output_size")),
@@ -2912,14 +2921,14 @@ def build_asr_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         1,
     )
     decoder_hidden = scalar_int(
-        first_defined(decoder_config.get("hidden_size"), adaptor_config.get("llm_dim"), config.get("head", {}).get("hidden_size") if isinstance(config.get("head"), dict) else None, encoder_output_hidden),
+        first_defined(decoder_config.get("hidden_size"), adaptor_config.get("llm_dim"), head_config.get("hidden_size"), encoder_output_hidden),
         encoder_output_hidden,
     )
     decoder_layers = scalar_int(first_defined(decoder_config.get("num_hidden_layers"), decoder_config.get("num_layers")), 0)
     decoder_heads = scalar_int(first_defined(decoder_config.get("num_attention_heads"), decoder_config.get("n_heads")), 0)
     vocab_size = scalar_int(decoder_config.get("vocab_size"), 0)
     if not vocab_size:
-        vocab_size = scalar_int(first_defined(config.get("vocab_size"), config.get("head", {}).get("num_classes") if isinstance(config.get("head"), dict) else None), 0)
+        vocab_size = scalar_int(first_defined(config.get("vocab_size"), head_config.get("num_classes")), 0)
     identity = _model_identity(config, yaml_config)
     has_decoder = bool(decoder_config or yaml_config.get("llm") or "conditionalgeneration" in identity)
 
@@ -3137,13 +3146,13 @@ def build_sam_video_payload(model_dir: Path, model_id: str, query: dict[str, lis
     config = primary_config(model_dir)
     processor = read_json_file(model_dir / "processor_config.json")
     architecture = infer_architecture_name(model_dir, "multimodal")
-    detector = config.get("detector_config") if isinstance(config.get("detector_config"), dict) else {}
-    tracker = config.get("tracker_config") if isinstance(config.get("tracker_config"), dict) else {}
-    vision_config = first_defined(detector.get("vision_config"), tracker.get("vision_config"), {}) or {}
-    backbone_config = vision_config.get("backbone_config") if isinstance(vision_config.get("backbone_config"), dict) else vision_config
-    text_config = detector.get("text_config") if isinstance(detector.get("text_config"), dict) else {}
-    image_processor = processor.get("image_processor") if isinstance(processor.get("image_processor"), dict) else processor
-    video_processor = processor.get("video_processor") if isinstance(processor.get("video_processor"), dict) else {}
+    detector = as_mapping(config.get("detector_config"))
+    tracker = as_mapping(config.get("tracker_config"))
+    vision_config = as_mapping(first_defined(detector.get("vision_config"), tracker.get("vision_config")))
+    backbone_config = as_mapping(vision_config.get("backbone_config")) or vision_config
+    text_config = as_mapping(detector.get("text_config"))
+    image_processor = as_mapping(processor.get("image_processor")) or processor
+    video_processor = as_mapping(processor.get("video_processor"))
 
     patch_size = scalar_int(first_defined(backbone_config.get("patch_size"), image_processor.get("patch_size")), 16)
     vision_hidden = scalar_int(backbone_config.get("hidden_size"), 1024)
@@ -3156,12 +3165,13 @@ def build_sam_video_payload(model_dir: Path, model_id: str, query: dict[str, lis
     target_size = processor.get("target_size")
     if isinstance(target_size, (int, float)):
         default_height = default_width = clamp_int(target_size, default_height)
-    mask_size_config = image_processor.get("mask_size") if isinstance(image_processor.get("mask_size"), dict) else {}
+    mask_size_config = as_mapping(image_processor.get("mask_size"))
     mask_height = scalar_int(first_defined(mask_size_config.get("height"), config.get("low_res_mask_size")), 256)
     mask_width = scalar_int(first_defined(mask_size_config.get("width"), config.get("low_res_mask_size")), mask_height)
 
     batch = clamp_int(query.get("batch", [1])[0], 1, maximum=8)
-    frames = clamp_int(query.get("frames", [video_processor.get("num_frames") or 8])[0], video_processor.get("num_frames") or 8, minimum=1, maximum=1024)
+    default_frames = scalar_int(video_processor.get("num_frames"), 8)
+    frames = clamp_int(query.get("frames", [str(default_frames)])[0], default_frames, minimum=1, maximum=1024)
     image_height = clamp_int(query.get("image_height", [default_height])[0], default_height, minimum=patch_size, maximum=4096)
     image_width = clamp_int(query.get("image_width", [default_width])[0], default_width, minimum=patch_size, maximum=4096)
     object_count = clamp_int(query.get("objects", [1])[0], 1, maximum=256)
@@ -3232,27 +3242,27 @@ def build_tts_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     if architecture == "UnknownModel":
         architecture = human_model_name(model_id).split("/")[-1]
     nested_text_config, nested_text_source = discover_nested_text_backbone_config(model_dir)
-    yaml_gpt = yaml_config.get("gpt") if isinstance(yaml_config.get("gpt"), dict) else {}
-    yaml_llm = yaml_config.get("llm") if isinstance(yaml_config.get("llm"), dict) else {}
-    yaml_flow = yaml_config.get("flow") if isinstance(yaml_config.get("flow"), dict) else {}
-    yaml_hift = yaml_config.get("hift") if isinstance(yaml_config.get("hift"), dict) else {}
-    yaml_s2mel = yaml_config.get("s2mel") if isinstance(yaml_config.get("s2mel"), dict) else {}
-    language_config = first_defined(
-        config.get("language_config") if isinstance(config.get("language_config"), dict) else None,
-        config.get("lm_config") if isinstance(config.get("lm_config"), dict) else None,
+    yaml_gpt = as_mapping(yaml_config.get("gpt"))
+    yaml_llm = as_mapping(yaml_config.get("llm"))
+    yaml_flow = as_mapping(yaml_config.get("flow"))
+    yaml_hift = as_mapping(yaml_config.get("hift"))
+    yaml_s2mel = as_mapping(yaml_config.get("s2mel"))
+    language_config = as_mapping(first_defined(
+        as_mapping(config.get("language_config")),
+        as_mapping(config.get("lm_config")),
         yaml_gpt,
         nested_text_config,
-        {},
-    ) or {}
+    ))
     hidden_size = scalar_int(first_defined(language_config.get("hidden_size"), language_config.get("model_dim"), yaml_config.get("llm_input_size")), 2048)
     num_layers = scalar_int(first_defined(language_config.get("num_hidden_layers"), language_config.get("layers")), 1)
     num_heads = scalar_int(first_defined(language_config.get("num_attention_heads"), language_config.get("heads")), 1)
     vocab_size = scalar_int(first_defined(language_config.get("vocab_size"), language_config.get("number_text_tokens")), 0)
     n_vq = scalar_int(config.get("n_vq"), 1)
     audio_vocab_size = scalar_int(first_defined(config.get("audio_vocab_size"), language_config.get("number_mel_codes"), yaml_llm.get("speech_token_size"), yaml_flow.get("vocab_size")), 0)
-    dataset_config = yaml_config.get("dataset") if isinstance(yaml_config.get("dataset"), dict) else {}
-    audio_vae_config = config.get("audio_vae_config") if isinstance(config.get("audio_vae_config"), dict) else {}
-    s2mel_preprocess = yaml_s2mel.get("preprocess_params") if isinstance(yaml_s2mel.get("preprocess_params"), dict) else {}
+    dataset_config = as_mapping(yaml_config.get("dataset"))
+    audio_vae_config = as_mapping(config.get("audio_vae_config"))
+    s2mel_preprocess = as_mapping(yaml_s2mel.get("preprocess_params"))
+    vocoder_config = as_mapping(yaml_config.get("vocoder"))
     sample_rate = scalar_int(first_defined(config.get("sampling_rate"), audio_vae_config.get("out_sample_rate"), s2mel_preprocess.get("sr"), yaml_config.get("sample_rate"), dataset_config.get("sample_rate")), 24000)
     max_text_tokens = scalar_int(first_defined(language_config.get("max_text_tokens"), config.get("max_length"), language_config.get("max_position_embeddings")), 8192)
     max_audio_frames = scalar_int(first_defined(language_config.get("max_mel_tokens"), config.get("max_length")), 16384)
@@ -3263,12 +3273,12 @@ def build_tts_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
     audio_steps = audio_frames + max(n_vq - 1, 0) if uses_delay_pattern else audio_frames
     total_steps = text_tokens + audio_steps
     prediction_heads = n_vq + 1 if uses_delay_pattern else 1
-    dit_config = config.get("dit_config") if isinstance(config.get("dit_config"), dict) else {}
-    encoder_config = config.get("encoder_config") if isinstance(config.get("encoder_config"), dict) else {}
+    dit_config = as_mapping(config.get("dit_config"))
+    encoder_config = as_mapping(config.get("encoder_config"))
     is_continuous_tts = bool(audio_vae_config and dit_config and not audio_vocab_size)
     token_frame_rate = scalar_int(yaml_config.get("token_frame_rate"), 0)
     token_mel_ratio = scalar_int(yaml_config.get("token_mel_ratio"), 1)
-    mel_spec_config = yaml_config.get("mel_spec_transform1") if isinstance(yaml_config.get("mel_spec_transform1"), dict) else {}
+    mel_spec_config = as_mapping(yaml_config.get("mel_spec_transform1"))
     mel_hop = scalar_int(mel_spec_config.get("hop_size"), 0)
     mel_frames = audio_frames * token_mel_ratio if yaml_flow else 0
     waveform_samples = mel_frames * mel_hop if mel_frames and mel_hop else 0
@@ -3334,9 +3344,9 @@ def build_tts_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         edges.append(build_edge(prediction_node_id, "codec_decoder", "RVQ codes"))
         synthesis_label = "RVQ Codec"
     elif yaml_flow:
-        flow_encoder = yaml_flow.get("encoder") if isinstance(yaml_flow.get("encoder"), dict) else {}
-        flow_decoder = yaml_flow.get("decoder") if isinstance(yaml_flow.get("decoder"), dict) else {}
-        flow_estimator = flow_decoder.get("estimator") if isinstance(flow_decoder.get("estimator"), dict) else {}
+        flow_encoder = as_mapping(yaml_flow.get("encoder"))
+        flow_decoder = as_mapping(yaml_flow.get("decoder"))
+        flow_estimator = as_mapping(flow_decoder.get("estimator"))
         mel_channels = scalar_int(first_defined(yaml_flow.get("output_size"), flow_estimator.get("out_channels")), 80)
         nodes.extend([
             build_node("flow_decoder", "synthesis", 0, "因果 Flow Matching", f"{scalar_int(flow_encoder.get('num_blocks'), 0)} conformer + {scalar_int(flow_estimator.get('num_mid_blocks'), 0)} mid blocks", "将离散语音 token 上采样并生成 mel 频谱。", shape(batch, audio_steps), shape(batch, mel_frames or "mel_frames", mel_channels), [f"token:mel 1:{token_mel_ratio}", f"mel {mel_channels}"], [detail("token_frames", audio_frames), detail("token_mel_ratio", token_mel_ratio), detail("mel_frames", mel_frames), detail("mel_channels", mel_channels)], [section("帧数推导", [detail("mel frames", f"{audio_frames} * {token_mel_ratio} = {mel_frames}")])], "audio"),
@@ -3346,11 +3356,11 @@ def build_tts_payload(model_dir: Path, model_id: str, query: dict[str, list[str]
         synthesis_label = "Causal CFM + HiFT"
         warning = "语音 token 帧率、token/mel 比和 mel hop 均来自配置，当前波形时长可精确由这些值推导。"
     elif yaml_s2mel:
-        s2mel_dit = yaml_s2mel.get("DiT") if isinstance(yaml_s2mel.get("DiT"), dict) else {}
+        s2mel_dit = as_mapping(yaml_s2mel.get("DiT"))
         mel_channels = scalar_int(s2mel_dit.get("in_channels"), 80)
         nodes.extend([
             build_node("s2mel_dit", "synthesis", 0, "S2Mel DiT", f"{scalar_int(s2mel_dit.get('depth'), 0)} layers / hidden {scalar_int(s2mel_dit.get('hidden_dim'), 0)}", "将语义码流、风格与条件特征映射为 mel 频谱。", shape(batch, audio_steps), shape(batch, "mel_frames", mel_channels), [f"mel {mel_channels}", "flow matching"], [detail("DiT_depth", s2mel_dit.get("depth")), detail("hidden_dim", s2mel_dit.get("hidden_dim")), detail("mel_channels", mel_channels)], [section("输出", [detail("mel", shape(batch, "mel_frames", mel_channels))])], "audio"),
-            build_node("vocoder", "output", 0, "BigVGAN 声码器", f"waveform @ {sample_rate} Hz", "将 S2Mel 输出还原为波形；配置未声明语义码到 mel 帧的固定比例。", shape(batch, "mel_frames", mel_channels), shape(batch, "waveform_samples"), [f"{sample_rate} Hz"], [detail("vocoder", (yaml_config.get("vocoder") or {}).get("name") if isinstance(yaml_config.get("vocoder"), dict) else None), detail("sample_rate", sample_rate)], [section("输出", [detail("waveform", shape(batch, "waveform_samples"))])], "output"),
+            build_node("vocoder", "output", 0, "BigVGAN 声码器", f"waveform @ {sample_rate} Hz", "将 S2Mel 输出还原为波形；配置未声明语义码到 mel 帧的固定比例。", shape(batch, "mel_frames", mel_channels), shape(batch, "waveform_samples"), [f"{sample_rate} Hz"], [detail("vocoder", vocoder_config.get("name")), detail("sample_rate", sample_rate)], [section("输出", [detail("waveform", shape(batch, "waveform_samples"))])], "output"),
         ])
         edges.extend([build_edge(prediction_node_id, "s2mel_dit", "semantic codes"), build_edge("s2mel_dit", "vocoder", "mel spectrogram")])
         synthesis_label = "S2Mel DiT + BigVGAN"
@@ -3406,8 +3416,8 @@ def build_hy_world_payload(model_dir: Path, model_id: str, query: dict[str, list
     pano_config = read_json_file(model_dir / "HY-Pano-2.0" / "config.json")
     generation_config = read_json_file(model_dir / "HY-Pano-2.0" / "generation_config.json")
     mirror_config = read_json_file(model_dir / "HY-WorldMirror-2.0" / "config.json")
-    pano_vae = pano_config.get("vae") if isinstance(pano_config.get("vae"), dict) else {}
-    pano_vit = pano_config.get("vit") if isinstance(pano_config.get("vit"), dict) else {}
+    pano_vae = as_mapping(pano_config.get("vae"))
+    pano_vit = as_mapping(pano_config.get("vit"))
     pano_dims = parse_llm_dims(pano_config)
     pano_metrics = estimate_llm_metrics(pano_dims)
 
@@ -3486,7 +3496,7 @@ def build_hy_world_payload(model_dir: Path, model_id: str, query: dict[str, list
         detail("WorldMirror tokens", mirror_total_tokens),
         detail("候选 Gaussians", gaussian_count),
     ]
-    controls = [
+    controls: list[dict[str, Any]] = [
         {"name": "task", "label": "任务", "type": "select", "value": task, "options": ["panorama", "reconstruction"], "help": "选择当前重点查看的 HY-World 分支"},
         {"name": "seq_len", "label": "提示 token", "type": "number", "value": prompt_tokens, "min": 1, "max": int(pano_config.get("max_position_embeddings", 22800) or 22800), "step": 1, "help": "HY-Pano 推理与重写上下文长度"},
         {"name": "image_height", "label": "全景生成高度", "type": "number", "value": pano_height, "min": 16, "max": 4096, "step": 16, "help": "融合前 ERP 高度"},
@@ -3586,19 +3596,26 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     video_processor_config = read_json_file(config_dir / "video_preprocessor_config.json")
     architecture = infer_architecture_name(model_dir, "multimodal")
 
-    text_config = first_defined(config.get("text_config"), config.get("language_config"), config, params_config) or {}
-    vision_config = first_defined(config.get("vision_config"), params_config.get("vision_encoder"), {}) or {}
-    projector_config = config.get("projector_config") if isinstance(config.get("projector_config"), dict) else {}
-    image_processor = processor_config.get("image_processor") if isinstance(processor_config.get("image_processor"), dict) else processor_config or image_processor_config
-    video_processor = processor_config.get("video_processor") if isinstance(processor_config.get("video_processor"), dict) else video_processor_config
-    audio_feature_extractor = processor_config.get("feature_extractor") if isinstance(processor_config.get("feature_extractor"), dict) else {}
-    image_compression = first_defined(
-        image_processor.get("img_token_compression_config"),
-        vision_config.get("img_token_compression_config"),
-        config.get("img_token_compression_config"),
-        {},
-    ) or {}
-    media_processor = image_processor.get("media_proc_cfg") if isinstance(image_processor.get("media_proc_cfg"), dict) else {}
+    text_config = as_mapping(first_defined(
+        as_mapping(config.get("text_config")),
+        as_mapping(config.get("language_config")),
+        config,
+        params_config,
+    ))
+    vision_config = as_mapping(first_defined(
+        as_mapping(config.get("vision_config")),
+        as_mapping(params_config.get("vision_encoder")),
+    ))
+    projector_config = as_mapping(config.get("projector_config"))
+    image_processor = as_mapping(processor_config.get("image_processor")) or processor_config or image_processor_config
+    video_processor = as_mapping(processor_config.get("video_processor")) or video_processor_config
+    audio_feature_extractor = as_mapping(processor_config.get("feature_extractor"))
+    image_compression = as_mapping(first_defined(
+        as_mapping(image_processor.get("img_token_compression_config")),
+        as_mapping(vision_config.get("img_token_compression_config")),
+        as_mapping(config.get("img_token_compression_config")),
+    ))
+    media_processor = as_mapping(image_processor.get("media_proc_cfg"))
 
     language_hidden = int(first_defined(text_config.get("hidden_size"), config.get("hidden_size"), params_config.get("dim"), projector_config.get("n_embed"), 2048) or 2048)
     num_layers = int(first_defined(text_config.get("num_hidden_layers"), config.get("num_hidden_layers"), params_config.get("n_layers"), 0) or 0)
@@ -3607,7 +3624,8 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     vocab_size = int(first_defined(text_config.get("vocab_size"), config.get("vocab_size"), params_config.get("vocab_size"), 0) or 0)
     max_position = int(first_defined(text_config.get("max_position_embeddings"), config.get("max_position_embeddings"), params_config.get("max_position_embeddings"), 8192) or 8192)
 
-    nested_patch_size = max_nested_numeric(vision_config.get("width"), "patch_size") if isinstance(vision_config.get("width"), dict) else None
+    width_config = as_mapping(vision_config.get("width"))
+    nested_patch_size = max_nested_numeric(width_config, "patch_size") if width_config else None
     patch_size = scalar_int(first_defined(image_processor.get("patch_size"), media_processor.get("patch_size"), vision_config.get("patch_size"), nested_patch_size), 16)
     merge_size = scalar_int(
         first_defined(
@@ -3635,7 +3653,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     vision_hidden = int(
         first_defined(
             vision_config.get("hidden_size"),
-            max_nested_numeric(vision_config.get("width"), "width") if isinstance(vision_config.get("width"), dict) else None,
+            max_nested_numeric(width_config, "width") if width_config else None,
             projector_config.get("input_dim"),
             language_hidden,
         )
@@ -3647,13 +3665,13 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
         first_defined(
             vision_config.get("depth"),
             vision_config.get("num_hidden_layers"),
-            max_nested_numeric(vision_config.get("width"), "layers") if isinstance(vision_config.get("width"), dict) else None,
+            max_nested_numeric(width_config, "layers") if width_config else None,
             0,
         )
         or 0
     )
 
-    default_height, default_width = infer_default_image_size(config, vision_config, image_processor if isinstance(image_processor, dict) else {})
+    default_height, default_width = infer_default_image_size(config, vision_config, image_processor)
     has_video = bool(
         config.get("video_token_id")
         or config.get("video_token_index")
@@ -4186,7 +4204,7 @@ def build_multimodal_payload(model_dir: Path, model_id: str, query: dict[str, li
     nodes.extend(mm_block_nodes)
     nodes.extend(mm_repeat_nodes)
 
-    edges = [
+    edges: list[dict[str, Any]] = [
         {"source": "text_input", "target": "text_embedding", "label": "token ids"},
         {"source": "text_embedding", "target": "fusion_context", "label": "text hidden", "viewModes": ["summary", "expanded"]},
         {"source": "image_input", "target": "image_processor", "label": "image tensor", "viewModes": ["summary", "expanded"]},
@@ -4302,7 +4320,7 @@ def load_component_config(model_dir: Path, component_name: str | None) -> tuple[
 
 
 def infer_text_hidden(text_component_config: dict[str, Any], transformer_config: dict[str, Any]) -> int:
-    nested = text_component_config.get("text_config") if isinstance(text_component_config.get("text_config"), dict) else {}
+    nested = as_mapping(text_component_config.get("text_config"))
     return int(
         first_defined(
             nested.get("hidden_size"),
@@ -4317,7 +4335,7 @@ def infer_text_hidden(text_component_config: dict[str, Any], transformer_config:
 
 
 def infer_text_layers(text_component_config: dict[str, Any], transformer_config: dict[str, Any]) -> int:
-    nested = text_component_config.get("text_config") if isinstance(text_component_config.get("text_config"), dict) else {}
+    nested = as_mapping(text_component_config.get("text_config"))
     return int(first_defined(nested.get("num_hidden_layers"), text_component_config.get("num_hidden_layers"), transformer_config.get("num_text_layers"), 0) or 0)
 
 
@@ -4403,7 +4421,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
 
     text_hidden = infer_text_hidden(text_component_config, transformer_config)
     text_layers = infer_text_layers(text_component_config, transformer_config)
-    text_nested = text_component_config.get("text_config") if isinstance(text_component_config.get("text_config"), dict) else {}
+    text_nested = as_mapping(text_component_config.get("text_config"))
     max_position = int(first_defined(text_nested.get("max_position_embeddings"), text_component_config.get("max_position_embeddings"), transformer_config.get("model_max_length"), transformer_config.get("text_len"), 4096) or 4096)
     prompt_tokens = clamp_int(query.get("seq_len", [min(max_position, 256)])[0], min(max_position, 256), maximum=max_position)
     batch = clamp_int(query.get("batch", [1])[0], 1, maximum=8)
@@ -4886,7 +4904,7 @@ def build_diffusers_payload(model_dir: Path, model_id: str, query: dict[str, lis
     nodes.extend(block_nodes)
     nodes.extend(repeat_nodes)
 
-    edges = [
+    edges: list[dict[str, Any]] = [
         {"source": "prompt_input", "target": "text_condition", "label": "prompt"},
         {"source": "text_condition", "target": "transformer", "label": "text hidden", "viewModes": ["summary", "expanded"]},
         {"source": "scheduler", "target": "transformer", "label": "timesteps", "viewModes": ["summary", "expanded"]},
