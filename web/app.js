@@ -26,6 +26,13 @@ const state = {
   centerView: "graph",
   urlStateApplied: false,
   pendingScroll: null,
+  remoteModels: [],
+  remoteSearchTimer: null,
+  remoteSearchController: null,
+  remoteSearchQuery: "",
+  remoteSearchLoading: false,
+  remoteSearchError: "",
+  downloadingModelId: null,
 };
 
 const ui = {
@@ -87,7 +94,33 @@ async function fetchJson(url, signal) {
   const response = await fetch(url, { cache: "no-store", signal });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `Request failed with ${response.status}`);
+    let message = text;
+    try {
+      message = JSON.parse(text).error || text;
+    } catch (_error) {
+      message = text;
+    }
+    throw new Error(message || `Request failed with ${response.status}`);
+  }
+  return response.json();
+}
+
+async function postJson(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    let message = text;
+    try {
+      message = JSON.parse(text).error || text;
+    } catch (_error) {
+      message = text;
+    }
+    throw new Error(message || `Request failed with ${response.status}`);
   }
   return response.json();
 }
@@ -514,21 +547,18 @@ function renderChipPairs(items, className = "flow-chip") {
 }
 
 function renderModelList() {
-  const keyword = ui.modelSearch.value.trim().toLowerCase();
+  const query = ui.modelSearch.value.trim();
+  const keyword = query.toLowerCase();
   const models = state.models.filter((model) => {
     if (!keyword) {
       return true;
     }
     return [model.name, model.architecture, model.type].some((value) => String(value).toLowerCase().includes(keyword));
   });
+  const remoteModels = query === state.remoteSearchQuery ? state.remoteModels : [];
 
-  ui.modelCount.textContent = String(models.length);
-  if (!models.length) {
-    ui.modelList.innerHTML = '<div class="empty-state">没有匹配的模型。</div>';
-    return;
-  }
-
-  ui.modelList.innerHTML = models
+  ui.modelCount.textContent = String(models.length + remoteModels.length);
+  const localHtml = models
     .map((model) => {
       const active = model.id === state.activeModelId ? "active" : "";
       return `
@@ -543,12 +573,111 @@ function renderModelList() {
       `;
     })
     .join("");
+  const remoteHtml = remoteModels
+    .map((model) => {
+      const downloading = state.downloadingModelId === model.modelId;
+      const disabled = state.downloadingModelId ? "disabled" : "";
+      const detail = model.chineseName ? `<p class="model-card-meta">${escapeHtml(model.chineseName)}</p>` : "";
+      return `
+        <button class="model-card remote-model-card" type="button" data-remote-model-id="${escapeHtml(model.modelId)}" ${disabled}>
+          <h3 class="model-card-title">${escapeHtml(model.name)}</h3>
+          ${detail}
+          <div class="tag-row">
+            <span class="tag remote-source-tag">ModelScope</span>
+            <span class="tag">${downloading ? "正在下载..." : "下载配置"}</span>
+          </div>
+          <p class="model-card-meta">${Number(model.downloads || 0).toLocaleString()} 下载 · ${Number(model.stars || 0).toLocaleString()} 收藏</p>
+        </button>
+      `;
+    })
+    .join("");
+  const remoteHeading = remoteHtml ? '<div class="remote-model-heading">ModelScope 中的模型</div>' : "";
+  let searchState = "";
+  if (state.remoteSearchLoading && query === state.remoteSearchQuery) {
+    searchState = '<div class="remote-search-state">正在搜索 ModelScope...</div>';
+  } else if (state.remoteSearchError && query === state.remoteSearchQuery) {
+    searchState = `<div class="remote-search-state is-error">${escapeHtml(state.remoteSearchError)}</div>`;
+  } else if (query.length >= 2 && !models.length && !remoteModels.length && query === state.remoteSearchQuery) {
+    searchState = '<div class="empty-state">本地和 ModelScope 均未找到匹配模型。</div>';
+  } else if (!models.length && query.length < 2) {
+    searchState = `<div class="empty-state">${query ? "至少输入 2 个字符以搜索 ModelScope。" : "没有匹配的本地模型。"}</div>`;
+  }
+
+  ui.modelList.innerHTML = `${localHtml}${remoteHeading}${remoteHtml}${searchState}`;
 }
 
-async function loadModels() {
+function scheduleRemoteModelSearch() {
+  const query = ui.modelSearch.value.trim();
+  clearTimeout(state.remoteSearchTimer);
+  if (state.remoteSearchController) {
+    state.remoteSearchController.abort();
+    state.remoteSearchController = null;
+  }
+  state.remoteSearchQuery = query;
+  state.remoteModels = [];
+  state.remoteSearchError = "";
+  state.remoteSearchLoading = query.length >= 2;
+  renderModelList();
+  if (query.length < 2) {
+    return;
+  }
+  state.remoteSearchTimer = setTimeout(() => searchRemoteModels(query), 450);
+}
+
+async function searchRemoteModels(query) {
+  const controller = new AbortController();
+  state.remoteSearchController = controller;
+  try {
+    const data = await fetchJson(`/api/modelscope/search?q=${encodeURIComponent(query)}&limit=10`, controller.signal);
+    if (ui.modelSearch.value.trim() !== query) {
+      return;
+    }
+    state.remoteModels = Array.isArray(data.models) ? data.models : [];
+    state.remoteSearchError = "";
+  } catch (error) {
+    if (error.name === "AbortError" || ui.modelSearch.value.trim() !== query) {
+      return;
+    }
+    state.remoteModels = [];
+    state.remoteSearchError = `ModelScope 搜索失败：${error.message}`;
+  } finally {
+    if (state.remoteSearchController === controller) {
+      state.remoteSearchController = null;
+      state.remoteSearchLoading = false;
+      if (ui.modelSearch.value.trim() === query) {
+        renderModelList();
+      }
+    }
+  }
+}
+
+async function downloadRemoteModel(modelId) {
+  if (!modelId || state.downloadingModelId) {
+    return;
+  }
+  state.downloadingModelId = modelId;
+  state.remoteSearchError = "";
+  renderModelList();
+  setStatus(`正在从 ModelScope 下载 ${modelId} 的配置文件...`);
+  try {
+    const result = await postJson("/api/modelscope/download", { modelId });
+    const localModelId = result.model?.id;
+    state.remoteModels = state.remoteModels.filter((model) => model.modelId !== modelId);
+    await loadModels(localModelId);
+  } catch (error) {
+    state.remoteSearchError = `配置下载失败：${error.message}`;
+    setStatus(state.remoteSearchError, true);
+  } finally {
+    state.downloadingModelId = null;
+    renderModelList();
+  }
+}
+
+async function loadModels(preferredModelId = null) {
   setStatus("正在读取 model_configs 目录...");
   const data = await fetchJson("/api/models");
   state.models = data.models || [];
+  renderModelList();
 
   if (!state.models.length) {
     setStatus("未找到模型目录。", true);
@@ -561,8 +690,11 @@ async function loadModels() {
     return;
   }
 
+  const preferredExists = preferredModelId && state.models.some((model) => model.id === preferredModelId);
   const currentExists = state.models.some((model) => model.id === state.activeModelId);
-  if (!currentExists) {
+  if (preferredExists) {
+    state.activeModelId = preferredModelId;
+  } else if (!currentExists) {
     const requestedModel = initialUrlParams.get("model");
     state.activeModelId = state.models.some((model) => model.id === requestedModel) ? requestedModel : state.models[0].id;
   }
@@ -2348,9 +2480,14 @@ ui.viewTabs.addEventListener("click", (event) => {
   setCenterView(tab.dataset.view);
 });
 
-ui.modelSearch.addEventListener("input", renderModelList);
+ui.modelSearch.addEventListener("input", scheduleRemoteModelSearch);
 
 ui.modelList.addEventListener("click", (event) => {
+  const remoteButton = event.target.closest("[data-remote-model-id]");
+  if (remoteButton) {
+    downloadRemoteModel(remoteButton.dataset.remoteModelId);
+    return;
+  }
   const button = event.target.closest("[data-model-id]");
   if (!button) {
     return;

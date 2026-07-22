@@ -8,6 +8,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import tempfile
+import threading
 from functools import lru_cache
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -15,10 +18,14 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlparse
 
+import download_hot_models as modelscope_downloader
+
 
 ROOT_DIR = Path(__file__).resolve().parent
 MODEL_CONFIGS_DIR = ROOT_DIR / "model_configs"
 WEB_DIR = ROOT_DIR / "web"
+MODELSCOPE_DOWNLOAD_LOCK = threading.Lock()
+MODELSCOPE_SEARCH_LIMIT = 10
 
 
 def read_json_file(path: Path) -> dict[str, Any]:
@@ -513,6 +520,17 @@ def infer_architecture_name(model_dir: Path, model_type: str) -> str:
     return "UnknownModel"
 
 
+def build_model_catalog_item(model_dir: Path) -> dict[str, Any]:
+    model_type = classify_model_dir(model_dir)
+    return {
+        "id": model_dir.name,
+        "name": human_model_name(model_dir.name),
+        "type": model_type,
+        "architecture": infer_architecture_name(model_dir, model_type),
+        "fileCount": count_model_files(model_dir),
+    }
+
+
 def build_model_catalog() -> list[dict[str, Any]]:
     models: list[dict[str, Any]] = []
     if not MODEL_CONFIGS_DIR.exists():
@@ -521,19 +539,105 @@ def build_model_catalog() -> list[dict[str, Any]]:
     for model_dir in sorted(MODEL_CONFIGS_DIR.iterdir()):
         if not model_dir.is_dir() or model_dir.name.startswith("."):
             continue
-
-        model_type = classify_model_dir(model_dir)
-        models.append(
-            {
-                "id": model_dir.name,
-                "name": human_model_name(model_dir.name),
-                "type": model_type,
-                "architecture": infer_architecture_name(model_dir, model_type),
-                "fileCount": count_model_files(model_dir),
-            }
-        )
+        models.append(build_model_catalog_item(model_dir))
 
     return models
+
+
+@lru_cache(maxsize=128)
+def cached_modelscope_search(query: str, limit: int) -> tuple[dict[str, Any], ...]:
+    token = os.environ.get("MODELSCOPE_API_TOKEN", "").strip() or None
+    records = modelscope_downloader.search_models(query, limit=limit, token=token, timeout=15)
+    return tuple(dict(record) for record in records if isinstance(record, dict))
+
+
+def search_modelscope_catalog(query: str, limit: int = MODELSCOPE_SEARCH_LIMIT) -> list[dict[str, Any]]:
+    normalized_query = str(query).strip()
+    if len(normalized_query) < 2:
+        return []
+    if len(normalized_query) > 100 or any(ord(char) < 32 for char in normalized_query):
+        raise ValueError("ModelScope 搜索词无效")
+    normalized_limit = max(1, min(int(limit), 20))
+    local_ids = {model_dir.name.casefold() for model_dir in MODEL_CONFIGS_DIR.iterdir() if model_dir.is_dir()} if MODEL_CONFIGS_DIR.exists() else set()
+    models: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in cached_modelscope_search(normalized_query, normalized_limit):
+        try:
+            model_id = modelscope_downloader.model_id_from_record(record)
+            local_id = modelscope_downloader.safe_model_dir_name(model_id)
+        except ValueError:
+            continue
+        folded_local_id = local_id.casefold()
+        if folded_local_id in local_ids or folded_local_id in seen:
+            continue
+        seen.add(folded_local_id)
+        models.append(
+            {
+                "modelId": model_id,
+                "localId": local_id,
+                "name": model_id,
+                "chineseName": str(record.get("ChineseName") or ""),
+                "downloads": max(scalar_int(record.get("Downloads"), 0), 0),
+                "stars": max(scalar_int(record.get("Stars"), 0), 0),
+                "source": "modelscope",
+            }
+        )
+    return models
+
+
+def clear_model_config_caches() -> None:
+    model_card_base_reference.cache_clear()
+    local_base_model_dir.cache_clear()
+    architecture_config_dir.cache_clear()
+
+
+def download_modelscope_config_to_catalog(model_id: str) -> dict[str, Any]:
+    normalized_model_id = modelscope_downloader.normalize_model_id(model_id)
+    local_id = modelscope_downloader.safe_model_dir_name(normalized_model_id)
+    MODEL_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    root = MODEL_CONFIGS_DIR.resolve()
+    target = (MODEL_CONFIGS_DIR / local_id).resolve()
+    if target.parent != root:
+        raise ValueError("无效模型目录")
+
+    with MODELSCOPE_DOWNLOAD_LOCK:
+        if target.is_dir():
+            return {"status": "exists", "model": build_model_catalog_item(target), "download": {"fileCount": count_model_files(target), "totalSize": 0}}
+        if target.exists():
+            raise RuntimeError("目标模型路径已存在且不是目录")
+
+        token = os.environ.get("MODELSCOPE_API_TOKEN", "").strip() or None
+        with tempfile.TemporaryDirectory(prefix=".modelscope-", dir=str(root)) as temporary_dir:
+            staging_dir = Path(temporary_dir) / "snapshot"
+            result = modelscope_downloader.download_model_config(
+                model_id=normalized_model_id,
+                local_dir=str(staging_dir),
+                allow_patterns=list(modelscope_downloader.DEFAULT_ALLOW_PATTERNS),
+                token=token,
+            )
+            if result.get("status") != "success":
+                raise RuntimeError(str(result.get("error") or "ModelScope 配置下载失败"))
+            files = result.get("files") if isinstance(result.get("files"), list) else []
+            if not files:
+                raise RuntimeError("ModelScope 仓库没有可下载的配置文件")
+            source = Path(str(result.get("path") or staging_dir)).resolve()
+            staging_root = staging_dir.resolve()
+            if source != staging_root and staging_root not in source.parents:
+                raise RuntimeError("下载器返回了非预期目录")
+            if not source.is_dir():
+                raise RuntimeError("下载目录不存在")
+            source.rename(target)
+
+        clear_model_config_caches()
+        return {
+            "status": "success",
+            "model": build_model_catalog_item(target),
+            "download": {
+                "fileCount": len(files),
+                "totalSize": int(result.get("total_size", 0) or 0),
+                "elapsed": result.get("elapsed", 0),
+            },
+        }
 
 
 def resolve_model_dir(model_id: str) -> Path:
@@ -5640,6 +5744,25 @@ class ModelArchRequestHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         segments = [unquote(segment) for segment in parsed.path.split("/") if segment]
 
+        if segments == ["api", "modelscope", "search"]:
+            query = parse_qs(parsed.query).get("q", [""])[0]
+            raw_limit = parse_qs(parsed.query).get("limit", [str(MODELSCOPE_SEARCH_LIMIT)])[0]
+            try:
+                limit = clamp_int(raw_limit, MODELSCOPE_SEARCH_LIMIT, maximum=20)
+                models = search_modelscope_catalog(query, limit)
+            except ValueError as exc:
+                self.respond_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            except Exception as exc:
+                print(f"[WARN] ModelScope search failed: {exc}")
+                self.respond_json(
+                    {"error": "ModelScope 服务暂时不可用，请检查网络或代理设置后重试"},
+                    status=HTTPStatus.BAD_GATEWAY,
+                )
+                return
+            self.respond_json({"query": query, "models": models})
+            return
+
         if segments[:2] == ["api", "models"]:
             if len(segments) == 2:
                 self.respond_json({"models": build_model_catalog()})
@@ -5666,6 +5789,46 @@ class ModelArchRequestHandler(SimpleHTTPRequestHandler):
             self.path = "/index.html"
 
         return super().do_GET()
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        segments = [unquote(segment) for segment in parsed.path.split("/") if segment]
+        if segments != ["api", "modelscope", "download"]:
+            self.respond_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+            return
+
+        try:
+            payload = self.read_json_body()
+            model_id = str(payload.get("modelId") or "").strip()
+            if not model_id:
+                raise ValueError("缺少 modelId")
+            result = download_modelscope_config_to_catalog(model_id)
+        except ValueError as exc:
+            self.respond_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        except Exception as exc:
+            message = str(exc)
+            status = HTTPStatus.SERVICE_UNAVAILABLE if "缺少 modelscope" in message.lower() else HTTPStatus.BAD_GATEWAY
+            self.respond_json({"error": f"ModelScope 下载失败: {message}"}, status=status)
+            return
+        self.respond_json(result, status=HTTPStatus.CREATED if result.get("status") == "success" else HTTPStatus.OK)
+
+    def read_json_body(self, maximum_bytes: int = 8192) -> dict[str, Any]:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("无效 Content-Length") from exc
+        if content_length <= 0:
+            raise ValueError("请求体为空")
+        if content_length > maximum_bytes:
+            raise ValueError("请求体过大")
+        try:
+            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("请求体不是有效 JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        return payload
 
     def respond_json(self, payload: dict[str, Any], status: int = HTTPStatus.OK) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")

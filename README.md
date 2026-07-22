@@ -15,6 +15,7 @@
 在仓库根目录运行：
 
 ```powershell
+pip install requests modelscope
 python serve_model_arch.py
 ```
 
@@ -33,6 +34,7 @@ python serve_model_arch.py --port 8123
 ## 页面功能
 
 - 自动扫描 model_configs 下的一级模型目录
+- 搜索本地不存在的模型时自动查询 ModelScope；点击远端结果后只下载配置、词表和说明文件到 `model_configs`，不会下载权重或模型代码
 - 左侧选择模型并调整 batch、token 长度、分辨率、帧数、推理步数等参数
 - 中间查看架构图与数据流向，并在选中节点后高亮其上下游路径
 - 对 LLM 支持三种 Decoder Stack 视图：汇总、单层 Block（含 Q/K/V、RoPE、QK Score、Causal Mask、Sliding Window Mask、Softmax、Weighted V、Output Projection）、重复 N 层摘要；repeat 视图会额外给出首层 / 中层 / 末层的 mask 摘要
@@ -44,6 +46,13 @@ python serve_model_arch.py --port 8123
 - 架构图支持节点固定、父级折叠，并按模型保存层级、缩放、选择和折叠状态
 - “复制链接”会编码模型、运行参数、当前页签和图状态，打开链接可还原同一分析现场
 - 支持导出当前模型视图的 JSON 数据、SVG 图和 Markdown 审计报告
+
+访问私有或受限模型时，可在启动前设置 ModelScope token：
+
+```powershell
+$env:MODELSCOPE_API_TOKEN = "ms-xxxxxxxx"
+python serve_model_arch.py
+```
 
 ## 计算审计
 

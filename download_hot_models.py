@@ -35,8 +35,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
-
 # ---------------------------------------------------------------------------
 # 常量定义
 # ---------------------------------------------------------------------------
@@ -119,6 +117,24 @@ def safe_model_dir_name(model_id: str) -> str:
     return normalize_model_id(model_id).replace("/", "__")
 
 
+def create_modelscope_session(token: Optional[str] = None) -> Any:
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError("缺少 requests 依赖，请先运行: pip install requests") from exc
+    session = requests.Session()
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "User-Agent": "modelscope-config-downloader/1.0 (requests)",
+        "x-modelscope-accept-language": "zh_CN",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    session.headers.update(headers)
+    return session
+
+
 # ---------------------------------------------------------------------------
 # 获取热门模型列表
 # ---------------------------------------------------------------------------
@@ -143,16 +159,7 @@ def get_hot_models(
     if limit <= 0:
         return []
 
-    session = requests.Session()
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "User-Agent": "modelscope-config-downloader/1.0 (requests)",
-        "x-modelscope-accept-language": "zh_CN",
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    session.headers.update(headers)
+    session = create_modelscope_session(token)
 
     # 构造过滤条件
     criterion = []
@@ -207,6 +214,39 @@ def get_hot_models(
     all_models = all_models[:limit]
     print(f"[INFO] 模型库总数: {total}, 已获取 {len(all_models)} 个热门模型")
     return all_models
+
+
+def search_models(
+    query: str,
+    limit: int = 10,
+    token: Optional[str] = None,
+    timeout: int = 15,
+) -> List[Dict]:
+    """Search ModelScope models by name without downloading files."""
+    normalized_query = str(query).strip()
+    if len(normalized_query) < 2:
+        return []
+    if len(normalized_query) > 100 or any(ord(char) < 32 for char in normalized_query):
+        raise ValueError("ModelScope 搜索词无效")
+
+    page_size = max(1, min(int(limit), 20))
+    payload = {
+        "Name": normalized_query,
+        "Criterion": [],
+        "SingleCriterion": [],
+        "SortBy": "Default",
+        "PageNumber": 1,
+        "PageSize": page_size,
+    }
+    response = create_modelscope_session(token).put(MODELSCOPE_API, json=payload, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("Success"):
+        raise RuntimeError(f"ModelScope API 返回失败: {data.get('Message', data)}")
+    models = data.get("Data", {}).get("Model", {}).get("Models", [])
+    if not isinstance(models, list):
+        raise RuntimeError("ModelScope API 返回了无效的模型列表")
+    return models[:page_size]
 
 
 # ---------------------------------------------------------------------------

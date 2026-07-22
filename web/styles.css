@@ -67,6 +67,13 @@ html, body {
 .model-card { width: 100%; padding: 12px; text-align: left; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--panel); cursor: pointer; transition: all 150ms ease; }
 .model-card:hover { background: var(--panel-strong); }
 .model-card.active { border-color: var(--accent); background: rgba(79, 70, 229, 0.04); box-shadow: 0 2px 6px rgba(79, 70, 229, 0.06); }
+.model-card:disabled { opacity: 0.62; cursor: wait; }
+.remote-model-card { border-style: dashed; border-color: rgba(79, 70, 229, 0.35); }
+.remote-model-card:hover:not(:disabled) { border-color: var(--accent); background: rgba(79, 70, 229, 0.04); }
+.remote-model-heading { margin: 6px 0 0; padding-top: 10px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.72rem; font-weight: 600; }
+.remote-search-state { padding: 10px 2px; color: var(--muted); font-size: 0.78rem; line-height: 1.45; }
+.remote-search-state.is-error { color: var(--rose); }
+.remote-source-tag { color: var(--accent); border-color: rgba(79, 70, 229, 0.22); background: rgba(79, 70, 229, 0.06); }
 .model-card-title { margin: 0 0 4px; font-size: 0.9rem; font-weight: 500; line-height: 1.4; word-break: break-word; }
 .model-card-meta, .subtle { color: var(--muted); font-size: 0.8rem; }
 .tag-row, .badge-row, .micro-flow, .summary-grid { display: flex; flex-wrap: wrap; gap: 6px; }

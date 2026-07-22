@@ -40,6 +40,55 @@ def test_model_id_from_record_rejects_outer_path_separators():
         downloader.model_id_from_record({"Path": "", "Name": "/owner/model"})
 
 
+def test_search_models_sends_bounded_modelscope_query(monkeypatch):
+    calls = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "Success": True,
+                "Data": {
+                    "Model": {
+                        "Models": [
+                            {"Path": "owner", "Name": f"model-{index}"}
+                            for index in range(25)
+                        ]
+                    }
+                },
+            }
+
+    class FakeSession:
+        def put(self, url, json, timeout):
+            calls.update(url=url, payload=json, timeout=timeout)
+            return FakeResponse()
+
+    monkeypatch.setattr(downloader, "create_modelscope_session", lambda token: (calls.update(token=token) or FakeSession()))
+
+    models = downloader.search_models(" Qwen3 ", limit=99, token="secret", timeout=7)
+
+    assert len(models) == 20
+    assert calls == {
+        "token": "secret",
+        "url": downloader.MODELSCOPE_API,
+        "payload": {
+            "Name": "Qwen3",
+            "Criterion": [],
+            "SingleCriterion": [],
+            "SortBy": "Default",
+            "PageNumber": 1,
+            "PageSize": 20,
+        },
+        "timeout": 7,
+    }
+
+
+def test_search_models_skips_short_queries():
+    assert downloader.search_models("q") == []
+
+
 def test_download_model_config_uses_lazy_downloader_and_tracks_changes(tmp_path, monkeypatch):
     local_dir = tmp_path / "model"
 
